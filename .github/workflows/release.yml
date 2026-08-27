@@ -21,6 +21,7 @@ on:
         type: number
 
 permissions:
+  actions: write
   contents: write
   packages: write
   id-token: write
@@ -249,6 +250,10 @@ jobs:
           git add tuf/repository
           git commit -m "release: publish GEOFlow $GEOFLOW_VERSION metadata"
           git push origin HEAD:main
+      - name: Deploy committed metadata through Pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run pages.yml --ref main
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: geoflow-updater-${{ inputs.updater_version }}
