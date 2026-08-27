@@ -158,7 +158,7 @@ func TestEnrollRejectsASecondInstanceDuringSingleHostPhaseA(t *testing.T) {
 	service := enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")}
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "secondary", Root: "/opt/geoflow"})
 	if err == nil || !strings.Contains(err.Error(), "primary") {
-		t.Fatalf("Enroll() error = %v, want Phase A primary instance rejection", err)
+		t.Fatalf("Enroll() error = %v, want primary instance rejection", err)
 	}
 }
 

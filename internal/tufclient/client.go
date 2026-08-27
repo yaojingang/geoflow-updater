@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/theupdateframework/go-tuf/v2/metadata/config"
@@ -21,6 +22,8 @@ const (
 	ManagedComposeTarget  = "deploy/docker-compose.managed.yml"
 )
 
+var releaseVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
+
 type releaseManifest struct {
 	SchemaVersion   int               `json:"schema_version"`
 	ReleaseSequence uint64            `json:"release_sequence"`
@@ -30,6 +33,7 @@ type releaseManifest struct {
 	PostgresImages  map[string]string `json:"postgres_images"`
 	RedisImages     map[string]string `json:"redis_images"`
 	ComposeTarget   string            `json:"compose_target"`
+	VersionTarget   string            `json:"version_target,omitempty"`
 }
 
 type Client struct {
@@ -91,7 +95,15 @@ func (client Client) Current(ctx context.Context) (managed.Release, error) {
 		return managed.Release{}, err
 	}
 
-	return DecodeReleaseManifest(manifestBytes, composeBytes)
+	var versionBytes []byte
+	if manifest.VersionTarget != "" {
+		versionBytes, err = downloadTarget(trustedUpdater, manifest.VersionTarget, 1024*1024)
+		if err != nil {
+			return managed.Release{}, err
+		}
+	}
+
+	return DecodeReleaseManifest(manifestBytes, composeBytes, versionBytes)
 }
 
 func sameOriginRedirects(baseURLs ...string) func(*http.Request, []*http.Request) error {
@@ -115,7 +127,7 @@ func sameOriginRedirects(baseURLs ...string) func(*http.Request, []*http.Request
 	}
 }
 
-func DecodeReleaseManifest(manifestBytes []byte, composeBytes []byte) (managed.Release, error) {
+func DecodeReleaseManifest(manifestBytes []byte, composeBytes []byte, versionDocuments ...[]byte) (managed.Release, error) {
 	manifest, err := decodeManifest(manifestBytes)
 	if err != nil {
 		return managed.Release{}, err
@@ -128,6 +140,12 @@ func DecodeReleaseManifest(manifestBytes []byte, composeBytes []byte) (managed.R
 		PostgresImages:  manifest.PostgresImages,
 		RedisImages:     manifest.RedisImages,
 		ComposeTemplate: composeBytes,
+	}
+	if len(versionDocuments) > 1 {
+		return managed.Release{}, errors.New("only one signed version document is allowed")
+	}
+	if len(versionDocuments) == 1 {
+		release.VersionDocument = versionDocuments[0]
 	}
 	if err := release.Validate(); err != nil {
 		return managed.Release{}, fmt.Errorf("validate release manifest: %w", err)
@@ -149,8 +167,14 @@ func decodeManifest(contents []byte) (releaseManifest, error) {
 	if manifest.SchemaVersion != 1 {
 		return releaseManifest{}, fmt.Errorf("unsupported release manifest schema %d", manifest.SchemaVersion)
 	}
+	if manifest.ReleaseSequence == 0 || !releaseVersionPattern.MatchString(manifest.Version) {
+		return releaseManifest{}, errors.New("release manifest sequence or version is invalid")
+	}
 	if manifest.ComposeTarget != ManagedComposeTarget {
 		return releaseManifest{}, errors.New("release manifest references an unsupported Compose target")
+	}
+	if manifest.VersionTarget != "" && manifest.VersionTarget != "releases/"+manifest.Version+"/version.json" {
+		return releaseManifest{}, errors.New("release manifest references an unsupported version target")
 	}
 
 	return manifest, nil

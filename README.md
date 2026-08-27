@@ -2,7 +2,7 @@
 
 GEOFlow Updater is the privileged host-side control plane for signed GEOFlow releases. It runs outside Laravel, owns the managed Docker Compose deployment, keeps the application away from the Docker socket, and exposes a small authenticated API over a Unix socket.
 
-Phase A provides:
+The current implementation provides:
 
 - static Linux binaries for amd64 and arm64;
 - `enroll` for registering an existing single-host Docker Compose deployment;
@@ -10,9 +10,14 @@ Phase A provides:
 - a systemd service and local installer package;
 - a go-tuf v2 client with an embedded two-of-three offline root of trust;
 - digest-pinned GEOFlow application and web images;
-- a signed bootstrap manifest for the GEOFlow administrator bridge.
+- a signed bootstrap manifest for the GEOFlow administrator bridge;
+- transaction stages for resolve, preflight, pull, quiesce, backup, migrate, activate, resume, and verify;
+- PostgreSQL custom-format dumps, compressed site storage, deployment state, and configuration recovery points;
+- automatic rollback after protected-stage failures and startup reconciliation after interrupted operations;
+- authenticated typed operations for update, backup, verification, recovery-point listing, and rollback;
+- direct CLI operations and administrator update-center controls.
 
-Update transactions, database backups, automatic verification, and one-click rollback are delivered in Phase B. The existing Laravel update executor remains available during the bridge period and is retired in Phase C.
+The existing Laravel update executor remains available during the Phase B bridge period and is retired in Phase C after stability verification.
 
 ## Supported environment
 
@@ -23,7 +28,7 @@ Update transactions, database backups, automatic verification, and one-click rol
 - GEOFlow deployment with bundled PostgreSQL
 - Existing deployment root containing `.env.prod` and `storage/`
 
-Phase A enrollment requires the installed `version.json` to match the signed managed release. This prevents enrollment from becoming an unprotected database upgrade before transactional backup and rollback arrive in Phase B.
+Enrollment requires the installed `version.json` to match the signed managed release. The first handover therefore attaches the updater to an already matching release. Later releases use the transactional update path.
 
 ## Install and enroll
 
@@ -55,6 +60,22 @@ Enrollment preserves PostgreSQL 16 or 18 and Redis 7 or 8 according to `PGVECTOR
 
 The installer does not support a remote `curl | sudo sh` flow. Review the extracted files before running the local script.
 
+## Transactional operations
+
+The administrator update center uses the authenticated Unix-socket API. The same fixed operations are available on the host:
+
+```bash
+sudo geoflow-updater update --instance primary
+sudo geoflow-updater backup --instance primary
+sudo geoflow-updater verify --instance primary
+sudo geoflow-updater recovery-points --instance primary
+sudo geoflow-updater rollback --instance primary --recovery-point RECOVERY_POINT_ID
+```
+
+An update resolves TUF metadata and signed targets, requires a higher release sequence, pulls immutable image digests, enters maintenance mode, and creates a recovery point before migrations or deployment activation. The updater restores the recovery point when migration, activation, startup, or verification fails. Operation state is written atomically after every stage. On service startup, an interrupted update is either safely completed after verification or restored according to its last durable stage.
+
+Recovery points include a PostgreSQL custom-format dump, the complete `storage/` tree with ownership and permissions, `.env.prod`, `version.json`, and updater-owned deployment files. Every artifact is verified against its manifest before restoration begins. The newest five valid recovery points are retained by default.
+
 ## Managed state
 
 | Path | Purpose |
@@ -62,13 +83,13 @@ The installer does not support a remote `curl | sudo sh` flow. Review the extrac
 | `/usr/local/sbin/geoflow-updater` | Static updater binary |
 | `/var/lib/geoflow-updater` | TUF cache and manager-owned instance state |
 | `/run/geoflow-updater/geoflow-updater.sock` | Local control API socket |
-| `/var/backups/geoflow-updater` | Recovery points introduced in Phase B |
+| `/var/backups/geoflow-updater` | Root-only transactional recovery points |
 
 Each enrolled instance receives `instance.yml`, `release.env`, `docker-compose.managed.yml`, and a private `control.token`. The application container receives the socket and its instance token. It never receives `/var/run/docker.sock`. The `doctor` command checks the installed version, database cluster, strict release pins, effective Compose configuration, and the running or healthy state of every required managed container.
 
 ## Trust and releases
 
-The embedded `root.json` authorizes three offline Ed25519 root keys with a threshold of two. Targets, snapshot, and timestamp use separate online keys. TUF protects the managed Compose file, release manifest, updater archives, and checksums. Image references in the release manifest use immutable OCI digests.
+The embedded `root.json` authorizes three offline Ed25519 root keys with a threshold of two. Targets, snapshot, and timestamp use separate online keys. TUF protects the managed Compose file, GEOFlow `version.json`, release manifest, updater archives, and checksums. Image references in the release manifest use immutable OCI digests.
 
 Release publishing runs in the protected `release-signing` GitHub environment. The workflow requires these base64-encoded PKCS#8 PEM secrets:
 

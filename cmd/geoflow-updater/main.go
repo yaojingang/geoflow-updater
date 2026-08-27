@@ -11,9 +11,13 @@ import (
 
 	"github.com/yaojingang/geoflow-updater/internal/agent"
 	"github.com/yaojingang/geoflow-updater/internal/cli"
+	"github.com/yaojingang/geoflow-updater/internal/deployment"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
+	"github.com/yaojingang/geoflow-updater/internal/operation"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/tufclient"
+	"github.com/yaojingang/geoflow-updater/internal/update"
 	trust "github.com/yaojingang/geoflow-updater/tuf"
 )
 
@@ -38,7 +42,20 @@ func main() {
 		TrustedRoot: trust.TrustedRoot,
 	}
 	diagnostics := doctor.Service{StateDir: stateDir}
-	server := agent.Server{StateDir: stateDir, Version: version, Status: diagnostics}
+	deployments := &deployment.Service{
+		StateDir:   stateDir,
+		Releases:   releases,
+		Doctor:     diagnostics,
+		Runner:     deployment.RealRunner{},
+		Recoveries: recovery.Store{BackupRoot: "/var/backups/geoflow-updater", Keep: 5},
+	}
+	operations := &operation.Manager{
+		StateDir:   stateDir,
+		Context:    ctx,
+		Deployment: deployments,
+		Engine:     update.Engine{Deployment: deployments},
+	}
+	server := agent.Server{StateDir: stateDir, Version: version, Status: diagnostics, Operations: operations}
 	application := cli.App{
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
@@ -48,8 +65,12 @@ func main() {
 			Releases:       releases,
 			ControlGroupID: updaterGroupID,
 		},
-		Doctor: diagnostics,
+		Doctor:     diagnostics,
+		Operations: operations,
 		Serve: func(ctx context.Context) error {
+			if err := operations.Reconcile("primary"); err != nil {
+				return fmt.Errorf("reconcile interrupted operation: %w", err)
+			}
 			return agent.ListenAndServe(ctx, runtimeSocket, server.Handler())
 		},
 	}

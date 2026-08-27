@@ -1,7 +1,10 @@
 package managed
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"regexp"
 )
 
@@ -21,6 +24,7 @@ type Release struct {
 	PostgresImages  map[string]string
 	RedisImages     map[string]string
 	ComposeTemplate []byte
+	VersionDocument []byte
 }
 
 func (release Release) Validate() error {
@@ -44,6 +48,22 @@ func (release Release) Validate() error {
 	}
 	if len(release.ComposeTemplate) == 0 {
 		return errors.New("managed Compose template is required")
+	}
+	if len(release.VersionDocument) > 1024*1024 {
+		return errors.New("signed version document exceeds the size limit")
+	}
+	if len(release.VersionDocument) > 0 {
+		decoder := json.NewDecoder(bytes.NewReader(release.VersionDocument))
+		var document struct {
+			Version string `json:"version"`
+		}
+		if err := decoder.Decode(&document); err != nil || document.Version != release.Version {
+			return errors.New("signed version document does not match the release")
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return errors.New("signed version document contains trailing JSON")
+		}
 	}
 
 	return nil

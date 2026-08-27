@@ -37,9 +37,13 @@ The scheduled `metadata-refresh.yml` workflow renews snapshot and timestamp meta
 6. Verify both multi-architecture GEOFlow image indexes contain `linux/amd64` and `linux/arm64`.
 7. Verify GitHub artifact attestations and archive checksums.
 8. Verify the GitHub Release is public before the new TUF timestamp is served by Pages.
-9. Run enrollment and `doctor` on clean amd64 and arm64 Linux hosts using the matching GEOFlow bridge release.
-10. Stop new work, confirm all GEOFlow queues are idle, and record the check before handover. The legacy Redis container has no persistent volume, so pending jobs can be lost when it stops.
-11. On each architecture, exercise handover from the standard `geoflow-laravel-prod` project and confirm only one PostgreSQL container can attach the production data directory.
+9. Confirm the signed release manifest references `releases/<version>/version.json` and that the target matches the source ref.
+10. Run enrollment and `doctor` on clean amd64 and arm64 Linux hosts using the matching GEOFlow bridge release.
+11. Stop new work, confirm all GEOFlow queues are idle, and record the check before handover. The legacy Redis container has no persistent volume, so pending jobs can be lost when it stops.
+12. On each architecture, exercise handover from the standard `geoflow-laravel-prod` project and confirm only one PostgreSQL container can attach the production data directory.
+13. From the managed release, run a transactional update that includes a migration and verify the recovery point, operation stages, new signed version document, and healthy containers.
+14. Force a protected-stage failure on a disposable host and verify automatic database, storage, configuration, and deployment rollback.
+15. Restart the updater during migration and during resume, then verify startup reconciliation follows the last durable stage without exposing two active operations.
 
 The publisher rejects a non-increasing release sequence, unrecognized manifest fields, mutable image tags, unofficial image repositories, malformed semantic versions, and a Compose target outside the fixed managed path.
 
@@ -51,4 +55,4 @@ The publisher rejects a non-increasing release sequence, unrecognized manifest f
 - If an online signing key is exposed, stop releases, rotate that role through a new root metadata version signed by two root custodians, publish the new root chain, and refresh all online metadata.
 - If fewer than two root keys remain available, release trust cannot be changed. Restore a verified offline copy and complete a custody review before resuming publication.
 
-Phase A enrollment only accepts a signed managed release whose version equals the installed GEOFlow `version.json`. Database-changing updates, transactional backups, verification, and rollback begin in Phase B.
+Enrollment accepts a signed managed release whose version equals the installed GEOFlow `version.json`. Phase B updates use a signed version document, a durable recovery point, automatic verification, and rollback before the operation reaches a terminal state.

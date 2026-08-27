@@ -53,7 +53,7 @@ func (service Service) Enroll(ctx context.Context, request Request) (Result, err
 		return Result{}, errors.New("instance id must start with a lowercase letter and contain only lowercase letters, numbers, or hyphens")
 	}
 	if request.InstanceID != "primary" {
-		return Result{}, errors.New("Phase A single-host enrollment supports only the primary instance")
+		return Result{}, errors.New("single-host enrollment supports only the primary instance")
 	}
 
 	root, err := canonicalRoot(request.Root)
@@ -79,7 +79,7 @@ func (service Service) Enroll(ctx context.Context, request Request) (Result, err
 		return Result{}, fmt.Errorf("validate trusted release: %w", err)
 	}
 	if installedVersion != release.Version {
-		return Result{}, fmt.Errorf("installed GEOFlow %s does not match signed bridge release %s; Phase A enrollment does not perform an unprotected version upgrade", installedVersion, release.Version)
+		return Result{}, fmt.Errorf("installed GEOFlow %s must match signed bridge release %s before enrollment", installedVersion, release.Version)
 	}
 	infrastructure, err := installedInfrastructure(filepath.Join(root, ".env.prod"), root)
 	if err != nil {
@@ -278,10 +278,10 @@ func installedInfrastructure(environmentPath string, root string) (infrastructur
 		return infrastructureConfig{}, errors.New("instance APP_KEY must contain a valid 32-byte base64 key before enrollment")
 	}
 	if values["DB_CONNECTION"] != "pgsql" || values["DB_HOST"] != "postgres" || values["DB_PASSWORD"] == "" {
-		return infrastructureConfig{}, errors.New("Phase A managed enrollment requires the bundled PostgreSQL connection and a non-empty DB_PASSWORD")
+		return infrastructureConfig{}, errors.New("managed enrollment requires the bundled PostgreSQL connection and a non-empty DB_PASSWORD")
 	}
 	if values["REDIS_HOST"] != "redis" {
-		return infrastructureConfig{}, errors.New("Phase A managed enrollment requires the bundled Redis service")
+		return infrastructureConfig{}, errors.New("managed enrollment requires the bundled Redis service")
 	}
 
 	postgresMajor, err := resolveMajor(values["GEOFLOW_UPDATER_POSTGRES_MAJOR"], values["PGVECTOR_IMAGE"], "PostgreSQL", "GEOFLOW_UPDATER_POSTGRES_MAJOR", func(tag string) (string, bool) {

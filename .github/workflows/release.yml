@@ -81,6 +81,9 @@ jobs:
           current_version="$(jq -er '.version' "$manifest")"
           resume=false
           if [ "$current_sequence" = "$RELEASE_SEQUENCE" ] && [ "$current_version" = "$GEOFLOW_VERSION" ]; then
+            version_target="$(jq -er '.version_target' "$manifest")"
+            test "$version_target" = "releases/$GEOFLOW_VERSION/version.json"
+            jq -e --arg target "$version_target" '.signed.targets[$target] != null' "tuf/repository/metadata/${targets_version}.targets.json" >/dev/null
             for target in \
               "updater/$UPDATER_VERSION/geoflow-updater_${UPDATER_VERSION}_linux_amd64.tar.gz" \
               "updater/$UPDATER_VERSION/geoflow-updater_${UPDATER_VERSION}_linux_arm64.tar.gz" \
@@ -163,6 +166,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yaojingang/GEOFlow
+          ref: ${{ inputs.geoflow_ref }}
+          path: geoflow
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -246,8 +254,9 @@ jobs:
           UPDATER_VERSION: ${{ inputs.updater_version }}
         run: |
           targets_dir="$(mktemp -d)"
-          mkdir -p "$targets_dir/deploy" "$targets_dir/releases" "$targets_dir/updater/$UPDATER_VERSION"
+          mkdir -p "$targets_dir/deploy" "$targets_dir/releases/$GEOFLOW_VERSION" "$targets_dir/updater/$UPDATER_VERSION"
           cp assets/docker-compose.managed.yml "$targets_dir/deploy/docker-compose.managed.yml"
+          cp geoflow/version.json "$targets_dir/releases/$GEOFLOW_VERSION/version.json"
           cp dist/geoflow-updater_*.tar.gz dist/checksums.txt "$targets_dir/updater/$UPDATER_VERSION/"
           jq -n \
             --argjson sequence "$RELEASE_SEQUENCE" \
@@ -258,7 +267,8 @@ jobs:
             --arg postgres_18_image "pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a" \
             --arg redis_7_image "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf" \
             --arg redis_8_image "redis@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576" \
-            '{schema_version:1,release_sequence:$sequence,version:$version,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml"}' \
+            --arg version_target "releases/$GEOFLOW_VERSION/version.json" \
+            '{schema_version:1,release_sequence:$sequence,version:$version,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml",version_target:$version_target}' \
             > "$targets_dir/releases/current.json"
           go run ./cmd/geoflow-tuf publish \
             --repository-dir tuf/repository \

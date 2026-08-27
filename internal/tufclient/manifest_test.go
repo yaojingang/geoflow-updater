@@ -18,14 +18,16 @@ func TestDecodeReleaseManifestAcceptsOnlyPinnedOfficialImagesAndFixedComposeTarg
   "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:` + strings.Repeat("2", 64) + `",
   "postgres_images": {"16":"pgvector/pgvector@sha256:` + strings.Repeat("3", 64) + `","18":"pgvector/pgvector@sha256:` + strings.Repeat("4", 64) + `"},
   "redis_images": {"7":"redis@sha256:` + strings.Repeat("5", 64) + `","8":"redis@sha256:` + strings.Repeat("6", 64) + `"},
-  "compose_target": "deploy/docker-compose.managed.yml"
+  "compose_target": "deploy/docker-compose.managed.yml",
+  "version_target": "releases/2.4.0/version.json"
 }`)
 
-	release, err := tufclient.DecodeReleaseManifest(manifest, []byte("services: {}\n"))
+	versionDocument := []byte(`{"version":"2.4.0","tag":"v2.4.0"}`)
+	release, err := tufclient.DecodeReleaseManifest(manifest, []byte("services: {}\n"), versionDocument)
 	if err != nil {
 		t.Fatalf("DecodeReleaseManifest() error = %v", err)
 	}
-	if release.Sequence != 17 || release.Version != "2.4.0" {
+	if release.Sequence != 17 || release.Version != "2.4.0" || string(release.VersionDocument) != string(versionDocument) {
 		t.Fatalf("release = %#v", release)
 	}
 }

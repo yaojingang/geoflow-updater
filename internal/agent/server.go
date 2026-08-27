@@ -6,15 +6,19 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
+	"github.com/yaojingang/geoflow-updater/internal/operation"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 )
 
 var (
@@ -26,16 +30,26 @@ type StatusProvider interface {
 	Run(context.Context, string) doctor.Report
 }
 
+type OperationManager interface {
+	StartUpdate(string) (operation.Operation, error)
+	StartBackup(string) (operation.Operation, error)
+	StartRollback(string, string) (operation.Operation, error)
+	StartVerify(string) (operation.Operation, error)
+	Current(string) (operation.Operation, error)
+	RecoveryPoints(string) ([]recovery.Point, error)
+}
+
 type Server struct {
-	StateDir string
-	Version  string
-	Status   StatusProvider
+	StateDir   string
+	Version    string
+	Status     StatusProvider
+	Operations OperationManager
 }
 
 func (server Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", server.health)
-	mux.HandleFunc("/v1/instances/", server.instanceStatus)
+	mux.HandleFunc("/v1/instances/", server.instanceRequest)
 
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.Header().Set("Cache-Control", "no-store")
@@ -56,14 +70,59 @@ func (server Server) health(response http.ResponseWriter, request *http.Request)
 	})
 }
 
-func (server Server) instanceStatus(response http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet {
-		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+func (server Server) instanceRequest(response http.ResponseWriter, request *http.Request) {
+	instanceID, endpoint, ok := instanceEndpoint(request.URL.Path)
+	if !ok {
+		writeError(response, http.StatusNotFound, "not_found")
 		return
 	}
-	instanceID, ok := statusInstanceID(request.URL.Path)
-	if !ok || !server.authorized(request, instanceID) {
+	if !server.authorized(request, instanceID) {
 		writeError(response, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	switch endpoint {
+	case "status":
+		server.instanceStatus(response, request, instanceID)
+	case "updates":
+		if request.ContentLength != 0 {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		server.startOperation(response, request, func() (operation.Operation, error) {
+			return server.Operations.StartUpdate(instanceID)
+		})
+	case "backups":
+		if request.Method == http.MethodGet {
+			server.recoveryPoints(response, instanceID)
+			return
+		}
+		if request.ContentLength != 0 {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		server.startOperation(response, request, func() (operation.Operation, error) {
+			return server.Operations.StartBackup(instanceID)
+		})
+	case "rollbacks":
+		server.startRollback(response, request, instanceID)
+	case "verify":
+		if request.ContentLength != 0 {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		server.startOperation(response, request, func() (operation.Operation, error) {
+			return server.Operations.StartVerify(instanceID)
+		})
+	case "operations/current":
+		server.currentOperation(response, request, instanceID)
+	default:
+		writeError(response, http.StatusNotFound, "not_found")
+	}
+}
+
+func (server Server) instanceStatus(response http.ResponseWriter, request *http.Request, instanceID string) {
+	if request.Method != http.MethodGet {
+		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
 	if server.Status == nil {
@@ -77,22 +136,143 @@ func (server Server) instanceStatus(response http.ResponseWriter, request *http.
 	})
 }
 
+func (server Server) startOperation(response http.ResponseWriter, request *http.Request, start func() (operation.Operation, error)) {
+	if request.Method != http.MethodPost {
+		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if server.Operations == nil {
+		writeError(response, http.StatusServiceUnavailable, "operations_unavailable")
+		return
+	}
+	started, err := start()
+	if errors.Is(err, operation.ErrActive) {
+		writeError(response, http.StatusConflict, "operation_active")
+		return
+	}
+	if errors.Is(err, operation.ErrInvalidRecoveryPoint) {
+		writeError(response, http.StatusBadRequest, "invalid_recovery_point")
+		return
+	}
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "operation_failed")
+		return
+	}
+	writeJSON(response, http.StatusAccepted, started)
+}
+
+func (server Server) startRollback(response http.ResponseWriter, request *http.Request, instanceID string) {
+	if request.Method != http.MethodPost {
+		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if server.Operations == nil {
+		writeError(response, http.StatusServiceUnavailable, "operations_unavailable")
+		return
+	}
+	request.Body = http.MaxBytesReader(response, request.Body, 4096)
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	var payload struct {
+		RecoveryPointID string `json:"recovery_point_id"`
+	}
+	if err := decoder.Decode(&payload); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeError(response, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	server.startOperation(response, request, func() (operation.Operation, error) {
+		return server.Operations.StartRollback(instanceID, payload.RecoveryPointID)
+	})
+}
+
+func (server Server) currentOperation(response http.ResponseWriter, request *http.Request, instanceID string) {
+	if request.Method != http.MethodGet {
+		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if server.Operations == nil {
+		writeError(response, http.StatusServiceUnavailable, "operations_unavailable")
+		return
+	}
+	current, err := server.Operations.Current(instanceID)
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(response, http.StatusNotFound, "operation_not_found")
+		return
+	}
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "operation_unavailable")
+		return
+	}
+	writeJSON(response, http.StatusOK, current)
+}
+
+func (server Server) recoveryPoints(response http.ResponseWriter, instanceID string) {
+	if server.Operations == nil {
+		writeError(response, http.StatusServiceUnavailable, "operations_unavailable")
+		return
+	}
+	points, err := server.Operations.RecoveryPoints(instanceID)
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "recovery_points_unavailable")
+		return
+	}
+	summaries := make([]recoveryPointSummary, 0, len(points))
+	for _, point := range points {
+		summaries = append(summaries, recoveryPointSummary{
+			SchemaVersion:   point.SchemaVersion,
+			ID:              point.ID,
+			InstanceID:      point.InstanceID,
+			Reason:          point.Reason,
+			CreatedAt:       point.CreatedAt,
+			Version:         point.Version,
+			ReleaseSequence: point.ReleaseSequence,
+		})
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"schema_version": 1, "recovery_points": summaries})
+}
+
+type recoveryPointSummary struct {
+	SchemaVersion   int       `json:"schema_version"`
+	ID              string    `json:"id"`
+	InstanceID      string    `json:"instance_id"`
+	Reason          string    `json:"reason"`
+	CreatedAt       time.Time `json:"created_at"`
+	Version         string    `json:"version"`
+	ReleaseSequence uint64    `json:"release_sequence"`
+}
+
 type instanceStatusResponse struct {
 	doctor.Report
 	UpdaterVersion string `json:"updater_version"`
 }
 
 func statusInstanceID(path string) (string, bool) {
-	const prefix = "/v1/instances/"
-	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, "/status") {
+	instanceID, endpoint, ok := instanceEndpoint(path)
+	if !ok || endpoint != "status" {
 		return "", false
 	}
-	id := strings.TrimSuffix(strings.TrimPrefix(path, prefix), "/status")
-	if !instanceIDPattern.MatchString(id) {
-		return "", false
-	}
+	return instanceID, true
+}
 
-	return id, true
+func instanceEndpoint(path string) (string, string, bool) {
+	const prefix = "/v1/instances/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, prefix), "/")
+	if len(parts) < 2 || len(parts) > 3 || !instanceIDPattern.MatchString(parts[0]) {
+		return "", "", false
+	}
+	endpoint := strings.Join(parts[1:], "/")
+	if endpoint == "" {
+		return "", "", false
+	}
+	return parts[0], endpoint, true
 }
 
 func (server Server) authorized(request *http.Request, instanceID string) bool {
@@ -120,6 +300,14 @@ func (server Server) authorized(request *http.Request, instanceID string) bool {
 }
 
 func ListenAndServe(ctx context.Context, socketPath string, handler http.Handler) error {
+	lock, err := acquireServerLock(socketPath + ".lock")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = lock.Close()
+	}()
 	if err := removeStaleSocket(socketPath); err != nil {
 		return err
 	}
@@ -156,6 +344,18 @@ func ListenAndServe(ctx context.Context, socketPath string, handler http.Handler
 	}
 
 	return err
+}
+
+func acquireServerLock(path string) (*os.File, error) {
+	lock, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o640)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lock.Close()
+		return nil, errors.New("another updater agent is already active")
+	}
+	return lock, nil
 }
 
 func removeStaleSocket(path string) error {

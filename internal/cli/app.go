@@ -3,13 +3,18 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
+	"github.com/yaojingang/geoflow-updater/internal/operation"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 )
 
 type Enroller interface {
@@ -20,13 +25,23 @@ type Diagnostician interface {
 	Run(context.Context, string) doctor.Report
 }
 
+type OperationController interface {
+	StartUpdate(string) (operation.Operation, error)
+	StartBackup(string) (operation.Operation, error)
+	StartRollback(string, string) (operation.Operation, error)
+	StartVerify(string) (operation.Operation, error)
+	Current(string) (operation.Operation, error)
+	RecoveryPoints(string) ([]recovery.Point, error)
+}
+
 type App struct {
-	Stdout   io.Writer
-	Stderr   io.Writer
-	Version  string
-	Enroller Enroller
-	Doctor   Diagnostician
-	Serve    func(context.Context) error
+	Stdout     io.Writer
+	Stderr     io.Writer
+	Version    string
+	Enroller   Enroller
+	Doctor     Diagnostician
+	Operations OperationController
+	Serve      func(context.Context) error
 }
 
 func (app App) Run(ctx context.Context, arguments []string) int {
@@ -50,6 +65,10 @@ func (app App) Run(ctx context.Context, arguments []string) int {
 		return app.doctor(ctx, arguments[1:], stdout, stderr)
 	case "serve":
 		return app.serve(ctx, arguments[1:], stderr)
+	case "update", "backup", "rollback", "verify":
+		return app.operation(ctx, arguments[0], arguments[1:], stdout, stderr)
+	case "recovery-points":
+		return app.recoveryPoints(arguments[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, app.Version)
 		return 0
@@ -61,6 +80,111 @@ func (app App) Run(ctx context.Context, arguments []string) int {
 		app.usage(stderr)
 		return 2
 	}
+}
+
+func (app App) operation(ctx context.Context, command string, arguments []string, stdout io.Writer, stderr io.Writer) int {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	instanceID := flags.String("instance", "primary", "managed instance identifier")
+	recoveryPointID := flags.String("recovery-point", "", "recovery point identifier")
+	jsonOutput := flags.Bool("json", false, "emit stable JSON")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || (command == "rollback" && *recoveryPointID == "") || (command != "rollback" && *recoveryPointID != "") {
+		fmt.Fprintf(stderr, "%s arguments are invalid\n", command)
+		return 2
+	}
+	if app.Operations == nil {
+		fmt.Fprintln(stderr, "updater operations are unavailable")
+		return 1
+	}
+	var started operation.Operation
+	var err error
+	switch command {
+	case "update":
+		started, err = app.Operations.StartUpdate(*instanceID)
+	case "backup":
+		started, err = app.Operations.StartBackup(*instanceID)
+	case "rollback":
+		started, err = app.Operations.StartRollback(*instanceID, *recoveryPointID)
+	case "verify":
+		started, err = app.Operations.StartVerify(*instanceID)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "%s failed to start: %v\n", command, err)
+		return 1
+	}
+	current, err := app.waitForOperation(ctx, *instanceID, started.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s wait failed: %v\n", command, err)
+		return 1
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(current); err != nil {
+			fmt.Fprintf(stderr, "encode operation: %v\n", err)
+			return 1
+		}
+	} else {
+		fmt.Fprintf(stdout, "GEOFlow updater %s %s", command, current.Status)
+		if current.RecoveryPointID != "" {
+			fmt.Fprintf(stdout, " with recovery point %s", current.RecoveryPointID)
+		}
+		fmt.Fprintln(stdout)
+		if current.Error != "" {
+			fmt.Fprintln(stderr, current.Error)
+		}
+	}
+	if current.Status != operation.StatusSucceeded {
+		return 1
+	}
+	return 0
+}
+
+func (app App) waitForOperation(ctx context.Context, instanceID string, operationID string) (operation.Operation, error) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, err := app.Operations.Current(instanceID)
+		if err == nil && current.ID == operationID && current.CompletedAt != nil {
+			return current, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return operation.Operation{}, err
+		}
+		select {
+		case <-ctx.Done():
+			return operation.Operation{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (app App) recoveryPoints(arguments []string, stdout io.Writer, stderr io.Writer) int {
+	flags := flag.NewFlagSet("recovery-points", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	instanceID := flags.String("instance", "primary", "managed instance identifier")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || app.Operations == nil {
+		fmt.Fprintln(stderr, "recovery-points arguments or service are invalid")
+		return 2
+	}
+	points, err := app.Operations.RecoveryPoints(*instanceID)
+	if err != nil {
+		fmt.Fprintf(stderr, "list recovery points: %v\n", err)
+		return 1
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(points); err != nil {
+		fmt.Fprintf(stderr, "encode recovery points: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func (app App) enroll(ctx context.Context, arguments []string, stdout io.Writer, stderr io.Writer) int {
@@ -164,5 +288,5 @@ func (app App) serve(ctx context.Context, arguments []string, stderr io.Writer) 
 }
 
 func (app App) usage(writer io.Writer) {
-	fmt.Fprintln(writer, "Usage: geoflow-updater <enroll|doctor|serve|version>")
+	fmt.Fprintln(writer, "Usage: geoflow-updater <enroll|doctor|update|backup|rollback|verify|recovery-points|serve|version>")
 }

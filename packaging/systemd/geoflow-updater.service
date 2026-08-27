@@ -18,6 +18,7 @@ StateDirectory=geoflow-updater
 StateDirectoryMode=0750
 ProtectSystem=full
 ProtectHome=read-only
+ReadWritePaths=/var/backups/geoflow-updater
 PrivateTmp=true
 PrivateDevices=true
 NoNewPrivileges=true
