@@ -209,6 +209,79 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 	}
 }
 
+func TestPublishSkipsOrphanedImmutableMetadataVersions(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	keysDir := filepath.Join(workingDir, "keys")
+	repositoryDir := filepath.Join(workingDir, "repository")
+	targetsDir := filepath.Join(workingDir, "targets")
+	mustWrite(t, filepath.Join(targetsDir, "deploy", "docker-compose.managed.yml"), []byte("services: {}\n"))
+	mustWriteReleaseManifest(t, targetsDir, 1, "1.0.0", "1", "2")
+	if err := tufrepo.Initialize(tufrepo.InitializeOptions{
+		KeysDir:       keysDir,
+		RepositoryDir: repositoryDir,
+		TargetsDir:    targetsDir,
+		Now:           func() time.Time { return time.Date(2026, time.August, 27, 0, 0, 0, 0, time.UTC) },
+	}); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	metadataDir := filepath.Join(repositoryDir, "metadata")
+	mustWrite(t, filepath.Join(metadataDir, "2.targets.json"), []byte("interrupted publication"))
+	mustWrite(t, filepath.Join(metadataDir, "2.snapshot.json"), []byte("interrupted publication"))
+	mustWriteReleaseManifest(t, targetsDir, 2, "1.1.0", "3", "4")
+
+	if err := tufrepo.Publish(tufrepo.PublishOptions{
+		RepositoryDir:    repositoryDir,
+		TargetsDir:       targetsDir,
+		TargetsKeyPath:   filepath.Join(keysDir, "targets.pem"),
+		SnapshotKeyPath:  filepath.Join(keysDir, "snapshot.pem"),
+		TimestampKeyPath: filepath.Join(keysDir, "timestamp.pem"),
+		Now:              func() time.Time { return time.Date(2026, time.August, 28, 0, 0, 0, 0, time.UTC) },
+	}); err != nil {
+		t.Fatalf("Publish() after orphaned metadata error = %v", err)
+	}
+
+	timestamp, err := metadata.Timestamp().FromFile(filepath.Join(metadataDir, "timestamp.json"))
+	if err != nil {
+		t.Fatalf("load timestamp metadata: %v", err)
+	}
+	if timestamp.Signed.Meta["snapshot.json"].Version != 3 {
+		t.Fatalf("published snapshot version = %d, want 3", timestamp.Signed.Meta["snapshot.json"].Version)
+	}
+	snapshot, err := metadata.Snapshot().FromFile(filepath.Join(metadataDir, "3.snapshot.json"))
+	if err != nil {
+		t.Fatalf("load recovered snapshot metadata: %v", err)
+	}
+	if snapshot.Signed.Meta["targets.json"].Version != 3 {
+		t.Fatalf("published targets version = %d, want 3", snapshot.Signed.Meta["targets.json"].Version)
+	}
+}
+
+func mustWriteReleaseManifest(t *testing.T, targetsDir string, sequence int, version string, appDigest string, webDigest string) {
+	t.Helper()
+	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(fmt.Sprintf(`{
+  "schema_version": 1,
+  "release_sequence": %d,
+  "version": %q,
+  "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:%s",
+  "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:%s",
+  "postgres_images": {"16":"pgvector/pgvector@sha256:%s","18":"pgvector/pgvector@sha256:%s"},
+  "redis_images": {"7":"redis@sha256:%s","8":"redis@sha256:%s"},
+  "compose_target": "deploy/docker-compose.managed.yml"
+}`,
+		sequence,
+		version,
+		strings.Repeat(appDigest, 64),
+		strings.Repeat(webDigest, 64),
+		strings.Repeat("5", 64),
+		strings.Repeat("6", 64),
+		strings.Repeat("7", 64),
+		strings.Repeat("8", 64),
+	)))
+}
+
 func mustWrite(t *testing.T, path string, contents []byte) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {

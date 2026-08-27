@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sigstore/sigstore/pkg/signature"
@@ -249,6 +251,33 @@ func listTargetFiles(root string) ([]string, error) {
 	sort.Strings(paths)
 
 	return paths, err
+}
+
+func nextMetadataVersion(metadataDir string, role string, current int64) (int64, error) {
+	maximum := current
+	entries, err := os.ReadDir(metadataDir)
+	if err != nil {
+		return 0, fmt.Errorf("inspect %s metadata versions: %w", role, err)
+	}
+	suffix := "." + role + ".json"
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
+			continue
+		}
+		versionText := strings.TrimSuffix(entry.Name(), suffix)
+		version, parseErr := strconv.ParseInt(versionText, 10, 64)
+		if parseErr != nil || version < 1 {
+			continue
+		}
+		if version > maximum {
+			maximum = version
+		}
+	}
+	if maximum == int64(^uint64(0)>>1) {
+		return 0, fmt.Errorf("%s metadata version is exhausted", role)
+	}
+
+	return maximum + 1, nil
 }
 
 func publishConsistentTarget(destinationRoot string, targetPath string, sourcePath string, info *metadata.TargetFiles) error {

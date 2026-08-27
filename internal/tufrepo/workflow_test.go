@@ -33,3 +33,29 @@ func TestMetadataPublishingWorkflowsExplicitlyDeployPagesAfterBotCommits(t *test
 		t.Fatal("Pages workflow cannot be dispatched after metadata publication")
 	}
 }
+
+func TestReleaseWorkflowStagesImagesAndUsesRecoverableDraftRelease(t *testing.T) {
+	t.Parallel()
+
+	contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+	workflow := string(contents)
+	for _, required := range []string{
+		"staging-${{ github.run_id }}-${{ github.run_attempt }}",
+		"--draft",
+		"--clobber",
+		"needs.preflight.outputs.resume",
+		"docker buildx imagetools create",
+		"verify-bootstrap",
+		"signed.targets[$target]",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("release workflow is missing recoverability control %q", required)
+		}
+	}
+	if strings.Contains(workflow, "ghcr.io/yaojingang/geoflow-app:${{ inputs.geoflow_version }}\n            ghcr.io/yaojingang/geoflow-app:latest") {
+		t.Error("release workflow publishes application release tags during the staging build")
+	}
+}

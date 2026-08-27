@@ -25,10 +25,11 @@ type Asset struct {
 }
 
 type Manifest struct {
-	SchemaVersion  int              `json:"schema_version"`
-	UpdaterVersion string           `json:"updater_version"`
-	Expires        time.Time        `json:"expires"`
-	Assets         map[string]Asset `json:"assets"`
+	SchemaVersion   int              `json:"schema_version"`
+	ReleaseSequence uint64           `json:"release_sequence"`
+	UpdaterVersion  string           `json:"updater_version"`
+	Expires         time.Time        `json:"expires"`
+	Assets          map[string]Asset `json:"assets"`
 }
 
 type Signature struct {
@@ -121,6 +122,9 @@ func Verify(envelope Envelope, trustedRoot []byte, now time.Time) error {
 func (manifest Manifest) Validate(now time.Time) error {
 	if manifest.SchemaVersion != 1 {
 		return fmt.Errorf("unsupported bootstrap manifest schema %d", manifest.SchemaVersion)
+	}
+	if manifest.ReleaseSequence == 0 {
+		return errors.New("bootstrap release sequence is required")
 	}
 	if !versionPattern.MatchString(manifest.UpdaterVersion) {
 		return errors.New("updater version is invalid")

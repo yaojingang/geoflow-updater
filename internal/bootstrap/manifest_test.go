@@ -32,9 +32,10 @@ func TestManifestSignatureIsAuthorizedByTrustedRootTargetsRole(t *testing.T) {
 	}
 
 	envelope, err := bootstrap.Sign(bootstrap.Manifest{
-		SchemaVersion:  1,
-		UpdaterVersion: "0.1.0",
-		Expires:        time.Date(2026, time.September, 27, 0, 0, 0, 0, time.UTC),
+		SchemaVersion:   1,
+		ReleaseSequence: 17,
+		UpdaterVersion:  "0.1.0",
+		Expires:         time.Date(2026, time.September, 27, 0, 0, 0, 0, time.UTC),
 		Assets: map[string]bootstrap.Asset{
 			"linux-amd64": {
 				URL:    "https://github.com/yaojingang/geoflow-updater/releases/download/v0.1.0/geoflow-updater_0.1.0_linux_amd64.tar.gz",
@@ -57,5 +58,29 @@ func TestManifestSignatureIsAuthorizedByTrustedRootTargetsRole(t *testing.T) {
 	}
 	if err := bootstrap.Verify(envelope, rootBytes, time.Date(2026, time.August, 28, 0, 0, 0, 0, time.UTC)); err == nil {
 		t.Fatal("Verify() accepted a tampered manifest")
+	}
+}
+
+func TestManifestRequiresReleaseSequence(t *testing.T) {
+	t.Parallel()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	_, err = bootstrap.Sign(bootstrap.Manifest{
+		SchemaVersion:  1,
+		UpdaterVersion: "0.1.0",
+		Expires:        time.Now().Add(time.Hour),
+		Assets: map[string]bootstrap.Asset{
+			"linux-amd64": {
+				URL:    "https://github.com/yaojingang/geoflow-updater/releases/download/v0.1.0/geoflow-updater_0.1.0_linux_amd64.tar.gz",
+				SHA256: strings.Repeat("a", 64),
+				Size:   1,
+			},
+		},
+	}, privateKey)
+	if err == nil || !strings.Contains(err.Error(), "release sequence") {
+		t.Fatalf("Sign() release sequence error = %v", err)
 	}
 }

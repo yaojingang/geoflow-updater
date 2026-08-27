@@ -45,8 +45,9 @@ The publisher rejects a non-increasing release sequence, unrecognized manifest f
 
 ## Failure handling
 
-- If build, signing, or local TUF validation fails before GitHub Release creation, fix the cause and dispatch again with the same inputs.
-- If GitHub Release creation succeeds and the metadata commit fails, keep the release out of installation instructions, inspect the branch movement, and complete the metadata publication only after confirming the generated digests. Use a new updater version when any release asset changes.
+- The workflow builds images under run-specific staging tags and keeps updater assets in a draft release until signed metadata is committed. A failure before the metadata commit can be retried with the same inputs; draft assets are replaced by the retry.
+- If the metadata commit succeeds and a later publication step fails, dispatch the workflow again with the same inputs. It recognizes the signed release sequence, validates the existing release assets, promotes only matching image digests, and dispatches Pages without signing a second release.
+- Immutable TUF metadata writers skip version numbers left by interrupted publications, so a failed metadata push can be retried after the branch conflict or service failure is resolved.
 - If an online signing key is exposed, stop releases, rotate that role through a new root metadata version signed by two root custodians, publish the new root chain, and refresh all online metadata.
 - If fewer than two root keys remain available, release trust cannot be changed. Restore a verified offline copy and complete a custody review before resuming publication.
 

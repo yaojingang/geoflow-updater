@@ -41,8 +41,15 @@ func Publish(options PublishOptions) error {
 	oldTimestamp := state.timestamp
 	oldSnapshot := state.snapshot
 	oldTargets := state.targets
-	oldTargetsVersion := oldTargets.Signed.Version
 	if err := validateReleaseProgression(oldTargets, publishedTargetsDir, options.TargetsDir); err != nil {
+		return err
+	}
+	targetsVersion, err := nextMetadataVersion(metadataDir, "targets", oldTargets.Signed.Version)
+	if err != nil {
+		return err
+	}
+	snapshotVersion, err := nextMetadataVersion(metadataDir, "snapshot", oldSnapshot.Signed.Version)
+	if err != nil {
 		return err
 	}
 
@@ -64,7 +71,7 @@ func Publish(options PublishOptions) error {
 		now = options.Now().UTC()
 	}
 	targets := metadata.Targets(now.Add(targetsValidity))
-	targets.Signed.Version = oldTargetsVersion + 1
+	targets.Signed.Version = targetsVersion
 	targetPaths, err := listTargetFiles(options.TargetsDir)
 	if err != nil {
 		return err
@@ -92,7 +99,7 @@ func Publish(options PublishOptions) error {
 	}
 
 	snapshot := metadata.Snapshot(now.Add(snapshotValidity))
-	snapshot.Signed.Version = oldSnapshot.Signed.Version + 1
+	snapshot.Signed.Version = snapshotVersion
 	snapshot.Signed.Meta["targets.json"] = metaFile(targets.Signed.Version, targetsBytes)
 	if err := signSnapshot(snapshot, snapshotKey); err != nil {
 		return fmt.Errorf("sign snapshot metadata: %w", err)

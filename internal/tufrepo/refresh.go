@@ -35,6 +35,10 @@ func RefreshOnline(options RefreshOnlineOptions) error {
 	if err != nil {
 		return err
 	}
+	snapshotVersion, err := nextMetadataVersion(metadataDir, "snapshot", state.snapshot.Signed.Version)
+	if err != nil {
+		return err
+	}
 	snapshotKey, err := LoadPrivateKey(options.SnapshotKeyPath)
 	if err != nil {
 		return fmt.Errorf("load snapshot key: %w", err)
@@ -53,7 +57,7 @@ func RefreshOnline(options RefreshOnlineOptions) error {
 		now = options.Now().UTC()
 	}
 	snapshot := metadata.Snapshot(now.Add(snapshotValidity))
-	snapshot.Signed.Version = state.snapshot.Signed.Version + 1
+	snapshot.Signed.Version = snapshotVersion
 	snapshot.Signed.Meta["targets.json"] = metaFile(state.targets.Signed.Version, targetsBytes)
 	if err := signSnapshot(snapshot, snapshotKey); err != nil {
 		return fmt.Errorf("sign refreshed snapshot metadata: %w", err)
@@ -101,6 +105,14 @@ func Refresh(options RefreshOptions) error {
 	oldTimestamp := state.timestamp
 	oldSnapshot := state.snapshot
 	targets := state.targets
+	targetsVersion, err := nextMetadataVersion(metadataDir, "targets", targets.Signed.Version)
+	if err != nil {
+		return err
+	}
+	snapshotVersion, err := nextMetadataVersion(metadataDir, "snapshot", oldSnapshot.Signed.Version)
+	if err != nil {
+		return err
+	}
 
 	targetsKey, err := LoadPrivateKey(options.TargetsKeyPath)
 	if err != nil {
@@ -119,7 +131,7 @@ func Refresh(options RefreshOptions) error {
 	if options.Now != nil {
 		now = options.Now().UTC()
 	}
-	targets.Signed.Version++
+	targets.Signed.Version = targetsVersion
 	targets.Signed.Expires = now.Add(targetsValidity)
 	targets.ClearSignatures()
 	if err := signTargets(targets, targetsKey); err != nil {
@@ -134,7 +146,7 @@ func Refresh(options RefreshOptions) error {
 	}
 
 	snapshot := metadata.Snapshot(now.Add(snapshotValidity))
-	snapshot.Signed.Version = oldSnapshot.Signed.Version + 1
+	snapshot.Signed.Version = snapshotVersion
 	snapshot.Signed.Meta["targets.json"] = metaFile(targets.Signed.Version, targetsBytes)
 	if err := signSnapshot(snapshot, snapshotKey); err != nil {
 		return fmt.Errorf("sign refreshed snapshot metadata: %w", err)

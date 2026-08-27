@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/bootstrap"
 	"github.com/yaojingang/geoflow-updater/internal/tufrepo"
@@ -29,9 +30,51 @@ func main() {
 		refreshOnline()
 	case "sign-bootstrap":
 		signBootstrap()
+	case "verify-bootstrap":
+		verifyBootstrap()
 	default:
 		usage()
 		os.Exit(2)
+	}
+}
+
+func verifyBootstrap() {
+	flags := flag.NewFlagSet("verify-bootstrap", flag.ExitOnError)
+	manifestPath := flags.String("manifest", "", "signed bootstrap envelope JSON")
+	trustedRootPath := flags.String("trusted-root", "", "trusted root metadata JSON")
+	updaterVersion := flags.String("updater-version", "", "expected updater version")
+	if err := flags.Parse(os.Args[2:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	contents, err := os.ReadFile(*manifestPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read bootstrap manifest: %v\n", err)
+		os.Exit(1)
+	}
+	trustedRoot, err := os.ReadFile(*trustedRootPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read trusted root: %v\n", err)
+		os.Exit(1)
+	}
+	var envelope bootstrap.Envelope
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		fmt.Fprintf(os.Stderr, "decode bootstrap manifest: %v\n", err)
+		os.Exit(1)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		fmt.Fprintln(os.Stderr, "decode bootstrap manifest: trailing JSON value")
+		os.Exit(1)
+	}
+	if envelope.Signed.UpdaterVersion != *updaterVersion {
+		fmt.Fprintf(os.Stderr, "bootstrap updater version %q does not match %q\n", envelope.Signed.UpdaterVersion, *updaterVersion)
+		os.Exit(1)
+	}
+	if err := bootstrap.Verify(envelope, trustedRoot, time.Now().UTC()); err != nil {
+		fmt.Fprintf(os.Stderr, "verify bootstrap manifest: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -171,4 +214,5 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  geoflow-tuf refresh --repository-dir PATH --targets-key PATH --snapshot-key PATH --timestamp-key PATH")
 	fmt.Fprintln(os.Stderr, "  geoflow-tuf refresh-online --repository-dir PATH --snapshot-key PATH --timestamp-key PATH")
 	fmt.Fprintln(os.Stderr, "  geoflow-tuf sign-bootstrap --manifest PATH --targets-key PATH --output PATH")
+	fmt.Fprintln(os.Stderr, "  geoflow-tuf verify-bootstrap --manifest PATH --trusted-root PATH --updater-version VERSION")
 }
