@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal tuf)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        run: go test -race ./...
+      - name: Build static Linux binaries
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/geoflow-updater
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath ./cmd/geoflow-updater
+      - name: Validate managed Compose
+        env:
+          GEOFLOW_INSTANCE_ID: ci
+          GEOFLOW_UPDATER_GROUP_ID: "991"
+          GEOFLOW_APP_IMAGE: ghcr.io/yaojingang/geoflow-app@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          GEOFLOW_WEB_IMAGE: ghcr.io/yaojingang/geoflow-web@sha256:2222222222222222222222222222222222222222222222222222222222222222
+          GEOFLOW_POSTGRES_IMAGE: pgvector/pgvector@sha256:3333333333333333333333333333333333333333333333333333333333333333
+          GEOFLOW_POSTGRES_DATA_DIR: ${{ runner.temp }}/geoflow/docker-data/prod/postgres
+          GEOFLOW_POSTGRES_CONTAINER_DATA_DIR: /var/lib/postgresql
+          GEOFLOW_REDIS_IMAGE: redis@sha256:4444444444444444444444444444444444444444444444444444444444444444
+          DB_PASSWORD: ci-only
+        run: |
+          mkdir -p "$RUNNER_TEMP/geoflow/storage" "$RUNNER_TEMP/geoflow/docker-data/prod/postgres"
+          touch "$RUNNER_TEMP/geoflow/.env.prod"
+          export GEOFLOW_INSTANCE_ROOT="$RUNNER_TEMP/geoflow"
+          docker compose -f assets/docker-compose.managed.yml config --quiet
+      - name: Check installer shell
+        run: shellcheck packaging/scripts/install.sh

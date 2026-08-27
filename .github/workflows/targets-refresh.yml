@@ -1,0 +1,49 @@
+name: Refresh TUF targets metadata
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: geoflow-release
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    environment: release-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Materialize role keys
+        env:
+          TARGETS_KEY_B64: ${{ secrets.TUF_TARGETS_KEY_B64 }}
+          SNAPSHOT_KEY_B64: ${{ secrets.TUF_SNAPSHOT_KEY_B64 }}
+          TIMESTAMP_KEY_B64: ${{ secrets.TUF_TIMESTAMP_KEY_B64 }}
+        run: |
+          umask 077
+          printf '%s' "$TARGETS_KEY_B64" | base64 --decode > "$RUNNER_TEMP/targets.pem"
+          printf '%s' "$SNAPSHOT_KEY_B64" | base64 --decode > "$RUNNER_TEMP/snapshot.pem"
+          printf '%s' "$TIMESTAMP_KEY_B64" | base64 --decode > "$RUNNER_TEMP/timestamp.pem"
+      - name: Refresh targets, snapshot, and timestamp metadata
+        run: |
+          go run ./cmd/geoflow-tuf refresh \
+            --repository-dir tuf/repository \
+            --targets-key "$RUNNER_TEMP/targets.pem" \
+            --snapshot-key "$RUNNER_TEMP/snapshot.pem" \
+            --timestamp-key "$RUNNER_TEMP/timestamp.pem"
+      - name: Commit refreshed metadata
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tuf/repository
+          git commit -m "chore: refresh TUF targets metadata"
+          git push origin HEAD:main

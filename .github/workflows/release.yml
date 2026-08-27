@@ -1,0 +1,259 @@
+name: Release updater and GEOFlow images
+
+on:
+  workflow_dispatch:
+    inputs:
+      updater_version:
+        description: Updater semantic version without v prefix
+        required: true
+        type: string
+      geoflow_ref:
+        description: GEOFlow tag or immutable commit to build
+        required: true
+        type: string
+      geoflow_version:
+        description: GEOFlow semantic version without v prefix
+        required: true
+        type: string
+      release_sequence:
+        description: Monotonically increasing GEOFlow release sequence
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: geoflow-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yaojingang/GEOFlow
+          ref: ${{ inputs.geoflow_ref }}
+          path: geoflow
+      - name: Validate immutable release inputs and source version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+          GEOFLOW_REF: ${{ inputs.geoflow_ref }}
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+        run: |
+          [[ "$UPDATER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$GEOFLOW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GEOFLOW_REF" == "v$GEOFLOW_VERSION" || "$GEOFLOW_REF" =~ ^[a-f0-9]{40}$ || "$GEOFLOW_REF" =~ ^[a-f0-9]{64}$ ]]
+          test "$(jq -er '.version' geoflow/version.json)" = "$GEOFLOW_VERSION"
+          if gh release view "v$UPDATER_VERSION" --repo yaojingang/geoflow-updater >/dev/null 2>&1; then
+            echo "Updater version v$UPDATER_VERSION already exists and is immutable." >&2
+            exit 1
+          fi
+      - name: Verify updater source
+        run: |
+          test -z "$(gofmt -l cmd internal tuf)"
+          go vet ./...
+          go test -race ./...
+
+  images:
+    needs: preflight
+    environment: release-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      app_digest: ${{ steps.app.outputs.digest }}
+      web_digest: ${{ steps.web.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yaojingang/GEOFlow
+          ref: ${{ inputs.geoflow_ref }}
+          path: geoflow
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite immutable GEOFlow version tags
+        env:
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+        run: |
+          if docker buildx imagetools inspect "ghcr.io/yaojingang/geoflow-app:$GEOFLOW_VERSION" >/dev/null 2>&1; then
+            echo "Application image tag $GEOFLOW_VERSION already exists." >&2
+            exit 1
+          fi
+          if docker buildx imagetools inspect "ghcr.io/yaojingang/geoflow-web:$GEOFLOW_VERSION" >/dev/null 2>&1; then
+            echo "Web image tag $GEOFLOW_VERSION already exists." >&2
+            exit 1
+          fi
+      - id: app
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: geoflow
+          file: geoflow/docker/Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/yaojingang/geoflow-app:${{ inputs.geoflow_version }}
+            ghcr.io/yaojingang/geoflow-app:latest
+          provenance: mode=max
+          sbom: true
+      - id: web
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: geoflow
+          file: geoflow/docker/nginx/Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/yaojingang/geoflow-web:${{ inputs.geoflow_version }}
+            ghcr.io/yaojingang/geoflow-web:latest
+          provenance: mode=max
+          sbom: true
+
+  publish:
+    needs: images
+    environment: release-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate release inputs
+        env:
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+        run: |
+          [[ "$UPDATER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$GEOFLOW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
+      - name: Build release archives
+        env:
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            stage="$(mktemp -d)"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.version=$UPDATER_VERSION" -o "$stage/geoflow-updater" ./cmd/geoflow-updater
+            cp -R packaging "$stage/packaging"
+            cp LICENSE README.md "$stage/"
+            tar -C "$stage" -czf "dist/geoflow-updater_${UPDATER_VERSION}_linux_${arch}.tar.gz" .
+          done
+          (cd dist && sha256sum geoflow-updater_*.tar.gz > checksums.txt)
+      - name: Materialize online signing keys
+        env:
+          TARGETS_KEY_B64: ${{ secrets.TUF_TARGETS_KEY_B64 }}
+          SNAPSHOT_KEY_B64: ${{ secrets.TUF_SNAPSHOT_KEY_B64 }}
+          TIMESTAMP_KEY_B64: ${{ secrets.TUF_TIMESTAMP_KEY_B64 }}
+        run: |
+          umask 077
+          printf '%s' "$TARGETS_KEY_B64" | base64 --decode > "$RUNNER_TEMP/targets.pem"
+          printf '%s' "$SNAPSHOT_KEY_B64" | base64 --decode > "$RUNNER_TEMP/snapshot.pem"
+          printf '%s' "$TIMESTAMP_KEY_B64" | base64 --decode > "$RUNNER_TEMP/timestamp.pem"
+      - name: Create signed bootstrap manifest
+        env:
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+        run: |
+          amd64_archive="dist/geoflow-updater_${UPDATER_VERSION}_linux_amd64.tar.gz"
+          arm64_archive="dist/geoflow-updater_${UPDATER_VERSION}_linux_arm64.tar.gz"
+          expires="$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')"
+          jq -n \
+            --arg version "$UPDATER_VERSION" \
+            --arg expires "$expires" \
+            --arg amd64_url "https://github.com/yaojingang/geoflow-updater/releases/download/v${UPDATER_VERSION}/$(basename "$amd64_archive")" \
+            --arg amd64_sha "$(sha256sum "$amd64_archive" | cut -d ' ' -f 1)" \
+            --argjson amd64_size "$(stat -c '%s' "$amd64_archive")" \
+            --arg arm64_url "https://github.com/yaojingang/geoflow-updater/releases/download/v${UPDATER_VERSION}/$(basename "$arm64_archive")" \
+            --arg arm64_sha "$(sha256sum "$arm64_archive" | cut -d ' ' -f 1)" \
+            --argjson arm64_size "$(stat -c '%s' "$arm64_archive")" \
+            '{schema_version:1,updater_version:$version,expires:$expires,assets:{"linux-amd64":{url:$amd64_url,sha256:$amd64_sha,size:$amd64_size},"linux-arm64":{url:$arm64_url,sha256:$arm64_sha,size:$arm64_size}}}' \
+            > dist/bootstrap-manifest.unsigned.json
+          go run ./cmd/geoflow-tuf sign-bootstrap \
+            --manifest dist/bootstrap-manifest.unsigned.json \
+            --targets-key "$RUNNER_TEMP/targets.pem" \
+            --output dist/bootstrap-manifest.json
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/geoflow-updater_*.tar.gz
+      - name: Publish TUF targets and metadata
+        env:
+          APP_DIGEST: ${{ needs.images.outputs.app_digest }}
+          WEB_DIGEST: ${{ needs.images.outputs.web_digest }}
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+        run: |
+          targets_dir="$(mktemp -d)"
+          mkdir -p "$targets_dir/deploy" "$targets_dir/releases" "$targets_dir/updater/$UPDATER_VERSION"
+          cp assets/docker-compose.managed.yml "$targets_dir/deploy/docker-compose.managed.yml"
+          cp dist/geoflow-updater_*.tar.gz dist/checksums.txt "$targets_dir/updater/$UPDATER_VERSION/"
+          jq -n \
+            --argjson sequence "$RELEASE_SEQUENCE" \
+            --arg version "$GEOFLOW_VERSION" \
+            --arg app_image "ghcr.io/yaojingang/geoflow-app@$APP_DIGEST" \
+            --arg web_image "ghcr.io/yaojingang/geoflow-web@$WEB_DIGEST" \
+            --arg postgres_16_image "pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b" \
+            --arg postgres_18_image "pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a" \
+            --arg redis_7_image "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf" \
+            --arg redis_8_image "redis@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576" \
+            '{schema_version:1,release_sequence:$sequence,version:$version,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml"}' \
+            > "$targets_dir/releases/current.json"
+          go run ./cmd/geoflow-tuf publish \
+            --repository-dir tuf/repository \
+            --targets-dir "$targets_dir" \
+            --targets-key "$RUNNER_TEMP/targets.pem" \
+            --snapshot-key "$RUNNER_TEMP/snapshot.pem" \
+            --timestamp-key "$RUNNER_TEMP/timestamp.pem"
+      - name: Create GitHub release before advertising it through TUF
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+        run: |
+          gh release create "v$UPDATER_VERSION" \
+            dist/geoflow-updater_*.tar.gz \
+            dist/checksums.txt \
+            dist/bootstrap-manifest.json \
+            --target "$GITHUB_SHA" \
+            --title "GEOFlow Updater v$UPDATER_VERSION" \
+            --notes "Installs GEOFlow Updater and enrolls GEOFlow $GEOFLOW_VERSION managed deployments."
+      - name: Commit public TUF metadata
+        env:
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tuf/repository
+          git commit -m "release: publish GEOFlow $GEOFLOW_VERSION metadata"
+          git push origin HEAD:main
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: geoflow-updater-${{ inputs.updater_version }}
+          path: |
+            dist/geoflow-updater_*.tar.gz
+            dist/checksums.txt
+            dist/bootstrap-manifest.json
+          if-no-files-found: error

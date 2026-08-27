@@ -1,0 +1,29 @@
+[Unit]
+Description=GEOFlow Updater control agent
+Documentation=https://github.com/yaojingang/geoflow-updater
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=geoflow-updater
+ExecStart=/usr/local/sbin/geoflow-updater serve
+Restart=on-failure
+RestartSec=5s
+UMask=0027
+RuntimeDirectory=geoflow-updater
+RuntimeDirectoryMode=0750
+StateDirectory=geoflow-updater
+StateDirectoryMode=0750
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

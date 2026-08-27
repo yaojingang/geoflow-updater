@@ -1,0 +1,6 @@
+/dist/
+/geoflow-updater
+/geoflow-tuf
+*.test
+*.out
+.DS_Store
