@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yaojingang/geoflow-updater/internal/authorization"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
 	"github.com/yaojingang/geoflow-updater/internal/operation"
@@ -35,14 +36,19 @@ type OperationController interface {
 	RecoveryPoints(string) ([]recovery.Point, error)
 }
 
+type AuthorizationProvisioner interface {
+	Provision(string) (authorization.Provisioning, error)
+}
+
 type App struct {
-	Stdout     io.Writer
-	Stderr     io.Writer
-	Version    string
-	Enroller   Enroller
-	Doctor     Diagnostician
-	Operations OperationController
-	Serve      func(context.Context) error
+	Stdout        io.Writer
+	Stderr        io.Writer
+	Version       string
+	Enroller      Enroller
+	Doctor        Diagnostician
+	Operations    OperationController
+	Authorization AuthorizationProvisioner
+	Serve         func(context.Context) error
 }
 
 func (app App) Run(ctx context.Context, arguments []string) int {
@@ -70,6 +76,8 @@ func (app App) Run(ctx context.Context, arguments []string) int {
 		return app.operation(ctx, arguments[0], arguments[1:], stdout, stderr)
 	case "recovery-points":
 		return app.recoveryPoints(arguments[1:], stdout, stderr)
+	case "authorization-uri":
+		return app.authorizationURI(arguments[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, app.Version)
 		return 0
@@ -81,6 +89,39 @@ func (app App) Run(ctx context.Context, arguments []string) int {
 		app.usage(stderr)
 		return 2
 	}
+}
+
+func (app App) authorizationURI(arguments []string, stdout io.Writer, stderr io.Writer) int {
+	flags := flag.NewFlagSet("authorization-uri", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	instanceID := flags.String("instance", "primary", "managed instance identifier")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "authorization-uri accepts no positional arguments")
+		return 2
+	}
+	if app.Authorization == nil {
+		fmt.Fprintln(stderr, "mutation authorization service is unavailable")
+		return 1
+	}
+	provisioning, err := app.Authorization.Provision(*instanceID)
+	if err != nil {
+		fmt.Fprintf(stderr, "provision mutation authorization: %v\n", err)
+		return 1
+	}
+	if len(provisioning.Factors) != 3 {
+		fmt.Fprintln(stderr, "mutation authorization provisioning returned an invalid factor set")
+		return 1
+	}
+	fmt.Fprintln(stdout, "Add these operation-specific URIs to an authenticator controlled by an authorized administrator:")
+	for _, factor := range provisioning.Factors {
+		fmt.Fprintf(stdout, "%s: %s\n", factor.Scope, factor.URI)
+	}
+	fmt.Fprintln(stdout, "Use the code from the matching update, backup, or rollback entry. Accepted codes are single-use.")
+
+	return 0
 }
 
 func (app App) operation(ctx context.Context, command string, arguments []string, stdout io.Writer, stderr io.Writer) int {
@@ -221,7 +262,8 @@ func (app App) enroll(ctx context.Context, arguments []string, stdout io.Writer,
 		shellQuote(result.Instance.ComposeFile),
 	)
 	fmt.Fprintf(stdout, "Before handover, confirm every GEOFlow queue is idle. Pending jobs stored in the legacy Redis container may be lost when that container stops.\n")
-	fmt.Fprintf(stdout, "Complete the planned handover. The first command stops the standard production project before its database volume is attached to the signed deployment:\n%s down\n%s up -d\n", composePrefix, composePrefix)
+	fmt.Fprintf(stdout, "Complete the planned handover. The first command stops the standard production project before its database volume is attached to the signed deployment:\n%s down --remove-orphans\n%s up -d --remove-orphans\n", composePrefix, composePrefix)
+	fmt.Fprintf(stdout, "Provision the administrator-held mutation factor:\ngeoflow-updater authorization-uri --instance %s\n", *instanceID)
 	fmt.Fprintf(stdout, "Then verify it:\ngeoflow-updater doctor --instance %s\n", *instanceID)
 	return 0
 }
@@ -289,5 +331,5 @@ func (app App) serve(ctx context.Context, arguments []string, stderr io.Writer) 
 }
 
 func (app App) usage(writer io.Writer) {
-	fmt.Fprintln(writer, "Usage: geoflow-updater <enroll|doctor|update|backup|rollback|verify|recovery-points|serve|version>")
+	fmt.Fprintln(writer, "Usage: geoflow-updater <enroll|doctor|authorization-uri|update|backup|rollback|verify|recovery-points|serve|version>")
 }

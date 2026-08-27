@@ -87,10 +87,35 @@ func (service *Service) Preflight(ctx context.Context, instanceID string, releas
 		return errors.New("deployment diagnostics are unavailable")
 	}
 	report := service.Doctor.Run(ctx, instanceID)
-	if report.Status != doctor.StatusPass {
+	if !updatePreflightReportAllowed(report) {
 		return fmt.Errorf("current deployment diagnostics returned %s", report.Status)
 	}
 	return nil
+}
+
+func updatePreflightReportAllowed(report doctor.Report) bool {
+	if report.Status == doctor.StatusPass {
+		return true
+	}
+	if report.Status != doctor.StatusFail {
+		return false
+	}
+	tolerated := false
+	for _, check := range report.Checks {
+		switch check.Status {
+		case doctor.StatusPass:
+			continue
+		case doctor.StatusFail:
+			if tolerated || check.ID != doctor.RetiredUpdateWorkerCheckID {
+				return false
+			}
+			tolerated = true
+		default:
+			return false
+		}
+	}
+
+	return tolerated
 }
 
 func (service *Service) Pull(ctx context.Context, instanceID string, release managed.Release) error {
@@ -131,7 +156,11 @@ func (service *Service) QuiesceForRecovery(ctx context.Context, instanceID strin
 func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config) error {
 	arguments := composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile)
 	_ = service.runner().Run(ctx, nil, io.Discard, "docker", append(arguments, "exec", "-T", "app", "php", "artisan", "down", "--retry=60")...)
-	services := []string{"queue", "knowledge-queue", "system-update-queue", "scheduler", "reverb", "web", "app", "redis"}
+	if err := service.runner().Run(ctx, nil, io.Discard, "docker", "stop", "--time", "900", "geoflow-system-update-queue-prod"); err != nil && !strings.Contains(err.Error(), "No such container") {
+		resumeErr := service.Resume(ctx, instanceID)
+		return errors.Join(fmt.Errorf("stop retired application update executor: %w", err), resumeErr)
+	}
+	services := []string{"queue", "knowledge-queue", "scheduler", "reverb", "web", "app", "redis"}
 	if err := service.runner().Run(ctx, nil, io.Discard, "docker", append(append(arguments, "stop"), services...)...); err != nil {
 		resumeErr := service.Resume(ctx, instanceID)
 		return errors.Join(fmt.Errorf("stop application services: %w", err), resumeErr)

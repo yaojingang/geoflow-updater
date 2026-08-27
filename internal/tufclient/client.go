@@ -26,16 +26,17 @@ var releaseVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0
 var sourceCommitPattern = regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`)
 
 type releaseManifest struct {
-	SchemaVersion   int               `json:"schema_version"`
-	ReleaseSequence uint64            `json:"release_sequence"`
-	Version         string            `json:"version"`
-	SourceCommit    string            `json:"source_commit,omitempty"`
-	AppImage        string            `json:"app_image"`
-	WebImage        string            `json:"web_image"`
-	PostgresImages  map[string]string `json:"postgres_images"`
-	RedisImages     map[string]string `json:"redis_images"`
-	ComposeTarget   string            `json:"compose_target"`
-	VersionTarget   string            `json:"version_target,omitempty"`
+	SchemaVersion          int               `json:"schema_version"`
+	ReleaseSequence        uint64            `json:"release_sequence"`
+	MinimumUpdaterProtocol uint64            `json:"minimum_updater_protocol,omitempty"`
+	Version                string            `json:"version"`
+	SourceCommit           string            `json:"source_commit,omitempty"`
+	AppImage               string            `json:"app_image"`
+	WebImage               string            `json:"web_image"`
+	PostgresImages         map[string]string `json:"postgres_images"`
+	RedisImages            map[string]string `json:"redis_images"`
+	ComposeTarget          string            `json:"compose_target"`
+	VersionTarget          string            `json:"version_target,omitempty"`
 }
 
 type Client struct {
@@ -135,14 +136,15 @@ func DecodeReleaseManifest(manifestBytes []byte, composeBytes []byte, versionDoc
 		return managed.Release{}, err
 	}
 	release := managed.Release{
-		Sequence:        manifest.ReleaseSequence,
-		Version:         manifest.Version,
-		SourceCommit:    manifest.SourceCommit,
-		AppImage:        manifest.AppImage,
-		WebImage:        manifest.WebImage,
-		PostgresImages:  manifest.PostgresImages,
-		RedisImages:     manifest.RedisImages,
-		ComposeTemplate: composeBytes,
+		Sequence:               manifest.ReleaseSequence,
+		MinimumUpdaterProtocol: manifest.MinimumUpdaterProtocol,
+		Version:                manifest.Version,
+		SourceCommit:           manifest.SourceCommit,
+		AppImage:               manifest.AppImage,
+		WebImage:               manifest.WebImage,
+		PostgresImages:         manifest.PostgresImages,
+		RedisImages:            manifest.RedisImages,
+		ComposeTemplate:        composeBytes,
 	}
 	if len(versionDocuments) > 1 {
 		return managed.Release{}, errors.New("only one signed version document is allowed")
@@ -167,7 +169,23 @@ func decodeManifest(contents []byte) (releaseManifest, error) {
 	if err := ensureJSONEnd(decoder); err != nil {
 		return releaseManifest{}, err
 	}
-	if manifest.SchemaVersion != 1 {
+	switch manifest.SchemaVersion {
+	case 1:
+		if manifest.MinimumUpdaterProtocol != 0 {
+			return releaseManifest{}, errors.New("legacy release manifest declares an updater protocol")
+		}
+		manifest.MinimumUpdaterProtocol = 1
+	case 2:
+		if manifest.MinimumUpdaterProtocol < 2 {
+			return releaseManifest{}, errors.New("Phase C release manifest requires updater protocol 2")
+		}
+		if manifest.MinimumUpdaterProtocol > managed.UpdaterProtocolVersion {
+			return releaseManifest{}, fmt.Errorf("release requires updater protocol %d, current protocol is %d", manifest.MinimumUpdaterProtocol, managed.UpdaterProtocolVersion)
+		}
+		if !sourceCommitPattern.MatchString(manifest.SourceCommit) || manifest.VersionTarget != "releases/"+manifest.Version+"/version.json" {
+			return releaseManifest{}, errors.New("Phase C release manifest source commit or version target is invalid")
+		}
+	default:
 		return releaseManifest{}, fmt.Errorf("unsupported release manifest schema %d", manifest.SchemaVersion)
 	}
 	if manifest.ReleaseSequence == 0 || !releaseVersionPattern.MatchString(manifest.Version) {

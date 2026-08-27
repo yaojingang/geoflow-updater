@@ -15,9 +15,10 @@ The current implementation provides:
 - PostgreSQL custom-format dumps, compressed site storage and persistent Redis data, deployment state, and configuration recovery points;
 - automatic rollback after protected-stage failures and startup reconciliation after interrupted operations;
 - authenticated typed operations for update, backup, verification, recovery-point listing, and rollback;
+- administrator-held six-digit mutation authorization with replay protection for website-triggered update, backup, and rollback requests;
 - direct CLI operations and administrator update-center controls.
 
-The existing Laravel update executor remains available during the Phase B bridge period and is retired in Phase C after stability verification.
+The Laravel update executor is retired. Its database records remain available as read-only history in the administrator update center. Serialized legacy jobs are handled by a one-release tombstone that records retirement without changing files, databases, or containers.
 
 ## Supported environment
 
@@ -41,16 +42,17 @@ sha256sum --check checksums.txt --ignore-missing
 tar -xzf geoflow-updater_VERSION_linux_ARCH.tar.gz
 sudo ./packaging/scripts/install.sh
 sudo geoflow-updater enroll --instance-id primary --instance-root /opt/geoflow
+sudo geoflow-updater authorization-uri --instance primary
 sudo docker compose \
   --env-file /opt/geoflow/.env.prod \
   --env-file /var/lib/geoflow-updater/instances/primary/release.env \
   -f /var/lib/geoflow-updater/instances/primary/docker-compose.managed.yml \
-  down
+  down --remove-orphans
 sudo docker compose \
   --env-file /opt/geoflow/.env.prod \
   --env-file /var/lib/geoflow-updater/instances/primary/release.env \
   -f /var/lib/geoflow-updater/instances/primary/docker-compose.managed.yml \
-  up -d
+  up -d --remove-orphans
 sudo geoflow-updater doctor --instance primary
 ```
 
@@ -62,7 +64,7 @@ The installer does not support a remote `curl | sudo sh` flow. Review the extrac
 
 ## Transactional operations
 
-The administrator update center uses the authenticated Unix-socket API. The same fixed operations are available on the host:
+The administrator update center uses the authenticated Unix-socket API. `authorization-uri` creates three authenticator entries scoped to update, backup, and rollback. Each website mutation requires the instance control token and a fresh code from the matching entry. Accepted counters are persisted separately and consumed once. Five consecutive invalid guesses start a persistent 15-minute lockout; later invalid guesses double the delay up to 24 hours, and a successful authorization resets the failure state. Status, recovery-point listing, and verification remain control-token operations. Website rollback is fixed to the newest pre-update checkpoint. Root can select any verified recovery point through the host CLI:
 
 ```bash
 sudo geoflow-updater update --instance primary
@@ -85,7 +87,7 @@ Recovery points include a PostgreSQL custom-format dump, the complete `storage/`
 | `/run/geoflow-updater/geoflow-updater.sock` | Local control API socket |
 | `/var/backups/geoflow-updater` | Root-only transactional recovery points |
 
-Each enrolled instance receives `instance.yml`, `release.env`, `docker-compose.managed.yml`, and a private `control.token`. The application container receives the socket and its instance token. It never receives `/var/run/docker.sock`. The `doctor` command checks the installed version, database cluster, strict release pins, effective Compose configuration, and the running or healthy state of every required managed container.
+Each enrolled instance receives `instance.yml`, `release.env`, `docker-compose.managed.yml`, a private `control.token`, and an optional root-only `mutation.secret` after authorization provisioning. Three operation-specific authenticator secrets are derived from that master secret. The application container receives the socket and its instance token. It does not receive `mutation.secret` or `/var/run/docker.sock`. The `doctor` command checks the installed version, database cluster, mutation authorization, strict release pins, effective Compose configuration, and the running or healthy state of every required managed container.
 
 ## Trust and releases
 

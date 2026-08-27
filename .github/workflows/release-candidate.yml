@@ -1,0 +1,221 @@
+name: Build Phase C release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      updater_version:
+        description: Updater semantic version without v prefix
+        required: true
+        type: string
+      geoflow_ref:
+        description: GEOFlow protected tag or immutable commit
+        required: true
+        type: string
+      geoflow_version:
+        description: GEOFlow semantic version without v prefix
+        required: true
+        type: string
+      release_sequence:
+        description: Monotonically increasing GEOFlow release sequence
+        required: true
+        type: number
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: geoflow-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    environment: release-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yaojingang/GEOFlow
+          ref: ${{ inputs.geoflow_ref }}
+          path: geoflow
+      - id: source
+        name: Validate and pin candidate sources
+        env:
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+          GEOFLOW_REF: ${{ inputs.geoflow_ref }}
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          [[ "$UPDATER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$GEOFLOW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GEOFLOW_REF" == "v$GEOFLOW_VERSION" || "$GEOFLOW_REF" =~ ^[a-f0-9]{40}$ || "$GEOFLOW_REF" =~ ^[a-f0-9]{64}$ ]]
+          test "$(jq -er '.version' geoflow/version.json)" = "$GEOFLOW_VERSION"
+          geoflow_sha="$(git -C geoflow rev-parse HEAD)"
+          [[ "$geoflow_sha" =~ ^[a-f0-9]{40}$|^[a-f0-9]{64}$ ]]
+          if [[ "$GEOFLOW_REF" =~ ^[a-f0-9]{40}$|^[a-f0-9]{64}$ ]]; then
+            test "$geoflow_sha" = "$GEOFLOW_REF"
+          fi
+          echo "geoflow_sha=$geoflow_sha" >> "$GITHUB_OUTPUT"
+      - name: Verify updater source
+        run: |
+          test -z "$(gofmt -l cmd internal tuf)"
+          go vet ./...
+          go test -race ./...
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: app
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: geoflow
+          file: geoflow/docker/Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/yaojingang/geoflow-app:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          provenance: mode=max
+          sbom: true
+      - id: web
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: geoflow
+          file: geoflow/docker/nginx/Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/yaojingang/geoflow-web:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          provenance: mode=max
+          sbom: true
+      - name: Build deterministic updater archives
+        env:
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+        run: |
+          mkdir -p candidate/dist
+          for arch in amd64 arm64; do
+            stage="$(mktemp -d)"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.version=$UPDATER_VERSION" -o "$stage/geoflow-updater" ./cmd/geoflow-updater
+            cp -R packaging "$stage/packaging"
+            cp LICENSE README.md "$stage/"
+            find "$stage" -exec touch -h -d '@0' {} +
+            TZ=UTC tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -C "$stage" -czf "candidate/dist/geoflow-updater_${UPDATER_VERSION}_linux_${arch}.tar.gz" .
+          done
+          (cd candidate/dist && sha256sum geoflow-updater_*.tar.gz > checksums.txt)
+      - name: Materialize candidate signing keys
+        env:
+          TARGETS_KEY_B64: ${{ secrets.TUF_TARGETS_KEY_B64 }}
+          SNAPSHOT_KEY_B64: ${{ secrets.TUF_SNAPSHOT_KEY_B64 }}
+          TIMESTAMP_KEY_B64: ${{ secrets.TUF_TIMESTAMP_KEY_B64 }}
+        run: |
+          umask 077
+          printf '%s' "$TARGETS_KEY_B64" | base64 --decode > "$RUNNER_TEMP/targets.pem"
+          printf '%s' "$SNAPSHOT_KEY_B64" | base64 --decode > "$RUNNER_TEMP/snapshot.pem"
+          printf '%s' "$TIMESTAMP_KEY_B64" | base64 --decode > "$RUNNER_TEMP/timestamp.pem"
+      - name: Create signed bootstrap manifest
+        env:
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+        run: |
+          amd64_archive="candidate/dist/geoflow-updater_${UPDATER_VERSION}_linux_amd64.tar.gz"
+          arm64_archive="candidate/dist/geoflow-updater_${UPDATER_VERSION}_linux_arm64.tar.gz"
+          expires="$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ')"
+          jq -n \
+            --arg version "$UPDATER_VERSION" \
+            --argjson sequence "$RELEASE_SEQUENCE" \
+            --arg expires "$expires" \
+            --arg amd64_url "https://github.com/yaojingang/geoflow-updater/releases/download/v${UPDATER_VERSION}/$(basename "$amd64_archive")" \
+            --arg amd64_sha "$(sha256sum "$amd64_archive" | cut -d ' ' -f 1)" \
+            --argjson amd64_size "$(stat -c '%s' "$amd64_archive")" \
+            --arg arm64_url "https://github.com/yaojingang/geoflow-updater/releases/download/v${UPDATER_VERSION}/$(basename "$arm64_archive")" \
+            --arg arm64_sha "$(sha256sum "$arm64_archive" | cut -d ' ' -f 1)" \
+            --argjson arm64_size "$(stat -c '%s' "$arm64_archive")" \
+            '{schema_version:1,release_sequence:$sequence,updater_version:$version,expires:$expires,assets:{"linux-amd64":{url:$amd64_url,sha256:$amd64_sha,size:$amd64_size},"linux-arm64":{url:$arm64_url,sha256:$arm64_sha,size:$arm64_size}}}' \
+            > candidate/dist/bootstrap-manifest.unsigned.json
+          go run ./cmd/geoflow-tuf sign-bootstrap \
+            --manifest candidate/dist/bootstrap-manifest.unsigned.json \
+            --targets-key "$RUNNER_TEMP/targets.pem" \
+            --output candidate/dist/bootstrap-manifest.json
+          rm candidate/dist/bootstrap-manifest.unsigned.json
+      - name: Sign the isolated candidate repository
+        env:
+          APP_DIGEST: ${{ steps.app.outputs.digest }}
+          WEB_DIGEST: ${{ steps.web.outputs.digest }}
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+          GEOFLOW_SOURCE_COMMIT: ${{ steps.source.outputs.geoflow_sha }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+        run: |
+          mkdir -p candidate/targets-source/deploy "candidate/targets-source/releases/$GEOFLOW_VERSION" "candidate/targets-source/updater/$UPDATER_VERSION"
+          cp assets/docker-compose.managed.yml candidate/targets-source/deploy/docker-compose.managed.yml
+          cp geoflow/version.json "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json"
+          cp candidate/dist/geoflow-updater_*.tar.gz candidate/dist/checksums.txt "candidate/targets-source/updater/$UPDATER_VERSION/"
+          jq -n \
+            --argjson sequence "$RELEASE_SEQUENCE" \
+            --arg version "$GEOFLOW_VERSION" \
+            --arg source_commit "$GEOFLOW_SOURCE_COMMIT" \
+            --arg app_image "ghcr.io/yaojingang/geoflow-app@$APP_DIGEST" \
+            --arg web_image "ghcr.io/yaojingang/geoflow-web@$WEB_DIGEST" \
+            --arg postgres_16_image "pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b" \
+            --arg postgres_18_image "pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a" \
+            --arg redis_7_image "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf" \
+            --arg redis_8_image "redis@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576" \
+            --arg version_target "releases/$GEOFLOW_VERSION/version.json" \
+            '{schema_version:2,minimum_updater_protocol:2,release_sequence:$sequence,version:$version,source_commit:$source_commit,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml",version_target:$version_target}' \
+            > candidate/targets-source/releases/current.json
+          mkdir -p candidate/tuf
+          cp -R tuf/repository candidate/tuf/repository
+          go run ./cmd/geoflow-tuf publish \
+            --repository-dir candidate/tuf/repository \
+            --targets-dir candidate/targets-source \
+            --targets-key "$RUNNER_TEMP/targets.pem" \
+            --snapshot-key "$RUNNER_TEMP/snapshot.pem" \
+            --timestamp-key "$RUNNER_TEMP/timestamp.pem"
+      - name: Record immutable candidate identity
+        env:
+          APP_DIGEST: ${{ steps.app.outputs.digest }}
+          WEB_DIGEST: ${{ steps.web.outputs.digest }}
+          GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+          GEOFLOW_SOURCE_COMMIT: ${{ steps.source.outputs.geoflow_sha }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+        run: |
+          jq -n \
+            --argjson candidate_run_id "$GITHUB_RUN_ID" \
+            --arg updater_version "$UPDATER_VERSION" \
+            --arg updater_commit "$GITHUB_SHA" \
+            --arg geoflow_version "$GEOFLOW_VERSION" \
+            --arg geoflow_commit "$GEOFLOW_SOURCE_COMMIT" \
+            --argjson release_sequence "$RELEASE_SEQUENCE" \
+            --arg app_digest "$APP_DIGEST" \
+            --arg web_digest "$WEB_DIGEST" \
+            --arg amd64_sha256 "$(sha256sum "candidate/dist/geoflow-updater_${UPDATER_VERSION}_linux_amd64.tar.gz" | cut -d ' ' -f 1)" \
+            --arg arm64_sha256 "$(sha256sum "candidate/dist/geoflow-updater_${UPDATER_VERSION}_linux_arm64.tar.gz" | cut -d ' ' -f 1)" \
+            --arg release_manifest_sha256 "$(sha256sum candidate/targets-source/releases/current.json | cut -d ' ' -f 1)" \
+            --arg compose_sha256 "$(sha256sum candidate/targets-source/deploy/docker-compose.managed.yml | cut -d ' ' -f 1)" \
+            --arg version_document_sha256 "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json" | cut -d ' ' -f 1)" \
+            '{schema_version:1,candidate_run_id:$candidate_run_id,updater:{version:$updater_version,commit:$updater_commit,archives:{"linux-amd64":$amd64_sha256,"linux-arm64":$arm64_sha256}},geoflow:{version:$geoflow_version,commit:$geoflow_commit,release_sequence:$release_sequence,app_digest:$app_digest,web_digest:$web_digest},targets:{release_manifest_sha256:$release_manifest_sha256,compose_sha256:$compose_sha256,version_document_sha256:$version_document_sha256}}' \
+            > candidate/candidate.json
+          jq . candidate/candidate.json
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: candidate/dist/geoflow-updater_*.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase-c-candidate-${{ github.run_id }}
+          path: candidate
+          if-no-files-found: error
+          retention-days: 30

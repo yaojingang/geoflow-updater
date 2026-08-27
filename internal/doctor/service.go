@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yaojingang/geoflow-updater/internal/authorization"
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"gopkg.in/yaml.v3"
@@ -34,6 +35,8 @@ const (
 	StatusPass Status = "pass"
 	StatusWarn Status = "warn"
 	StatusFail Status = "fail"
+
+	RetiredUpdateWorkerCheckID = "retired-update-worker"
 )
 
 type Check struct {
@@ -137,6 +140,11 @@ func (service Service) Run(ctx context.Context, instanceID string) Report {
 	} else {
 		report.add("control-token", StatusPass, "Control token permissions are restricted")
 	}
+	if err := (authorization.Service{StateDir: stateDir}).Configured(instanceID); err != nil {
+		report.add("mutation-authorization", StatusFail, "Human mutation authorization is unavailable: "+err.Error())
+	} else {
+		report.add("mutation-authorization", StatusPass, "Human mutation authorization is configured")
+	}
 
 	if err := validateOwnedPath(instanceDir, config.EnvironmentFile); err != nil {
 		report.add("release-pins", StatusFail, err.Error())
@@ -144,6 +152,14 @@ func (service Service) Run(ctx context.Context, instanceID string) Report {
 		report.add("release-pins", StatusFail, "Release image pins are invalid: "+err.Error())
 	} else {
 		report.add("release-pins", StatusPass, "Application and web images are pinned by digest")
+	}
+	retiredWorkerPresent, err := inspectRetiredUpdateWorker(diagnosticContext, probe)
+	if err != nil {
+		report.add("retired-update-worker-inspection", StatusFail, "Retired Phase B update worker inspection failed: "+err.Error())
+	} else if retiredWorkerPresent {
+		report.add(RetiredUpdateWorkerCheckID, StatusFail, "Retired Phase B update worker must be removed during the signed update handover")
+	} else {
+		report.add(RetiredUpdateWorkerCheckID, StatusPass, "Retired Phase B update worker is absent")
 	}
 
 	if err := validateManagedDeployment(diagnosticContext, probe, stateDir, instanceDir, config); err != nil {
@@ -153,6 +169,21 @@ func (service Service) Run(ctx context.Context, instanceID string) Report {
 	}
 
 	return report
+}
+
+func inspectRetiredUpdateWorker(ctx context.Context, probe Probe) (bool, error) {
+	output, err := probe.CommandOutput(
+		ctx,
+		"docker",
+		"ps", "-a",
+		"--filter", "name=^/geoflow-system-update-queue-prod$",
+		"--format={{.Names}}",
+	)
+	if err != nil {
+		return false, err
+	}
+
+	return strings.TrimSpace(output) != "", nil
 }
 
 func (report *Report) add(id string, status Status, message string) {
@@ -413,17 +444,15 @@ func validateManagedDeployment(ctx context.Context, probe Probe, stateDir string
 	if _, err := probe.CommandOutput(ctx, "docker", append(composeArguments, "config", "--quiet")...); err != nil {
 		return fmt.Errorf("Compose configuration check failed: %w", err)
 	}
-
 	containers := map[string]string{
-		"geoflow-postgres-prod":            "healthy",
-		"geoflow-redis-prod":               "healthy",
-		"geoflow-app-prod":                 "healthy",
-		"geoflow-web-prod":                 "healthy",
-		"geoflow-queue-prod":               "none",
-		"geoflow-knowledge-queue-prod":     "none",
-		"geoflow-system-update-queue-prod": "none",
-		"geoflow-scheduler-prod":           "none",
-		"geoflow-reverb-prod":              "none",
+		"geoflow-postgres-prod":        "healthy",
+		"geoflow-redis-prod":           "healthy",
+		"geoflow-app-prod":             "healthy",
+		"geoflow-web-prod":             "healthy",
+		"geoflow-queue-prod":           "none",
+		"geoflow-knowledge-queue-prod": "none",
+		"geoflow-scheduler-prod":       "none",
+		"geoflow-reverb-prod":          "none",
 	}
 	arguments := []string{"inspect", "--format={{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"}
 	for name := range containers {

@@ -24,15 +24,19 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 	repositoryDir := filepath.Join(workingDir, "repository")
 	targetsDir := filepath.Join(workingDir, "source-targets")
 	mustWrite(t, filepath.Join(targetsDir, "deploy", "docker-compose.managed.yml"), []byte("services: {}\n"))
+	mustWrite(t, filepath.Join(targetsDir, "releases", "2.4.0", "version.json"), []byte(`{"version":"2.4.0"}`))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(`{
-  "schema_version": 1,
+  "schema_version": 2,
+  "minimum_updater_protocol": 2,
   "release_sequence": 17,
   "version": "2.4.0",
+  "source_commit": "`+strings.Repeat("b", 40)+`",
   "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:`+strings.Repeat("1", 64)+`",
   "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:`+strings.Repeat("2", 64)+`",
   "postgres_images": {"16":"pgvector/pgvector@sha256:`+strings.Repeat("7", 64)+`","18":"pgvector/pgvector@sha256:`+strings.Repeat("8", 64)+`"},
   "redis_images": {"7":"redis@sha256:`+strings.Repeat("9", 64)+`","8":"redis@sha256:`+strings.Repeat("a", 64)+`"},
-  "compose_target": "deploy/docker-compose.managed.yml"
+  "compose_target": "deploy/docker-compose.managed.yml",
+  "version_target": "releases/2.4.0/version.json"
 }`))
 
 	err := tufrepo.Initialize(tufrepo.InitializeOptions{
@@ -77,15 +81,19 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		t.Fatalf("release = %#v", release)
 	}
 
+	mustWrite(t, filepath.Join(targetsDir, "releases", "2.4.1", "version.json"), []byte(`{"version":"2.4.1"}`))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(`{
-  "schema_version": 1,
+  "schema_version": 2,
+  "minimum_updater_protocol": 2,
   "release_sequence": 18,
   "version": "2.4.1",
+  "source_commit": "`+strings.Repeat("b", 40)+`",
   "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:`+strings.Repeat("3", 64)+`",
   "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:`+strings.Repeat("4", 64)+`",
   "postgres_images": {"16":"pgvector/pgvector@sha256:`+strings.Repeat("7", 64)+`","18":"pgvector/pgvector@sha256:`+strings.Repeat("8", 64)+`"},
   "redis_images": {"7":"redis@sha256:`+strings.Repeat("9", 64)+`","8":"redis@sha256:`+strings.Repeat("a", 64)+`"},
-  "compose_target": "deploy/docker-compose.managed.yml"
+  "compose_target": "deploy/docker-compose.managed.yml",
+  "version_target": "releases/2.4.1/version.json"
 }`))
 	if err := tufrepo.Publish(tufrepo.PublishOptions{
 		RepositoryDir:    repositoryDir,
@@ -109,15 +117,19 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 	if release.Sequence != 18 || release.Version != "2.4.1" {
 		t.Fatalf("published release = %#v", release)
 	}
+	mustWrite(t, filepath.Join(targetsDir, "releases", "2.4.2", "version.json"), []byte(`{"version":"2.4.2"}`))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(`{
-  "schema_version": 1,
+  "schema_version": 2,
+  "minimum_updater_protocol": 2,
   "release_sequence": 17,
   "version": "2.4.2",
+  "source_commit": "`+strings.Repeat("b", 40)+`",
   "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:`+strings.Repeat("5", 64)+`",
   "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:`+strings.Repeat("6", 64)+`",
   "postgres_images": {"16":"pgvector/pgvector@sha256:`+strings.Repeat("7", 64)+`","18":"pgvector/pgvector@sha256:`+strings.Repeat("8", 64)+`"},
   "redis_images": {"7":"redis@sha256:`+strings.Repeat("9", 64)+`","8":"redis@sha256:`+strings.Repeat("a", 64)+`"},
-  "compose_target": "deploy/docker-compose.managed.yml"
+  "compose_target": "deploy/docker-compose.managed.yml",
+  "version_target": "releases/2.4.2/version.json"
 }`))
 	rollbackErr := tufrepo.Publish(tufrepo.PublishOptions{
 		RepositoryDir:    repositoryDir,
@@ -131,14 +143,17 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		t.Fatalf("Publish() rollback error = %v", rollbackErr)
 	}
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(`{
-  "schema_version": 1,
+  "schema_version": 2,
+  "minimum_updater_protocol": 2,
   "release_sequence": 18,
   "version": "2.4.1",
+  "source_commit": "`+strings.Repeat("b", 40)+`",
   "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:`+strings.Repeat("3", 64)+`",
   "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:`+strings.Repeat("4", 64)+`",
   "postgres_images": {"16":"pgvector/pgvector@sha256:`+strings.Repeat("7", 64)+`","18":"pgvector/pgvector@sha256:`+strings.Repeat("8", 64)+`"},
   "redis_images": {"7":"redis@sha256:`+strings.Repeat("9", 64)+`","8":"redis@sha256:`+strings.Repeat("a", 64)+`"},
-  "compose_target": "deploy/docker-compose.managed.yml"
+  "compose_target": "deploy/docker-compose.managed.yml",
+  "version_target": "releases/2.4.1/version.json"
 }`))
 
 	if err := tufrepo.RefreshOnline(tufrepo.RefreshOnlineOptions{
@@ -261,24 +276,30 @@ func TestPublishSkipsOrphanedImmutableMetadataVersions(t *testing.T) {
 
 func mustWriteReleaseManifest(t *testing.T, targetsDir string, sequence int, version string, appDigest string, webDigest string) {
 	t.Helper()
+	mustWrite(t, filepath.Join(targetsDir, "releases", version, "version.json"), []byte(fmt.Sprintf(`{"version":%q}`, version)))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(fmt.Sprintf(`{
-  "schema_version": 1,
+  "schema_version": 2,
+  "minimum_updater_protocol": 2,
   "release_sequence": %d,
   "version": %q,
+  "source_commit": "%s",
   "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:%s",
   "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:%s",
   "postgres_images": {"16":"pgvector/pgvector@sha256:%s","18":"pgvector/pgvector@sha256:%s"},
   "redis_images": {"7":"redis@sha256:%s","8":"redis@sha256:%s"},
-  "compose_target": "deploy/docker-compose.managed.yml"
+  "compose_target": "deploy/docker-compose.managed.yml",
+  "version_target": "releases/%s/version.json"
 }`,
 		sequence,
 		version,
+		strings.Repeat("b", 40),
 		strings.Repeat(appDigest, 64),
 		strings.Repeat(webDigest, 64),
 		strings.Repeat("5", 64),
 		strings.Repeat("6", 64),
 		strings.Repeat("7", 64),
 		strings.Repeat("8", 64),
+		version,
 	)))
 }
 

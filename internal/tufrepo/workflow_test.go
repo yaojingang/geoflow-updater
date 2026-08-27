@@ -39,6 +39,21 @@ func TestMetadataPublishingWorkflowsExplicitlyDeployPagesAfterBotCommits(t *test
 	}
 }
 
+func TestReleaseWorkflowsAreValidYAML(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"release-candidate.yml", "release.yml"} {
+		contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		var document any
+		if err := yaml.Unmarshal(contents, &document); err != nil {
+			t.Errorf("parse %s: %v", name, err)
+		}
+	}
+}
+
 func TestManagedComposeMountsUpdaterControlCapabilityOnlyIntoTheWebApplication(t *testing.T) {
 	t.Parallel()
 
@@ -56,6 +71,7 @@ func TestManagedComposeMountsUpdaterControlCapabilityOnlyIntoTheWebApplication(t
 			Environment map[string]string `yaml:"environment"`
 			Volumes     []any             `yaml:"volumes"`
 			GroupAdd    []string          `yaml:"group_add"`
+			Command     []any             `yaml:"command"`
 		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(contents, &document); err != nil {
@@ -75,6 +91,13 @@ func TestManagedComposeMountsUpdaterControlCapabilityOnlyIntoTheWebApplication(t
 		if hasCredential || len(service.GroupAdd) != 0 || containsSubstring(service.Volumes, "control.token") {
 			t.Fatalf("service %s unexpectedly receives updater mutation capability", serviceName)
 		}
+	}
+	if _, exists := document.Services["system-update-queue"]; exists {
+		t.Fatal("managed Compose still includes the retired application update executor")
+	}
+	queue := document.Services["queue"]
+	if !containsSubstring(queue.Command, "--queue=system-updates,") {
+		t.Fatal("managed queue does not consume tombstone system update jobs during Phase C")
 	}
 }
 
@@ -101,24 +124,38 @@ func TestReleaseWorkflowBootstrapsAnEmptyRepositoryAndPinsGEOFlowSource(t *testi
 		`if jq -e '.signed.targets["releases/current.json"] != null'`,
 		"geoflow_sha: ${{ steps.source.outputs.sha }}",
 		"ref: ${{ needs.preflight.outputs.geoflow_sha }}",
-		"source_commit:$source_commit",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("release workflow is missing bootstrap or source pin control %q", required)
 		}
 	}
+	candidateContents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release-candidate.yml"))
+	if err != nil {
+		t.Fatalf("read candidate workflow: %v", err)
+	}
+	if !strings.Contains(string(candidateContents), "source_commit:$source_commit") {
+		t.Error("candidate workflow does not bind the resolved GEOFlow source commit")
+	}
 }
 
-func TestReleaseWorkflowStagesImagesAndUsesRecoverableDraftRelease(t *testing.T) {
+func TestReleaseWorkflowPublishesOnlyAnApprovedExactCandidate(t *testing.T) {
 	t.Parallel()
 
-	contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	root := filepath.Join("..", "..", ".github", "workflows")
+	contents, err := os.ReadFile(filepath.Join(root, "release.yml"))
 	if err != nil {
 		t.Fatalf("read release workflow: %v", err)
 	}
 	workflow := string(contents)
 	for _, required := range []string{
-		"staging-${{ github.run_id }}-${{ github.run_attempt }}",
+		"candidate_run_id:",
+		"phase_c_evidence_sha256:",
+		"PHASE_C_REHEARSAL_EVIDENCE_B64",
+		"gh run download",
+		"phase-c-candidate-$CANDIDATE_RUN_ID",
+		`--jq '.path')" = ".github/workflows/release-candidate.yml"`,
+		"candidate/targets-source",
+		".candidate == $candidate[0]",
 		"--draft",
 		"--clobber",
 		"needs.preflight.outputs.resume",
@@ -127,10 +164,36 @@ func TestReleaseWorkflowStagesImagesAndUsesRecoverableDraftRelease(t *testing.T)
 		"signed.targets[$target]",
 	} {
 		if !strings.Contains(workflow, required) {
-			t.Errorf("release workflow is missing recoverability control %q", required)
+			t.Errorf("release workflow is missing candidate publication control %q", required)
 		}
 	}
-	if strings.Contains(workflow, "ghcr.io/yaojingang/geoflow-app:${{ inputs.geoflow_version }}\n            ghcr.io/yaojingang/geoflow-app:latest") {
-		t.Error("release workflow publishes application release tags during the staging build")
+	for _, forbidden := range []string{"docker/build-push-action", "go build -trimpath", "needs.images", "--targets-dir \"$targets_dir\""} {
+		if strings.Contains(workflow, forbidden) {
+			t.Errorf("release workflow rebuilds or detaches the approved candidate through %q", forbidden)
+		}
+	}
+
+	candidateContents, err := os.ReadFile(filepath.Join(root, "release-candidate.yml"))
+	if err != nil {
+		t.Fatalf("read candidate workflow: %v", err)
+	}
+	candidate := string(candidateContents)
+	for _, required := range []string{
+		"candidate-${{ github.run_id }}-${{ github.run_attempt }}",
+		"schema_version:2",
+		"minimum_updater_protocol:2",
+		"candidate/tuf/repository",
+		"phase-c-candidate-${{ github.run_id }}",
+	} {
+		if !strings.Contains(candidate, required) {
+			t.Errorf("candidate workflow is missing rehearsal identity control %q", required)
+		}
+	}
+	updaterMain, err := os.ReadFile(filepath.Join("..", "..", "cmd", "geoflow-updater", "main.go"))
+	if err != nil {
+		t.Fatalf("read updater main: %v", err)
+	}
+	if !strings.Contains(string(updaterMain), "GEOFLOW_UPDATER_ALLOW_CANDIDATE_REPOSITORY") {
+		t.Fatal("release binary has no explicit root-only candidate repository opt-in")
 	}
 }

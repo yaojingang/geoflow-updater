@@ -10,11 +10,98 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"gopkg.in/yaml.v3"
 )
+
+type fixedDiagnostician struct {
+	report doctor.Report
+}
+
+func (diagnostician fixedDiagnostician) Run(context.Context, string) doctor.Report {
+	return diagnostician.report
+}
+
+func TestPreflightOnlyAllowsTheRetiredPhaseBWorkerFailure(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+	root := filepath.Join(t.TempDir(), "site")
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve root: %v", err)
+	}
+	instanceDir := filepath.Join(stateDir, "instances", "primary")
+	config := instance.Config{
+		SchemaVersion:   1,
+		ID:              "primary",
+		Root:            root,
+		ComposeFile:     filepath.Join(instanceDir, "docker-compose.managed.yml"),
+		EnvironmentFile: filepath.Join(instanceDir, "release.env"),
+		ControlToken:    filepath.Join(instanceDir, "control.token"),
+		ReleaseSequence: 17,
+		Version:         "2.4.0",
+		PostgresMajor:   "18",
+		RedisMajor:      "8",
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(root, ".env.prod"):    "APP_ENV=production\n",
+		filepath.Join(root, "version.json"): "{\"version\":\"2.4.0\"}\n",
+		config.ComposeFile:                  "services: {}\n",
+		config.EnvironmentFile:              "GEOFLOW_VERSION=2.4.0\n",
+		config.ControlToken:                 strings.Repeat("a", 43) + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o640); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "storage"), 0o750); err != nil {
+		t.Fatalf("mkdir storage: %v", err)
+	}
+	encoded, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(instanceDir, "instance.yml"), encoded, 0o640); err != nil {
+		t.Fatalf("write instance config: %v", err)
+	}
+	release := managed.Release{
+		Sequence:        18,
+		Version:         "2.5.0",
+		PostgresImages:  map[string]string{"16": "pgvector/pgvector@sha256:" + strings.Repeat("1", 64), "18": "pgvector/pgvector@sha256:" + strings.Repeat("2", 64)},
+		RedisImages:     map[string]string{"7": "redis@sha256:" + strings.Repeat("3", 64), "8": "redis@sha256:" + strings.Repeat("4", 64)},
+		VersionDocument: []byte(`{"version":"2.5.0"}`),
+	}
+
+	transitionReport := doctor.Report{Status: doctor.StatusFail, Checks: []doctor.Check{
+		{ID: "platform", Status: doctor.StatusPass},
+		{ID: "retired-update-worker", Status: doctor.StatusFail, Message: "Retired Phase B update worker is still present"},
+		{ID: "managed-deployment", Status: doctor.StatusPass},
+	}}
+	service := Service{StateDir: stateDir, Doctor: fixedDiagnostician{report: transitionReport}}
+	if err := service.Preflight(context.Background(), "primary", release); err != nil {
+		t.Fatalf("Preflight() rejected the bounded Phase B handover: %v", err)
+	}
+
+	for _, checkID := range []string{"managed-deployment", "mutation-authorization"} {
+		report := transitionReport
+		report.Checks = append([]doctor.Check(nil), transitionReport.Checks...)
+		report.Checks[1].ID = checkID
+		service.Doctor = fixedDiagnostician{report: report}
+		if err := service.Preflight(context.Background(), "primary", release); err == nil {
+			t.Fatalf("Preflight() accepted unrelated failed check %q", checkID)
+		}
+	}
+}
 
 func TestReplaceEnvironmentValuesUpdatesEveryManagedKeyExactlyOnce(t *testing.T) {
 	t.Parallel()
@@ -240,8 +327,15 @@ func TestRollbackLoadsInstanceWhenStorageSwapWasInterrupted(t *testing.T) {
 	if err := service.QuiesceForRecovery(context.Background(), "primary", recoveryPointID); err != nil {
 		t.Fatalf("QuiesceForRecovery() error = %v", err)
 	}
-	if len(runner.commands) != 2 {
+	if len(runner.commands) != 3 {
 		t.Fatalf("QuiesceForRecovery() commands = %#v", runner.commands)
+	}
+	if !reflect.DeepEqual(runner.commands[1].arguments, []string{"stop", "--time", "900", "geoflow-system-update-queue-prod"}) {
+		t.Fatalf("legacy queue stop command = %#v", runner.commands[1])
+	}
+	wantServices := []string{"queue", "knowledge-queue", "scheduler", "reverb", "web", "app", "redis"}
+	if !reflect.DeepEqual(runner.commands[2].arguments[len(runner.commands[2].arguments)-len(wantServices):], wantServices) {
+		t.Fatalf("managed service stop command = %#v", runner.commands[2])
 	}
 	if err := service.Rollback(context.Background(), "primary", recoveryPointID); err != nil {
 		t.Fatalf("Rollback() error = %v", err)

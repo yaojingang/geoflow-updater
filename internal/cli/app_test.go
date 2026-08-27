@@ -6,11 +6,26 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yaojingang/geoflow-updater/internal/authorization"
 	"github.com/yaojingang/geoflow-updater/internal/cli"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 )
+
+type provisioner struct {
+	instanceID string
+}
+
+func (fake *provisioner) Provision(instanceID string) (authorization.Provisioning, error) {
+	fake.instanceID = instanceID
+
+	return authorization.Provisioning{Factors: []authorization.Factor{
+		{Scope: authorization.ScopeUpdate, URI: "otpauth://totp/GEOFlow%20Updater:primary:update?secret=EXAMPLE"},
+		{Scope: authorization.ScopeBackup, URI: "otpauth://totp/GEOFlow%20Updater:primary:backup?secret=EXAMPLE"},
+		{Scope: authorization.ScopeRollback, URI: "otpauth://totp/GEOFlow%20Updater:primary:rollback?secret=EXAMPLE"},
+	}}, nil
+}
 
 type enroller struct {
 	request enrollment.Request
@@ -55,10 +70,13 @@ func TestEnrollCommandUsesFixedCommandSurface(t *testing.T) {
 	if !strings.Contains(stdout.String(), "confirm every GEOFlow queue is idle") {
 		t.Fatalf("stdout does not include the queue drain warning: %q", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "docker compose --env-file /opt/geoflow/.env.prod --env-file /var/lib/geoflow-updater/instances/primary/release.env -f /var/lib/geoflow-updater/instances/primary/docker-compose.managed.yml down") {
+	if !strings.Contains(stdout.String(), "geoflow-updater authorization-uri --instance primary") {
+		t.Fatalf("stdout does not include mutation authorization setup: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "docker compose --env-file /opt/geoflow/.env.prod --env-file /var/lib/geoflow-updater/instances/primary/release.env -f /var/lib/geoflow-updater/instances/primary/docker-compose.managed.yml down --remove-orphans") {
 		t.Fatalf("stdout does not include the safe legacy handover command: %q", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "docker compose --env-file /opt/geoflow/.env.prod --env-file /var/lib/geoflow-updater/instances/primary/release.env -f /var/lib/geoflow-updater/instances/primary/docker-compose.managed.yml up -d") {
+	if !strings.Contains(stdout.String(), "docker compose --env-file /opt/geoflow/.env.prod --env-file /var/lib/geoflow-updater/instances/primary/release.env -f /var/lib/geoflow-updater/instances/primary/docker-compose.managed.yml up -d --remove-orphans") {
 		t.Fatalf("stdout does not include the managed deployment command with both environment files: %q", stdout.String())
 	}
 }
@@ -96,5 +114,26 @@ func TestUnknownCommandDoesNotExposeAnArbitraryExecutionHook(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "unknown command") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestAuthorizationURIProvisionsHumanMutationFactor(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	fake := &provisioner{}
+	exitCode := (cli.App{Stdout: stdout, Stderr: &bytes.Buffer{}, Authorization: fake}).Run(
+		context.Background(),
+		[]string{"authorization-uri", "--instance", "primary"},
+	)
+
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0", exitCode)
+	}
+	if fake.instanceID != "primary" {
+		t.Fatalf("provisioned instance = %q", fake.instanceID)
+	}
+	if strings.Count(stdout.String(), "otpauth://") != 3 || !strings.Contains(stdout.String(), "authenticator") || !strings.Contains(stdout.String(), "single-use") {
+		t.Fatalf("stdout = %q", stdout.String())
 	}
 }

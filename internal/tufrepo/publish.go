@@ -12,11 +12,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/theupdateframework/go-tuf/v2/metadata"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
 )
+
+var publicationSourceCommitPattern = regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`)
 
 type PublishOptions struct {
 	RepositoryDir    string
@@ -140,14 +143,17 @@ func Publish(options PublishOptions) error {
 }
 
 type publicationManifest struct {
-	SchemaVersion   int               `json:"schema_version"`
-	ReleaseSequence uint64            `json:"release_sequence"`
-	Version         string            `json:"version"`
-	AppImage        string            `json:"app_image"`
-	WebImage        string            `json:"web_image"`
-	PostgresImages  map[string]string `json:"postgres_images"`
-	RedisImages     map[string]string `json:"redis_images"`
-	ComposeTarget   string            `json:"compose_target"`
+	SchemaVersion          int               `json:"schema_version"`
+	ReleaseSequence        uint64            `json:"release_sequence"`
+	MinimumUpdaterProtocol uint64            `json:"minimum_updater_protocol,omitempty"`
+	Version                string            `json:"version"`
+	SourceCommit           string            `json:"source_commit,omitempty"`
+	AppImage               string            `json:"app_image"`
+	WebImage               string            `json:"web_image"`
+	PostgresImages         map[string]string `json:"postgres_images"`
+	RedisImages            map[string]string `json:"redis_images"`
+	ComposeTarget          string            `json:"compose_target"`
+	VersionTarget          string            `json:"version_target,omitempty"`
 }
 
 func validateReleaseProgression(oldTargets *metadata.Metadata[metadata.TargetsType], publishedTargetsDir string, sourceTargetsDir string) error {
@@ -160,18 +166,28 @@ func validateReleaseProgression(oldTargets *metadata.Metadata[metadata.TargetsTy
 	if err != nil {
 		return fmt.Errorf("validate release manifest target: %w", err)
 	}
+	if newManifest.SchemaVersion != 2 || newManifest.MinimumUpdaterProtocol != managed.UpdaterProtocolVersion {
+		return errors.New("new releases must use the Phase C manifest and current updater protocol")
+	}
 	composeContents, err := os.ReadFile(filepath.Join(sourceTargetsDir, filepath.FromSlash(newManifest.ComposeTarget)))
 	if err != nil {
 		return fmt.Errorf("read managed Compose target: %w", err)
 	}
+	versionContents, err := os.ReadFile(filepath.Join(sourceTargetsDir, filepath.FromSlash(newManifest.VersionTarget)))
+	if err != nil {
+		return fmt.Errorf("read signed version target: %w", err)
+	}
 	if err := (managed.Release{
-		Sequence:        newManifest.ReleaseSequence,
-		Version:         newManifest.Version,
-		AppImage:        newManifest.AppImage,
-		WebImage:        newManifest.WebImage,
-		PostgresImages:  newManifest.PostgresImages,
-		RedisImages:     newManifest.RedisImages,
-		ComposeTemplate: composeContents,
+		Sequence:               newManifest.ReleaseSequence,
+		MinimumUpdaterProtocol: newManifest.MinimumUpdaterProtocol,
+		Version:                newManifest.Version,
+		SourceCommit:           newManifest.SourceCommit,
+		AppImage:               newManifest.AppImage,
+		WebImage:               newManifest.WebImage,
+		PostgresImages:         newManifest.PostgresImages,
+		RedisImages:            newManifest.RedisImages,
+		ComposeTemplate:        composeContents,
+		VersionDocument:        versionContents,
 	}).Validate(); err != nil {
 		return fmt.Errorf("validate managed release target: %w", err)
 	}
@@ -217,7 +233,22 @@ func decodePublicationManifest(contents []byte) (publicationManifest, error) {
 		}
 		return publicationManifest{}, err
 	}
-	if manifest.SchemaVersion != 1 || manifest.ComposeTarget != "deploy/docker-compose.managed.yml" {
+	if manifest.SchemaVersion != 1 && manifest.SchemaVersion != 2 {
+		return publicationManifest{}, errors.New("release manifest schema is invalid")
+	}
+	if manifest.SchemaVersion == 1 && manifest.MinimumUpdaterProtocol != 0 {
+		return publicationManifest{}, errors.New("legacy release manifest declares an updater protocol")
+	}
+	if manifest.SchemaVersion == 2 && manifest.MinimumUpdaterProtocol < 2 {
+		return publicationManifest{}, errors.New("Phase C release manifest requires updater protocol 2")
+	}
+	if manifest.SchemaVersion == 2 && (!publicationSourceCommitPattern.MatchString(manifest.SourceCommit) || manifest.VersionTarget != "releases/"+manifest.Version+"/version.json") {
+		return publicationManifest{}, errors.New("Phase C release manifest source commit or version target is invalid")
+	}
+	if manifest.SourceCommit != "" && !publicationSourceCommitPattern.MatchString(manifest.SourceCommit) {
+		return publicationManifest{}, errors.New("release manifest source commit is invalid")
+	}
+	if manifest.ComposeTarget != "deploy/docker-compose.managed.yml" {
 		return publicationManifest{}, errors.New("release manifest schema or Compose target is invalid")
 	}
 

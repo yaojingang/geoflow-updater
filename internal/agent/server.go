@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yaojingang/geoflow-updater/internal/authorization"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/operation"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
@@ -39,11 +40,16 @@ type OperationManager interface {
 	RecoveryPoints(string) ([]recovery.Point, error)
 }
 
+type MutationAuthorizer interface {
+	Authorize(string, authorization.Scope, string, func() error) error
+}
+
 type Server struct {
-	StateDir   string
-	Version    string
-	Status     StatusProvider
-	Operations OperationManager
+	StateDir      string
+	Version       string
+	Status        StatusProvider
+	Operations    OperationManager
+	Authorization MutationAuthorizer
 }
 
 func (server Server) Handler() http.Handler {
@@ -84,11 +90,15 @@ func (server Server) instanceRequest(response http.ResponseWriter, request *http
 	case "status":
 		server.instanceStatus(response, request, instanceID)
 	case "updates":
+		if request.Method != http.MethodPost {
+			writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
 		if request.ContentLength != 0 {
 			writeError(response, http.StatusBadRequest, "invalid_request")
 			return
 		}
-		server.startOperation(response, request, func() (operation.Operation, error) {
+		server.startMutationOperation(response, request, instanceID, authorization.ScopeUpdate, func() (operation.Operation, error) {
 			return server.Operations.StartUpdate(instanceID)
 		})
 	case "backups":
@@ -96,16 +106,24 @@ func (server Server) instanceRequest(response http.ResponseWriter, request *http
 			server.recoveryPoints(response, instanceID)
 			return
 		}
+		if request.Method != http.MethodPost {
+			writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
 		if request.ContentLength != 0 {
 			writeError(response, http.StatusBadRequest, "invalid_request")
 			return
 		}
-		server.startOperation(response, request, func() (operation.Operation, error) {
+		server.startMutationOperation(response, request, instanceID, authorization.ScopeBackup, func() (operation.Operation, error) {
 			return server.Operations.StartBackup(instanceID)
 		})
 	case "rollbacks":
 		server.startRollback(response, request, instanceID)
 	case "verify":
+		if request.Method != http.MethodPost {
+			writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
 		if request.ContentLength != 0 {
 			writeError(response, http.StatusBadRequest, "invalid_request")
 			return
@@ -185,9 +203,80 @@ func (server Server) startRollback(response http.ResponseWriter, request *http.R
 		writeError(response, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	server.startOperation(response, request, func() (operation.Operation, error) {
+	points, err := server.Operations.RecoveryPoints(instanceID)
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "recovery_points_unavailable")
+		return
+	}
+	rollbackPointID, ok := websiteRollbackPointID(points)
+	if !ok {
+		writeError(response, http.StatusConflict, "rollback_checkpoint_unavailable")
+		return
+	}
+	if rollbackPointID != payload.RecoveryPointID {
+		writeError(response, http.StatusBadRequest, "rollback_requires_latest_update_checkpoint")
+		return
+	}
+	server.startMutationOperation(response, request, instanceID, authorization.ScopeRollback, func() (operation.Operation, error) {
 		return server.Operations.StartRollback(instanceID, payload.RecoveryPointID)
 	})
+}
+
+func websiteRollbackPointID(points []recovery.Point) (string, bool) {
+	for _, point := range points {
+		if strings.HasPrefix(point.Reason, "update-to-") {
+			return point.ID, true
+		}
+	}
+
+	return "", false
+}
+
+func (server Server) startMutationOperation(
+	response http.ResponseWriter,
+	request *http.Request,
+	instanceID string,
+	scope authorization.Scope,
+	start func() (operation.Operation, error),
+) {
+	if server.Operations == nil {
+		writeError(response, http.StatusServiceUnavailable, "operations_unavailable")
+		return
+	}
+	code := request.Header.Get("X-GEOFlow-Updater-Authorization")
+	if code == "" {
+		writeError(response, http.StatusForbidden, "mutation_authorization_required")
+		return
+	}
+	if server.Authorization == nil {
+		writeError(response, http.StatusServiceUnavailable, "mutation_authorization_unavailable")
+		return
+	}
+	var started operation.Operation
+	err := server.Authorization.Authorize(instanceID, scope, code, func() error {
+		var startErr error
+		started, startErr = start()
+
+		return startErr
+	})
+	switch {
+	case err == nil:
+		writeJSON(response, http.StatusAccepted, started)
+	case errors.Is(err, authorization.ErrUnconfigured):
+		writeError(response, http.StatusServiceUnavailable, "mutation_authorization_unconfigured")
+	case errors.Is(err, authorization.ErrReplay):
+		writeError(response, http.StatusForbidden, "mutation_authorization_replayed")
+	case errors.Is(err, authorization.ErrInvalid):
+		writeError(response, http.StatusForbidden, "mutation_authorization_invalid")
+	case errors.Is(err, authorization.ErrRateLimited):
+		writeError(response, http.StatusTooManyRequests, "mutation_authorization_rate_limited")
+	case errors.Is(err, operation.ErrActive):
+		writeError(response, http.StatusConflict, "operation_active")
+	case errors.Is(err, operation.ErrInvalidRecoveryPoint):
+		writeError(response, http.StatusBadRequest, "invalid_recovery_point")
+	default:
+		writeError(response, http.StatusServiceUnavailable, "operation_failed")
+	}
 }
 
 func (server Server) currentOperation(response http.ResponseWriter, request *http.Request, instanceID string) {

@@ -16,21 +16,27 @@ var (
 	versionPattern       = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
 )
 
+const UpdaterProtocolVersion uint64 = 2
+
 type Release struct {
-	Sequence        uint64
-	Version         string
-	SourceCommit    string
-	AppImage        string
-	WebImage        string
-	PostgresImages  map[string]string
-	RedisImages     map[string]string
-	ComposeTemplate []byte
-	VersionDocument []byte
+	Sequence               uint64
+	MinimumUpdaterProtocol uint64
+	Version                string
+	SourceCommit           string
+	AppImage               string
+	WebImage               string
+	PostgresImages         map[string]string
+	RedisImages            map[string]string
+	ComposeTemplate        []byte
+	VersionDocument        []byte
 }
 
 func (release Release) Validate() error {
 	if release.Sequence == 0 {
 		return errors.New("release sequence must be positive")
+	}
+	if release.MinimumUpdaterProtocol > UpdaterProtocolVersion {
+		return errors.New("release requires a newer updater protocol")
 	}
 	if !versionPattern.MatchString(release.Version) {
 		return errors.New("release version must be semantic")
