@@ -12,9 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/update"
@@ -49,18 +51,20 @@ const (
 )
 
 type Operation struct {
-	SchemaVersion   int            `json:"schema_version"`
-	ID              string         `json:"id"`
-	InstanceID      string         `json:"instance_id"`
-	Kind            Kind           `json:"kind"`
-	Status          Status         `json:"status"`
-	CurrentStage    string         `json:"current_stage,omitempty"`
-	Stages          []update.Stage `json:"stages"`
-	TargetVersion   string         `json:"target_version,omitempty"`
-	RecoveryPointID string         `json:"recovery_point_id,omitempty"`
-	Error           string         `json:"error,omitempty"`
-	StartedAt       time.Time      `json:"started_at"`
-	CompletedAt     *time.Time     `json:"completed_at,omitempty"`
+	SchemaVersion     int            `json:"schema_version"`
+	ID                string         `json:"id"`
+	InstanceID        string         `json:"instance_id"`
+	Kind              Kind           `json:"kind"`
+	Status            Status         `json:"status"`
+	CurrentStage      string         `json:"current_stage,omitempty"`
+	Stages            []update.Stage `json:"stages"`
+	TargetVersion     string         `json:"target_version,omitempty"`
+	RecoveryPointID   string         `json:"recovery_point_id,omitempty"`
+	Error             string         `json:"error,omitempty"`
+	StartedAt         time.Time      `json:"started_at"`
+	CompletedAt       *time.Time     `json:"completed_at,omitempty"`
+	ReconcileAttempts int            `json:"reconcile_attempts,omitempty"`
+	NextReconcileAt   *time.Time     `json:"next_reconcile_at,omitempty"`
 }
 
 type Deployment interface {
@@ -262,6 +266,9 @@ func (manager *Manager) Reconcile(instanceID string) error {
 	if operation.Status != StatusQueued && operation.Status != StatusRunning && !recoveryRequired(operation) {
 		return nil
 	}
+	if recoveryRequired(operation) && operation.NextReconcileAt != nil && manager.now().UTC().Before(*operation.NextReconcileAt) {
+		return nil
+	}
 	if manager.Deployment == nil {
 		return errors.New("deployment service is unavailable")
 	}
@@ -269,12 +276,24 @@ func (manager *Manager) Reconcile(instanceID string) error {
 	defer cancel()
 	status, err := manager.reconcileOperation(ctx, &operation)
 	if err != nil {
+		operation.Status = StatusRecoveryRequired
+		operation.Error = fmt.Sprintf("updater service could not recover an interrupted operation: %v", err)
+		operation.ReconcileAttempts++
+		nextAttempt := manager.now().UTC().Add(reconciliationBackoff(operation.ReconcileAttempts))
+		operation.NextReconcileAt = &nextAttempt
+		completed := manager.now().UTC()
+		operation.CompletedAt = &completed
+		if saveErr := manager.save(&operation); saveErr != nil {
+			return errors.Join(err, fmt.Errorf("persist failed operation recovery: %w", saveErr))
+		}
 		return err
 	}
 	operation.Status = status
 	message := "updater service recovered an interrupted operation"
 	operation.Error = message
 	operation.CurrentStage = "reconciled"
+	operation.ReconcileAttempts = 0
+	operation.NextReconcileAt = nil
 	completed := manager.now().UTC()
 	operation.CompletedAt = &completed
 	return manager.save(&operation)
@@ -538,6 +557,10 @@ func (manager *Manager) acquireLock(instanceID string) (*os.File, error) {
 }
 
 func (manager *Manager) save(operation *Operation) error {
+	operation.Error = boundedOperationMessage(operation.Error)
+	for index := range operation.Stages {
+		operation.Stages[index].Message = boundedOperationMessage(operation.Stages[index].Message)
+	}
 	directory := filepath.Dir(manager.currentPath(operation.InstanceID))
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return err
@@ -556,6 +579,21 @@ func (manager *Manager) save(operation *Operation) error {
 		}
 	}
 	return nil
+}
+
+func boundedOperationMessage(message string) string {
+	const maximumBytes = 4096
+
+	message = strings.ToValidUTF8(message, "�")
+	if len(message) <= maximumBytes {
+		return message
+	}
+	message = message[:maximumBytes]
+	for !utf8.ValidString(message) {
+		message = message[:len(message)-1]
+	}
+
+	return message
 }
 
 func replaceContents(path string, contents []byte) error {
@@ -642,6 +680,18 @@ func recoveryRequired(operation Operation) bool {
 	last := operation.Stages[len(operation.Stages)-1]
 
 	return last.Name == "rollback" && last.Status == "failed"
+}
+
+func reconciliationBackoff(attempts int) time.Duration {
+	delay := 30 * time.Second
+	for attempt := 1; attempt < attempts && delay < 15*time.Minute; attempt++ {
+		delay *= 2
+		if delay > 15*time.Minute {
+			return 15 * time.Minute
+		}
+	}
+
+	return delay
 }
 
 func updateRecoveryNeeded(operation Operation) bool {

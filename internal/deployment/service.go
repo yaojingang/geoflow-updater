@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +24,9 @@ import (
 )
 
 var (
-	instanceIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	recoveryIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$`)
+	instanceIDPattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	recoveryIDPattern     = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$`)
+	composeServicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 )
 
 type ReleaseResolver interface {
@@ -265,14 +267,66 @@ func (service *Service) Resume(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return err
 	}
+	managedServices, err := resumeServices(config.ComposeFile)
+	if err != nil {
+		return fmt.Errorf("select managed services: %w", err)
+	}
 	arguments := composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile)
 	if err := service.runner().Run(ctx, nil, io.Discard, "docker", append(arguments, "run", "--rm", "--no-deps", "init", "php", "artisan", "up")...); err != nil {
 		return fmt.Errorf("disable maintenance mode: %w", err)
 	}
-	if err := service.runner().Run(ctx, nil, io.Discard, "docker", append(arguments, "up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "180")...); err != nil {
+	if err := service.runner().Run(ctx, nil, io.Discard, "docker", "rm", "-f", "geoflow-system-update-queue-prod"); err != nil && !strings.Contains(err.Error(), "No such container") {
+		return fmt.Errorf("remove retired application update executor: %w", err)
+	}
+	startArguments := append(arguments, "up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "180")
+	startArguments = append(startArguments, managedServices...)
+	if err := service.runner().Run(ctx, nil, io.Discard, "docker", startArguments...); err != nil {
 		return fmt.Errorf("start managed deployment: %w", err)
 	}
 	return nil
+}
+
+func resumeServices(composePath string) ([]string, error) {
+	info, err := os.Lstat(composePath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > 1024*1024 {
+		return nil, errors.New("managed Compose file is unavailable")
+	}
+	contents, err := os.ReadFile(composePath)
+	if err != nil {
+		return nil, err
+	}
+	var document struct {
+		Services map[string]yaml.Node `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		return nil, err
+	}
+	required := map[string]struct{}{
+		"postgres": {}, "redis": {}, "init": {}, "app": {}, "web": {}, "queue": {},
+		"knowledge-queue": {}, "scheduler": {}, "reverb": {},
+	}
+	services := make([]string, 0, len(document.Services))
+	for name := range document.Services {
+		if !composeServicePattern.MatchString(name) {
+			return nil, fmt.Errorf("managed Compose contains invalid service name %q", name)
+		}
+		if name == "system-update-queue" {
+			continue
+		}
+		delete(required, name)
+		services = append(services, name)
+	}
+	if len(required) > 0 {
+		missing := make([]string, 0, len(required))
+		for name := range required {
+			missing = append(missing, name)
+		}
+		sort.Strings(missing)
+		return nil, fmt.Errorf("managed Compose is missing required services: %s", strings.Join(missing, ", "))
+	}
+	sort.Strings(services)
+
+	return services, nil
 }
 
 func (service *Service) Verify(ctx context.Context, instanceID string) error {

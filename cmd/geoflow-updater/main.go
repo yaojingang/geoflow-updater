@@ -81,7 +81,7 @@ func main() {
 		Authorization: mutationAuthorization,
 		Serve: func(ctx context.Context) error {
 			if err := operations.Reconcile("primary"); err != nil && !errors.Is(err, operation.ErrActive) {
-				return fmt.Errorf("reconcile interrupted operation: %w", err)
+				fmt.Fprintf(os.Stderr, "reconcile interrupted operation: %v\n", err)
 			}
 			monitorDone := make(chan struct{})
 			go func() {

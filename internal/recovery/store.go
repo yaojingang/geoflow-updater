@@ -55,6 +55,10 @@ type Point struct {
 	Files           map[string]FileRecord `json:"files"`
 }
 
+func (point Point) IsUpdateCheckpoint() bool {
+	return strings.HasPrefix(point.Reason, "update-to-")
+}
+
 type Store struct {
 	BackupRoot string
 	Keep       int
@@ -371,6 +375,15 @@ func (store Store) prune(instanceID string, protectedID string) error {
 		return err
 	}
 	retainedIDs := map[string]struct{}{protectedID: {}}
+	for _, point := range points {
+		if len(retainedIDs) >= keep {
+			break
+		}
+		if point.IsUpdateCheckpoint() {
+			retainedIDs[point.ID] = struct{}{}
+			break
+		}
+	}
 	for _, point := range points {
 		if len(retainedIDs) >= keep {
 			break

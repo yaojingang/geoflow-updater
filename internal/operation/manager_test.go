@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
@@ -222,6 +223,99 @@ func TestManagerReconcilesInterruptedProtectedOperationWithRollback(t *testing.T
 	want := []string{"quiesce", "rollback", "resume", "verify"}
 	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+}
+
+func TestManagerPersistsAndBacksOffFailedStartupRecovery(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC)
+	deployment := &fakeDeployment{rollbackErr: errors.New("database unavailable")}
+	manager := &Manager{
+		StateDir:   t.TempDir(),
+		Deployment: deployment,
+		Now:        func() time.Time { return now },
+	}
+	operation := Operation{
+		SchemaVersion:   1,
+		ID:              "20260827T123456.000000000Z-0011223344556677",
+		InstanceID:      "primary",
+		Kind:            KindUpdate,
+		Status:          StatusRunning,
+		CurrentStage:    "activate",
+		RecoveryPointID: "20260827T123456Z-1234abcd",
+		StartedAt:       now,
+	}
+	if err := manager.save(&operation); err != nil {
+		t.Fatalf("save interrupted operation: %v", err)
+	}
+
+	if err := manager.Reconcile("primary"); err == nil {
+		t.Fatal("Reconcile() succeeded despite a failed recovery")
+	}
+	current, err := manager.Current("primary")
+	if err != nil {
+		t.Fatalf("Current() error = %v", err)
+	}
+	if current.Status != StatusRecoveryRequired || !strings.Contains(current.Error, "database unavailable") {
+		t.Fatalf("failed reconciliation state = %#v", current)
+	}
+	if current.ReconcileAttempts != 1 || current.NextReconcileAt == nil || !current.NextReconcileAt.After(now) {
+		t.Fatalf("failed reconciliation retry state = %#v", current)
+	}
+	if _, err := manager.StartVerify("primary"); !errors.Is(err, ErrActive) {
+		t.Fatalf("StartVerify() during recovery error = %v, want ErrActive", err)
+	}
+	firstCalls := deployment.snapshotCalls()
+	if err := manager.Reconcile("primary"); err != nil {
+		t.Fatalf("Reconcile() during backoff error = %v", err)
+	}
+	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, firstCalls) {
+		t.Fatalf("reconciliation ignored retry backoff: before=%#v after=%#v", firstCalls, calls)
+	}
+
+	now = current.NextReconcileAt.Add(time.Second)
+	deployment.rollbackErr = nil
+	if err := manager.Reconcile("primary"); err != nil {
+		t.Fatalf("Reconcile() after recovery became available = %v", err)
+	}
+	current, err = manager.Current("primary")
+	if err != nil {
+		t.Fatalf("Current() after recovery error = %v", err)
+	}
+	if current.Status != StatusRolledBack || current.ReconcileAttempts != 0 || current.NextReconcileAt != nil {
+		t.Fatalf("recovered reconciliation state = %#v", current)
+	}
+}
+
+func TestManagerBoundsPersistedRecoveryErrorsForTheWebsiteContract(t *testing.T) {
+	t.Parallel()
+
+	deployment := &fakeDeployment{rollbackErr: errors.New(strings.Repeat("故", 2000))}
+	manager := &Manager{StateDir: t.TempDir(), Deployment: deployment}
+	operation := Operation{
+		SchemaVersion:   1,
+		ID:              "20260827T123456.000000000Z-0011223344556677",
+		InstanceID:      "primary",
+		Kind:            KindUpdate,
+		Status:          StatusRunning,
+		CurrentStage:    "activate",
+		RecoveryPointID: "20260827T123456Z-1234abcd",
+		StartedAt:       time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC),
+	}
+	if err := manager.save(&operation); err != nil {
+		t.Fatalf("save interrupted operation: %v", err)
+	}
+
+	if err := manager.Reconcile("primary"); err == nil {
+		t.Fatal("Reconcile() succeeded despite a failed recovery")
+	}
+	current, err := manager.Current("primary")
+	if err != nil {
+		t.Fatalf("Current() error = %v", err)
+	}
+	if len(current.Error) > 4096 || !utf8.ValidString(current.Error) {
+		t.Fatalf("persisted recovery error is not a bounded UTF-8 string: bytes=%d", len(current.Error))
 	}
 }
 

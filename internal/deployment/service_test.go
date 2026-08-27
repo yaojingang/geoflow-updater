@@ -344,3 +344,80 @@ func TestRollbackLoadsInstanceWhenStorageSwapWasInterrupted(t *testing.T) {
 		t.Fatal("Rollback() did not reach the recovery store")
 	}
 }
+
+func TestResumeDoesNotRestartTheRetiredPhaseBUpdateWorker(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+	instanceDir := filepath.Join(stateDir, "instances", "primary")
+	root := filepath.Join(t.TempDir(), "site")
+	if err := os.MkdirAll(filepath.Join(root, "storage"), 0o750); err != nil {
+		t.Fatalf("mkdir site: %v", err)
+	}
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve root: %v", err)
+	}
+	config := instance.Config{
+		SchemaVersion:   1,
+		ID:              "primary",
+		Root:            root,
+		ComposeFile:     filepath.Join(instanceDir, "docker-compose.managed.yml"),
+		EnvironmentFile: filepath.Join(instanceDir, "release.env"),
+		ControlToken:    filepath.Join(instanceDir, "control.token"),
+		ReleaseSequence: 17,
+		Version:         "2.4.0",
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(root, ".env.prod"):    "APP_ENV=production\n",
+		filepath.Join(root, "version.json"): "{\"version\":\"2.4.0\"}\n",
+		config.ComposeFile: "services:\n" +
+			"  postgres: {}\n" +
+			"  redis: {}\n" +
+			"  init: {}\n" +
+			"  app: {}\n" +
+			"  web: {}\n" +
+			"  queue: {}\n" +
+			"  knowledge-queue: {}\n" +
+			"  system-update-queue: {}\n" +
+			"  scheduler: {}\n" +
+			"  reverb: {}\n" +
+			"  future-worker: {}\n",
+		config.EnvironmentFile: "GEOFLOW_VERSION=2.4.0\n",
+		config.ControlToken:    strings.Repeat("a", 43) + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o640); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	encoded, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(instanceDir, "instance.yml"), encoded, 0o640); err != nil {
+		t.Fatalf("write instance config: %v", err)
+	}
+
+	runner := &recordingRunner{}
+	service := Service{StateDir: stateDir, Runner: runner}
+	if err := service.Resume(context.Background(), "primary"); err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	if len(runner.commands) != 3 {
+		t.Fatalf("Resume() commands = %#v", runner.commands)
+	}
+	if !reflect.DeepEqual(runner.commands[1].arguments, []string{"rm", "-f", "geoflow-system-update-queue-prod"}) {
+		t.Fatalf("retired worker removal command = %#v", runner.commands[1])
+	}
+	wantServices := []string{"app", "future-worker", "init", "knowledge-queue", "postgres", "queue", "redis", "reverb", "scheduler", "web"}
+	start := runner.commands[2].arguments
+	if len(start) < len(wantServices) || !reflect.DeepEqual(start[len(start)-len(wantServices):], wantServices) {
+		t.Fatalf("managed service start command = %#v", runner.commands[2])
+	}
+	if strings.Contains(strings.Join(start, " "), "system-update-queue") {
+		t.Fatalf("retired worker was included in managed service start: %#v", runner.commands[2])
+	}
+}

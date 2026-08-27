@@ -224,7 +224,7 @@ func (server Server) startRollback(response http.ResponseWriter, request *http.R
 
 func websiteRollbackPointID(points []recovery.Point) (string, bool) {
 	for _, point := range points {
-		if strings.HasPrefix(point.Reason, "update-to-") {
+		if point.IsUpdateCheckpoint() {
 			return point.ID, true
 		}
 	}

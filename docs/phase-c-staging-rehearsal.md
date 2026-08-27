@@ -36,13 +36,14 @@ This is a release-blocking evidence record for the first release that retires th
 - [ ] Website status, recovery-point listing, and verification work with the control token.
 - [ ] Website update, backup, and rollback fail without a six-digit code.
 - [ ] A valid code starts exactly one matching mutation; cross-operation use and replay both fail.
-- [ ] Five consecutive invalid codes trigger a persistent 15-minute lockout shared by all mutation scopes. A successful code after expiry resets the failure state. Record one later invalid attempt only after the reset; do not extend the staging lockout unnecessarily.
+- [ ] Five consecutive invalid codes within one scope or distributed across mutation scopes trigger a persistent 15-minute lockout. After expiry, a successful code clears its accepted scope while failures recorded in other scopes continue to count toward the aggregate anti-spray budget. Record only the attempts required for this check.
 - [ ] Full backup includes PostgreSQL, Redis, storage, environment, version marker, and updater deployment state.
 - [ ] Signed update with a migration succeeds and records every durable operation stage.
 - [ ] A later manual backup leaves website rollback fixed to the newest pre-update checkpoint; older and manual recovery points remain available to root through the CLI.
-- [ ] Forced protected-stage failure automatically restores data, configuration, deployment state, and the prior version.
+- [ ] Forced migration and activation failures each restore Phase B data, configuration, deployment state, and the prior version; the restored Compose does not restart `system-update-queue`, the operation reaches `rolled_back`, and no later reconciliation repeats the restore.
 - [ ] Updater restart during migration reconciles safely.
 - [ ] Updater restart during resume reconciles safely.
+- [ ] A stable recovery failure is persisted as `recovery_required`, the Unix-socket status API stays available, mutations remain blocked, retry attempts back off, and the operation converges after the fault is removed.
 - [ ] Administrator history shows the latest 90 days, archive view shows older rows, and every legacy detail page is read-only.
 - [ ] Application and updater logs contain no administrator password, control token, authorization URI, secret, or six-digit code.
 

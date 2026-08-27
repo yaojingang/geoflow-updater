@@ -185,12 +185,96 @@ func TestAuthorizeUsesPersistentCrossWindowExponentialLockout(t *testing.T) {
 	if err := service.Authorize("primary", authorization.ScopeUpdate, invalid, func() error { return nil }); !errors.Is(err, authorization.ErrInvalid) {
 		t.Fatalf("post-success invalid attempt error = %v, want reset ErrInvalid", err)
 	}
-	attemptsInfo, err := os.Lstat(filepath.Join(stateDir, "instances", "primary", "mutation.attempts"))
+	attemptsInfo, err := os.Lstat(filepath.Join(stateDir, "instances", "primary", "mutation.update.attempts"))
 	if err != nil {
 		t.Fatalf("stat attempt state: %v", err)
 	}
 	if attemptsInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("attempt state mode = %v, want 0600", attemptsInfo.Mode())
+	}
+}
+
+func TestAuthorizeKeepsFailureStateIsolatedBetweenScopes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC)
+	stateDir := t.TempDir()
+	writeEnrollment(t, stateDir)
+	service := authorization.Service{StateDir: stateDir, Now: func() time.Time { return now }}
+	provisioned, err := service.Provision("primary")
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	validRollback := codeFor(t, provisioned, authorization.ScopeRollback, now)
+	invalidRollback := differentCode(validRollback)
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := service.Authorize("primary", authorization.ScopeRollback, invalidRollback, func() error { return nil }); !errors.Is(err, authorization.ErrInvalid) {
+			t.Fatalf("invalid rollback attempt %d error = %v, want ErrInvalid", attempt+1, err)
+		}
+	}
+	validBackup := codeFor(t, provisioned, authorization.ScopeBackup, now)
+	if err := service.Authorize("primary", authorization.ScopeBackup, validBackup, func() error { return nil }); err != nil {
+		t.Fatalf("Authorize(backup) error = %v", err)
+	}
+	if err := service.Authorize("primary", authorization.ScopeRollback, invalidRollback, func() error { return nil }); !errors.Is(err, authorization.ErrRateLimited) {
+		t.Fatalf("fifth rollback attempt after accepted backup error = %v, want ErrRateLimited", err)
+	}
+}
+
+func TestAuthorizeRateLimitsAttemptsDistributedAcrossScopes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC)
+	stateDir := t.TempDir()
+	writeEnrollment(t, stateDir)
+	service := authorization.Service{StateDir: stateDir, Now: func() time.Time { return now }}
+	provisioned, err := service.Provision("primary")
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	sequence := []authorization.Scope{
+		authorization.ScopeUpdate,
+		authorization.ScopeBackup,
+		authorization.ScopeRollback,
+		authorization.ScopeUpdate,
+		authorization.ScopeBackup,
+	}
+	for index, scope := range sequence {
+		invalid := differentCode(codeFor(t, provisioned, scope, now))
+		err := service.Authorize("primary", scope, invalid, func() error { return nil })
+		if index < 4 && !errors.Is(err, authorization.ErrInvalid) {
+			t.Fatalf("distributed attempt %d error = %v, want ErrInvalid", index+1, err)
+		}
+		if index == 4 && !errors.Is(err, authorization.ErrRateLimited) {
+			t.Fatalf("distributed attempt %d error = %v, want ErrRateLimited", index+1, err)
+		}
+	}
+}
+
+func TestAuthorizeKeepsFailureStateWhenTheMutationIsRejected(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC)
+	stateDir := t.TempDir()
+	writeEnrollment(t, stateDir)
+	service := authorization.Service{StateDir: stateDir, Now: func() time.Time { return now }}
+	provisioned, err := service.Provision("primary")
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	valid := codeFor(t, provisioned, authorization.ScopeUpdate, now)
+	invalid := differentCode(valid)
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := service.Authorize("primary", authorization.ScopeUpdate, invalid, func() error { return nil }); !errors.Is(err, authorization.ErrInvalid) {
+			t.Fatalf("invalid attempt %d error = %v, want ErrInvalid", attempt+1, err)
+		}
+	}
+	rejected := errors.New("operation active")
+	if err := service.Authorize("primary", authorization.ScopeUpdate, valid, func() error { return rejected }); !errors.Is(err, rejected) {
+		t.Fatalf("rejected mutation error = %v, want callback error", err)
+	}
+	if err := service.Authorize("primary", authorization.ScopeUpdate, invalid, func() error { return nil }); !errors.Is(err, authorization.ErrRateLimited) {
+		t.Fatalf("fifth attempt after rejected mutation error = %v, want ErrRateLimited", err)
 	}
 }
 

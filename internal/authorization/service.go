@@ -157,13 +157,18 @@ func (service Service) Authorize(instanceID string, scope Scope, code string, ca
 	if err != nil {
 		return err
 	}
-	attemptsPath := filepath.Join(instanceDir, "mutation.attempts")
+	globalAttemptsPath := filepath.Join(instanceDir, "mutation.attempts")
+	globalAttempts, err := readAttemptState(globalAttemptsPath)
+	if err != nil {
+		return err
+	}
+	attemptsPath := filepath.Join(instanceDir, "mutation."+string(scope)+".attempts")
 	attempts, err := readAttemptState(attemptsPath)
 	if err != nil {
 		return err
 	}
 	now := service.now()
-	if attempts.LockedUntil > now.Unix() {
+	if globalAttempts.LockedUntil > now.Unix() || attempts.LockedUntil > now.Unix() {
 		return ErrRateLimited
 	}
 	counterPath := filepath.Join(instanceDir, "mutation."+string(scope)+".counter")
@@ -183,23 +188,31 @@ func (service Service) Authorize(instanceID string, scope Scope, code string, ca
 		}
 	}
 	if matchedCounter < 0 {
-		return recordInvalidAttempt(attemptsPath, attempts, now)
+		return recordInvalidAttempt(globalAttemptsPath, globalAttempts, attemptsPath, attempts, now)
 	}
 	if matchedCounter <= lastCounter {
 		return ErrReplay
 	}
-	if err := replacePrivateFile(attemptsPath, []byte("0 0\n")); err != nil {
-		return fmt.Errorf("reset mutation authorization attempts: %w", err)
+	clearedGlobalAttempts, err := remainingGlobalAttemptState(instanceDir, scope)
+	if err != nil {
+		return fmt.Errorf("calculate mutation authorization attempts: %w", err)
 	}
 	if err := replacePrivateFile(counterPath, []byte(strconv.FormatInt(matchedCounter, 10)+"\n")); err != nil {
 		return fmt.Errorf("persist mutation authorization counter: %w", err)
 	}
 	if err := callback(); err != nil {
-		if restoreErr := restoreCounter(counterPath, lastCounter); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restore unused mutation authorization counter: %w", restoreErr))
-		}
+		counterErr := restoreCounter(counterPath, lastCounter)
 
-		return err
+		return errors.Join(
+			err,
+			wrapRestoreError("counter", counterErr),
+		)
+	}
+	if err := writeAttemptState(attemptsPath, attemptState{}); err != nil {
+		return fmt.Errorf("reset scoped mutation authorization attempts: %w", err)
+	}
+	if err := writeAttemptState(globalAttemptsPath, clearedGlobalAttempts); err != nil {
+		return fmt.Errorf("reset global mutation authorization attempts: %w", err)
 	}
 
 	return nil
@@ -398,7 +411,23 @@ func readAttemptState(path string) (attemptState, error) {
 	return attemptState{Failures: failures, LockedUntil: lockedUntil}, nil
 }
 
-func recordInvalidAttempt(path string, previous attemptState, now time.Time) error {
+func recordInvalidAttempt(globalPath string, previousGlobal attemptState, scopePath string, previousScope attemptState, now time.Time) error {
+	global, globalResult := nextInvalidAttemptState(previousGlobal, now)
+	scope, scopeResult := nextInvalidAttemptState(previousScope, now)
+	if err := writeAttemptState(globalPath, global); err != nil {
+		return fmt.Errorf("persist global mutation authorization attempts: %w", err)
+	}
+	if err := writeAttemptState(scopePath, scope); err != nil {
+		return fmt.Errorf("persist scoped mutation authorization attempts: %w", err)
+	}
+	if errors.Is(globalResult, ErrRateLimited) || errors.Is(scopeResult, ErrRateLimited) {
+		return ErrRateLimited
+	}
+
+	return ErrInvalid
+}
+
+func nextInvalidAttemptState(previous attemptState, now time.Time) (attemptState, error) {
 	failures := previous.Failures + 1
 	lockedUntil := int64(0)
 	result := ErrInvalid
@@ -414,11 +443,42 @@ func recordInvalidAttempt(path string, previous attemptState, now time.Time) err
 		lockedUntil = now.Unix() + delay
 		result = ErrRateLimited
 	}
-	if err := replacePrivateFile(path, []byte(fmt.Sprintf("%d %d\n", failures, lockedUntil))); err != nil {
-		return fmt.Errorf("persist mutation authorization attempts: %w", err)
+	return attemptState{Failures: failures, LockedUntil: lockedUntil}, result
+}
+
+func remainingGlobalAttemptState(instanceDir string, acceptedScope Scope) (attemptState, error) {
+	remaining := attemptState{}
+	for _, scope := range scopes {
+		if scope == acceptedScope {
+			continue
+		}
+		path := filepath.Join(instanceDir, "mutation."+string(scope)+".attempts")
+		state, err := readAttemptState(path)
+		if err != nil {
+			return attemptState{}, err
+		}
+		remaining.Failures += state.Failures
+		if state.LockedUntil > remaining.LockedUntil {
+			remaining.LockedUntil = state.LockedUntil
+		}
+	}
+	if remaining.Failures > 1_000_000 {
+		remaining.Failures = 1_000_000
 	}
 
-	return result
+	return remaining, nil
+}
+
+func writeAttemptState(path string, state attemptState) error {
+	return replacePrivateFile(path, []byte(fmt.Sprintf("%d %d\n", state.Failures, state.LockedUntil)))
+}
+
+func wrapRestoreError(state string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	return fmt.Errorf("restore unused mutation authorization %s: %w", state, err)
 }
 
 func restoreCounter(path string, previous int64) error {

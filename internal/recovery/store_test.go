@@ -152,6 +152,64 @@ func TestStoreRetainsTheNewestConfiguredRecoveryPoints(t *testing.T) {
 	}
 }
 
+func TestStoreRetainsNewestPreUpdateCheckpointAcrossManualBackups(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "site")
+	stateDir := filepath.Join(t.TempDir(), "state", "instances", "primary")
+	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("APP_ENV=production\n"), 0o600)
+	mustWrite(t, filepath.Join(root, "version.json"), []byte("{}\n"), 0o640)
+	if err := os.MkdirAll(filepath.Join(root, "storage"), 0o750); err != nil {
+		t.Fatalf("mkdir storage: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "docker-data", "prod", "redis"), 0o750); err != nil {
+		t.Fatalf("mkdir redis: %v", err)
+	}
+	mustWrite(t, filepath.Join(stateDir, "instance.yml"), []byte("instance\n"), 0o640)
+	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("release\n"), 0o640)
+	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
+	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
+	clock := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	store := recovery.Store{
+		BackupRoot: filepath.Join(t.TempDir(), "backups"),
+		Keep:       2,
+		Now: func() time.Time {
+			clock = clock.Add(time.Second)
+			return clock
+		},
+	}
+	db := &database{dump: []byte("database")}
+	updatePoint, err := store.Create(context.Background(), config, "update-to-2.5.0", db)
+	if err != nil {
+		t.Fatalf("Create(update checkpoint) error = %v", err)
+	}
+	if _, err := store.Create(context.Background(), config, "manual", db); err != nil {
+		t.Fatalf("Create(first manual backup) error = %v", err)
+	}
+	latestManualPoint, err := store.Create(context.Background(), config, "manual", db)
+	if err != nil {
+		t.Fatalf("Create(second manual backup) error = %v", err)
+	}
+
+	points, err := store.List("primary")
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(points) != 2 {
+		t.Fatalf("retained point count = %d, want 2", len(points))
+	}
+	retained := make(map[string]struct{}, len(points))
+	for _, point := range points {
+		retained[point.ID] = struct{}{}
+	}
+	if _, ok := retained[updatePoint.ID]; !ok {
+		t.Fatalf("pre-update checkpoint %s was pruned", updatePoint.ID)
+	}
+	if _, ok := retained[latestManualPoint.ID]; !ok {
+		t.Fatalf("latest manual recovery point %s was pruned", latestManualPoint.ID)
+	}
+}
+
 func TestStoreRecoversAnInterruptedStorageSwapBeforeRetryingRestore(t *testing.T) {
 	t.Parallel()
 
