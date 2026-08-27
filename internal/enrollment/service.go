@@ -36,6 +36,7 @@ type Service struct {
 	Releases       ReleaseResolver
 	ControlGroupID func() (int, error)
 	Chown          func(string, int, int) error
+	RootAccess     func(string) error
 }
 
 type Request struct {
@@ -56,8 +57,20 @@ func (service Service) Enroll(ctx context.Context, request Request) (Result, err
 		return Result{}, errors.New("single-host enrollment supports only the primary instance")
 	}
 
+	rootAccess := service.RootAccess
+	if rootAccess == nil {
+		rootAccess = validateServiceSandboxRoot
+	}
+	if filepath.IsAbs(request.Root) {
+		if err := rootAccess(filepath.Clean(request.Root)); err != nil {
+			return Result{}, err
+		}
+	}
 	root, err := canonicalRoot(request.Root)
 	if err != nil {
+		return Result{}, err
+	}
+	if err := rootAccess(root); err != nil {
 		return Result{}, err
 	}
 	if err := validateLayout(root); err != nil {
@@ -174,9 +187,6 @@ func canonicalRoot(root string) (string, error) {
 		return "", errors.New("instance root must be an absolute path")
 	}
 	cleaned := filepath.Clean(root)
-	if protectedByServiceSandbox(cleaned) {
-		return "", errors.New("instance root is blocked by the installed systemd sandbox")
-	}
 	info, err := os.Lstat(cleaned)
 	if err != nil {
 		return "", fmt.Errorf("inspect instance root: %w", err)
@@ -192,14 +202,14 @@ func canonicalRoot(root string) (string, error) {
 	return resolved, nil
 }
 
-func protectedByServiceSandbox(root string) bool {
+func validateServiceSandboxRoot(root string) error {
 	for _, protected := range []string{"/boot", "/efi", "/etc", "/home", "/root", "/run", "/tmp", "/usr", "/var/tmp"} {
 		if root == protected || strings.HasPrefix(root, protected+string(filepath.Separator)) {
-			return true
+			return errors.New("instance root is blocked by the installed systemd sandbox")
 		}
 	}
 
-	return false
+	return nil
 }
 
 func validateLayout(root string) error {

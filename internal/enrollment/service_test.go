@@ -32,7 +32,7 @@ func TestEnrollWritesPinnedManagedDeploymentAndPrivateControlToken(t *testing.T)
 	mustWriteFile(t, filepath.Join(root, "docker-data", "prod", "postgres", "PG_VERSION"), "16\n")
 
 	stateDir := filepath.Join(t.TempDir(), "state")
-	service := enrollment.Service{
+	service := allowTestRoot(enrollment.Service{
 		StateDir: stateDir,
 		ControlGroupID: func() (int, error) {
 			return 991, nil
@@ -57,7 +57,7 @@ func TestEnrollWritesPinnedManagedDeploymentAndPrivateControlToken(t *testing.T)
 			},
 			ComposeTemplate: []byte("name: geoflow-${GEOFLOW_INSTANCE_ID}\nservices:\n  app:\n    image: ${GEOFLOW_APP_IMAGE}\n"),
 		}},
-	}
+	})
 
 	result, err := service.Enroll(context.Background(), enrollment.Request{
 		InstanceID: "primary",
@@ -111,7 +111,7 @@ func TestEnrollRejectsSymlinkedInstanceRoot(t *testing.T) {
 		t.Fatalf("create symlink: %v", err)
 	}
 
-	service := enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")}
+	service := allowTestRoot(enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")})
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: linkRoot})
 	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatalf("Enroll() error = %v, want symbolic link rejection", err)
@@ -142,7 +142,7 @@ func TestEnrollRejectsSymlinkedRequiredLayoutPaths(t *testing.T) {
 	mustWriteFile(t, filepath.Join(root, "version.json"), `{"version":"2.4.0"}`)
 	mustMkdir(t, filepath.Join(root, "storage"))
 
-	service := enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")}
+	service := allowTestRoot(enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")})
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: root})
 	if err == nil || !strings.Contains(err.Error(), ".env.prod") {
 		t.Fatalf("Enroll() error = %v, want symlinked environment rejection", err)
@@ -157,7 +157,7 @@ func TestEnrollRejectsUnboundedInstalledVersionDocument(t *testing.T) {
 	mustWriteFile(t, filepath.Join(root, "version.json"), `{"version":"2.4.0","padding":"`+strings.Repeat("a", 1024*1024)+`"}`)
 	mustMkdir(t, filepath.Join(root, "storage"))
 
-	service := enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")}
+	service := allowTestRoot(enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")})
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: root})
 	if err == nil || !strings.Contains(err.Error(), "version.json") {
 		t.Fatalf("Enroll() error = %v, want oversized version document rejection", err)
@@ -184,7 +184,7 @@ func TestEnrollRemovesStagedStateWhenCredentialGenerationFails(t *testing.T) {
 	mustMkdir(t, filepath.Join(root, "docker-data", "prod", "postgres", "18", "docker"))
 	mustWriteFile(t, filepath.Join(root, "docker-data", "prod", "postgres", "18", "docker", "PG_VERSION"), "18\n")
 	stateDir := t.TempDir()
-	service := enrollment.Service{
+	service := allowTestRoot(enrollment.Service{
 		StateDir: stateDir,
 		Random:   strings.NewReader("short"),
 		Releases: releaseResolver{release: managed.Release{
@@ -196,7 +196,7 @@ func TestEnrollRemovesStagedStateWhenCredentialGenerationFails(t *testing.T) {
 			RedisImages:     supportedRedisImages(),
 			ComposeTemplate: []byte("services: {}\n"),
 		}},
-	}
+	})
 
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: root})
 	if err == nil {
@@ -214,7 +214,7 @@ func TestEnrollRejectsAReleaseThatWouldUpgradeTheDatabaseWithoutABackupTransacti
 	mustWriteFile(t, filepath.Join(root, ".env.prod"), "APP_ENV=production\nGEOFLOW_UPDATER_POSTGRES_MAJOR=18\nGEOFLOW_UPDATER_REDIS_MAJOR=8\n")
 	mustWriteFile(t, filepath.Join(root, "version.json"), `{"version":"2.3.0"}`)
 	mustMkdir(t, filepath.Join(root, "storage"))
-	service := enrollment.Service{
+	service := allowTestRoot(enrollment.Service{
 		StateDir: filepath.Join(t.TempDir(), "state"),
 		Releases: releaseResolver{release: managed.Release{
 			Sequence:        17,
@@ -225,7 +225,7 @@ func TestEnrollRejectsAReleaseThatWouldUpgradeTheDatabaseWithoutABackupTransacti
 			RedisImages:     supportedRedisImages(),
 			ComposeTemplate: []byte("services: {}\n"),
 		}},
-	}
+	})
 
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: root})
 	if err == nil || !strings.Contains(err.Error(), "bridge release") {
@@ -240,7 +240,7 @@ func TestEnrollRejectsAnUnknownExistingDatabaseMajor(t *testing.T) {
 	mustWriteFile(t, filepath.Join(root, ".env.prod"), validEnvironment()+"PGVECTOR_IMAGE=pgvector/pgvector:pg17\nREDIS_IMAGE=redis:8-alpine\n")
 	mustWriteFile(t, filepath.Join(root, "version.json"), `{"version":"2.4.0"}`)
 	mustMkdir(t, filepath.Join(root, "storage"))
-	service := enrollment.Service{
+	service := allowTestRoot(enrollment.Service{
 		StateDir: filepath.Join(t.TempDir(), "state"),
 		Releases: releaseResolver{release: managed.Release{
 			Sequence:        17,
@@ -251,7 +251,7 @@ func TestEnrollRejectsAnUnknownExistingDatabaseMajor(t *testing.T) {
 			RedisImages:     supportedRedisImages(),
 			ComposeTemplate: []byte("services: {}\n"),
 		}},
-	}
+	})
 
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: root})
 	if err == nil || !strings.Contains(err.Error(), "PostgreSQL major") {
@@ -266,7 +266,7 @@ func TestEnrollRejectsMissingInfrastructureMajorInsteadOfGuessingAgainstExisting
 	mustWriteFile(t, filepath.Join(root, ".env.prod"), validEnvironment())
 	mustWriteFile(t, filepath.Join(root, "version.json"), `{"version":"2.4.0"}`)
 	mustMkdir(t, filepath.Join(root, "storage"))
-	service := enrollment.Service{
+	service := allowTestRoot(enrollment.Service{
 		StateDir: filepath.Join(t.TempDir(), "state"),
 		Releases: releaseResolver{release: managed.Release{
 			Sequence:        17,
@@ -277,7 +277,7 @@ func TestEnrollRejectsMissingInfrastructureMajorInsteadOfGuessingAgainstExisting
 			RedisImages:     supportedRedisImages(),
 			ComposeTemplate: []byte("services: {}\n"),
 		}},
-	}
+	})
 
 	_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: root})
 	if err == nil || !strings.Contains(err.Error(), "cannot be inferred") {
@@ -290,6 +290,12 @@ func supportedPostgresImages() map[string]string {
 		"16": "pgvector/pgvector@sha256:" + strings.Repeat("3", 64),
 		"18": "pgvector/pgvector@sha256:" + strings.Repeat("4", 64),
 	}
+}
+
+func allowTestRoot(service enrollment.Service) enrollment.Service {
+	service.RootAccess = func(string) error { return nil }
+
+	return service
 }
 
 func supportedRedisImages() map[string]string {
