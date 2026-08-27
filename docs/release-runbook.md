@@ -24,7 +24,7 @@ The scheduled `metadata-refresh.yml` workflow renews snapshot and timestamp meta
 3. Create the protected `release-signing` environment with required reviewers and add `TUF_TARGETS_KEY_B64`, `TUF_SNAPSHOT_KEY_B64`, and `TUF_TIMESTAMP_KEY_B64`.
 4. Create the branch-restricted `metadata-refresh` environment without required reviewers and add only `TUF_SNAPSHOT_KEY_B64` and `TUF_TIMESTAMP_KEY_B64`.
 5. Enable private vulnerability reporting.
-6. Protect `main` and require the CI workflow before merge while allowing the metadata workflows to publish signed metadata.
+6. Protect `main` from deletion and non-fast-forward updates, and require linear history. A strict pull-request and CI gate also needs a dedicated release GitHub App installed on the repository and configured as the signing-workflow bypass actor. Personal repositories cannot assign the built-in GitHub Actions App as that bypass actor.
 7. Run the online metadata refresh workflow and verify the Pages metadata URL before the first updater release.
 
 ## Publishing a release
