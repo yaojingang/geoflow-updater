@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"os/user"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/agent"
 	"github.com/yaojingang/geoflow-updater/internal/cli"
@@ -68,14 +71,46 @@ func main() {
 		Doctor:     diagnostics,
 		Operations: operations,
 		Serve: func(ctx context.Context) error {
-			if err := operations.Reconcile("primary"); err != nil {
+			if err := operations.Reconcile("primary"); err != nil && !errors.Is(err, operation.ErrActive) {
 				return fmt.Errorf("reconcile interrupted operation: %w", err)
 			}
-			return agent.ListenAndServe(ctx, runtimeSocket, server.Handler())
+			monitorDone := make(chan struct{})
+			go func() {
+				defer close(monitorDone)
+				monitorInterruptedOperations(ctx, operations, os.Stderr)
+			}()
+			err := agent.ListenAndServe(ctx, runtimeSocket, server.Handler())
+			<-monitorDone
+
+			return err
 		},
 	}
 
-	os.Exit(application.Run(ctx, os.Args[1:]))
+	exitCode := application.Run(ctx, os.Args[1:])
+	if ctx.Err() != nil {
+		recoveryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		if err := operations.Wait(recoveryCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "wait for updater safety recovery: %v\n", err)
+			exitCode = 1
+		}
+		cancel()
+	}
+	os.Exit(exitCode)
+}
+
+func monitorInterruptedOperations(ctx context.Context, operations *operation.Manager, stderr io.Writer) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := operations.Reconcile("primary"); err != nil && !errors.Is(err, operation.ErrActive) {
+				fmt.Fprintf(stderr, "reconcile interrupted operation: %v\n", err)
+			}
+		}
+	}
 }
 
 func updaterGroupID() (int, error) {

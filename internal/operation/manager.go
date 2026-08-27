@@ -25,6 +25,7 @@ var (
 	ErrInvalidRecoveryPoint = errors.New("recovery point identifier is invalid")
 	instanceIDPattern       = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	recoveryIDPattern       = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$`)
+	operationIDPattern      = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[a-f0-9]{16}$`)
 )
 
 type Kind string
@@ -39,11 +40,12 @@ const (
 type Status string
 
 const (
-	StatusQueued     Status = "queued"
-	StatusRunning    Status = "running"
-	StatusSucceeded  Status = "succeeded"
-	StatusFailed     Status = "failed"
-	StatusRolledBack Status = "rolled_back"
+	StatusQueued           Status = "queued"
+	StatusRunning          Status = "running"
+	StatusSucceeded        Status = "succeeded"
+	StatusFailed           Status = "failed"
+	StatusRolledBack       Status = "rolled_back"
+	StatusRecoveryRequired Status = "recovery_required"
 )
 
 type Operation struct {
@@ -63,18 +65,23 @@ type Operation struct {
 
 type Deployment interface {
 	update.Deployment
+	QuiesceForRecovery(context.Context, string, string) error
+	ValidateRecoveryPoint(string, string) error
 	ListRecoveryPoints(string) ([]recovery.Point, error)
 }
 
 type Manager struct {
-	StateDir   string
-	Context    context.Context
-	Engine     update.Engine
-	Deployment Deployment
-	Now        func() time.Time
-	Random     io.Reader
-	mu         sync.Mutex
-	active     map[string]string
+	StateDir         string
+	Context          context.Context
+	Engine           update.Engine
+	Deployment       Deployment
+	Now              func() time.Time
+	Random           io.Reader
+	OperationTimeout time.Duration
+	RecoveryTimeout  time.Duration
+	mu               sync.Mutex
+	active           map[string]string
+	wg               sync.WaitGroup
 }
 
 func (manager *Manager) StartUpdate(instanceID string) (Operation, error) {
@@ -94,7 +101,11 @@ func (manager *Manager) StartUpdate(instanceID string) (Operation, error) {
 		case update.StatusRolledBack:
 			operation.Status = StatusRolledBack
 		default:
-			operation.Status = StatusFailed
+			if updateRecoveryNeeded(*operation) {
+				operation.Status = StatusRecoveryRequired
+			} else {
+				operation.Status = StatusFailed
+			}
 		}
 	})
 }
@@ -118,12 +129,17 @@ func (manager *Manager) StartBackup(instanceID string) (Operation, error) {
 			return err
 		})
 		operation.RecoveryPointID = recoveryPointID
-		resumeOK := manager.step(ctx, operation, save, "resume", func() error { return manager.Deployment.Resume(ctx, instanceID) })
+		resumeCtx, cancel := manager.recoveryContext(ctx)
+		defer cancel()
+		resumeOK := manager.step(resumeCtx, operation, save, "resume", func() error { return manager.Deployment.Resume(resumeCtx, instanceID) })
 		if !resumeOK {
+			operation.Status = StatusRecoveryRequired
 			manager.resumeAfterFailure(ctx, instanceID, operation)
 		}
 		if backupOK && resumeOK && manager.step(ctx, operation, save, "verify", func() error { return manager.Deployment.Verify(ctx, instanceID) }) {
 			operation.Status = StatusSucceeded
+		} else if backupOK && resumeOK {
+			operation.Status = StatusRecoveryRequired
 		}
 	})
 }
@@ -136,19 +152,27 @@ func (manager *Manager) StartRollback(instanceID string, recoveryPointID string)
 		if !manager.requireDeployment(operation) {
 			return
 		}
+		if !manager.step(ctx, operation, save, "preflight", func() error {
+			return manager.Deployment.ValidateRecoveryPoint(instanceID, recoveryPointID)
+		}) {
+			return
+		}
 		if !manager.step(ctx, operation, save, "quiesce", func() error { return manager.Deployment.Quiesce(ctx, instanceID) }) {
 			manager.resumeAfterFailure(ctx, instanceID, operation)
 			return
 		}
 		if !manager.step(ctx, operation, save, "rollback", func() error { return manager.Deployment.Rollback(ctx, instanceID, recoveryPointID) }) {
-			_ = manager.Deployment.Resume(ctx, instanceID)
+			operation.Status = StatusRecoveryRequired
 			return
 		}
 		if !manager.step(ctx, operation, save, "resume", func() error { return manager.Deployment.Resume(ctx, instanceID) }) {
+			operation.Status = StatusRecoveryRequired
 			return
 		}
 		if manager.step(ctx, operation, save, "verify", func() error { return manager.Deployment.Verify(ctx, instanceID) }) {
 			operation.Status = StatusSucceeded
+		} else {
+			operation.Status = StatusRecoveryRequired
 		}
 	})
 }
@@ -168,7 +192,18 @@ func (manager *Manager) Current(instanceID string) (Operation, error) {
 	if !instanceIDPattern.MatchString(instanceID) {
 		return Operation{}, errors.New("managed instance identifier is invalid")
 	}
-	path := manager.currentPath(instanceID)
+	return manager.read(manager.currentPath(instanceID), instanceID, "")
+}
+
+func (manager *Manager) Get(instanceID string, operationID string) (Operation, error) {
+	if !instanceIDPattern.MatchString(instanceID) || !operationIDPattern.MatchString(operationID) {
+		return Operation{}, errors.New("operation identifier is invalid")
+	}
+
+	return manager.read(filepath.Join(manager.operationsDir(instanceID), operationID+".json"), instanceID, operationID)
+}
+
+func (manager *Manager) read(path string, instanceID string, operationID string) (Operation, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return Operation{}, err
@@ -190,7 +225,8 @@ func (manager *Manager) Current(instanceID string) (Operation, error) {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return Operation{}, errors.New("operation state contains trailing JSON")
 	}
-	if operation.SchemaVersion != 1 || operation.InstanceID != instanceID || operation.ID == "" {
+	if operation.SchemaVersion != 1 || operation.InstanceID != instanceID || !operationIDPattern.MatchString(operation.ID) ||
+		(operationID != "" && operation.ID != operationID) {
 		return Operation{}, errors.New("operation state is invalid")
 	}
 	return operation, nil
@@ -204,6 +240,18 @@ func (manager *Manager) RecoveryPoints(instanceID string) ([]recovery.Point, err
 }
 
 func (manager *Manager) Reconcile(instanceID string) error {
+	if !instanceIDPattern.MatchString(instanceID) {
+		return errors.New("managed instance identifier is invalid")
+	}
+	lock, err := manager.acquireLock(instanceID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = lock.Close()
+	}()
+
 	operation, err := manager.Current(instanceID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -211,13 +259,13 @@ func (manager *Manager) Reconcile(instanceID string) error {
 	if err != nil {
 		return err
 	}
-	if operation.Status != StatusQueued && operation.Status != StatusRunning {
+	if operation.Status != StatusQueued && operation.Status != StatusRunning && !recoveryRequired(operation) {
 		return nil
 	}
 	if manager.Deployment == nil {
 		return errors.New("deployment service is unavailable")
 	}
-	ctx, cancel := context.WithTimeout(manager.baseContext(), 30*time.Minute)
+	ctx, cancel := manager.recoveryContext(manager.baseContext())
 	defer cancel()
 	status, err := manager.reconcileOperation(ctx, &operation)
 	if err != nil {
@@ -270,6 +318,9 @@ func (manager *Manager) reconcileOperation(ctx context.Context, operation *Opera
 		if operation.RecoveryPointID == "" {
 			return StatusFailed, errors.New("interrupted rollback has no recovery point")
 		}
+		if err := manager.Deployment.QuiesceForRecovery(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
+			return StatusFailed, fmt.Errorf("quiesce before recovering interrupted rollback: %w", err)
+		}
 		if err := manager.Deployment.Rollback(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
 			return StatusFailed, fmt.Errorf("recover interrupted rollback: %w", err)
 		}
@@ -305,6 +356,9 @@ func (manager *Manager) reconcileOperation(ctx context.Context, operation *Opera
 			}
 			return StatusFailed, nil
 		}
+		if err := manager.Deployment.QuiesceForRecovery(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
+			return StatusFailed, fmt.Errorf("quiesce before recovering interrupted update: %w", err)
+		}
 		if err := manager.Deployment.Rollback(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
 			return StatusFailed, fmt.Errorf("recover interrupted update: %w", err)
 		}
@@ -330,7 +384,7 @@ func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID stri
 		return Operation{}, ErrActive
 	}
 	current, currentErr := manager.Current(instanceID)
-	if currentErr == nil && (current.Status == StatusQueued || current.Status == StatusRunning) {
+	if currentErr == nil && (current.Status == StatusQueued || current.Status == StatusRunning || current.Status == StatusRecoveryRequired) {
 		manager.mu.Unlock()
 		return Operation{}, ErrActive
 	}
@@ -365,6 +419,7 @@ func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID stri
 		return Operation{}, err
 	}
 	manager.active[instanceID] = id
+	manager.wg.Add(1)
 	manager.mu.Unlock()
 
 	started := operation
@@ -375,8 +430,9 @@ func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID stri
 			manager.mu.Lock()
 			delete(manager.active, instanceID)
 			manager.mu.Unlock()
+			manager.wg.Done()
 		}()
-		ctx, cancel := context.WithTimeout(manager.baseContext(), 2*time.Hour)
+		ctx, cancel := context.WithTimeout(manager.baseContext(), manager.operationTimeout())
 		defer cancel()
 		operation.Status = StatusRunning
 		if err := manager.save(&operation); err != nil {
@@ -394,6 +450,21 @@ func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID stri
 	}(operation)
 
 	return started, nil
+}
+
+func (manager *Manager) Wait(ctx context.Context) error {
+	completed := make(chan struct{})
+	go func() {
+		manager.wg.Wait()
+		close(completed)
+	}()
+
+	select {
+	case <-completed:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (manager *Manager) step(ctx context.Context, operation *Operation, save func() error, name string, run func() error) bool {
@@ -428,8 +499,16 @@ func (manager *Manager) failPersistence(operation *Operation, stage string, err 
 }
 
 func (manager *Manager) resumeAfterFailure(ctx context.Context, instanceID string, operation *Operation) {
-	if err := manager.Deployment.Resume(ctx, instanceID); err != nil {
+	recoveryCtx, cancel := manager.recoveryContext(ctx)
+	defer cancel()
+	if err := manager.Deployment.Resume(recoveryCtx, instanceID); err != nil {
 		operation.Error = errors.Join(errors.New(operation.Error), fmt.Errorf("resume current release: %w", err)).Error()
+		operation.Status = StatusRecoveryRequired
+		return
+	}
+	if err := manager.Deployment.Verify(recoveryCtx, instanceID); err != nil {
+		operation.Error = errors.Join(errors.New(operation.Error), fmt.Errorf("verify current release: %w", err)).Error()
+		operation.Status = StatusRecoveryRequired
 	}
 }
 
@@ -512,7 +591,11 @@ func replaceContents(path string, contents []byte) error {
 }
 
 func (manager *Manager) currentPath(instanceID string) string {
-	return filepath.Join(manager.stateDir(), "instances", instanceID, "operations", "current.json")
+	return filepath.Join(manager.operationsDir(instanceID), "current.json")
+}
+
+func (manager *Manager) operationsDir(instanceID string) string {
+	return filepath.Join(manager.stateDir(), "instances", instanceID, "operations")
 }
 
 func (manager *Manager) stateDir() string {
@@ -527,6 +610,46 @@ func (manager *Manager) baseContext() context.Context {
 		return manager.Context
 	}
 	return context.Background()
+}
+
+func (manager *Manager) operationTimeout() time.Duration {
+	if manager.OperationTimeout > 0 {
+		return manager.OperationTimeout
+	}
+
+	return 2 * time.Hour
+}
+
+func (manager *Manager) recoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := manager.RecoveryTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
+
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
+func recoveryRequired(operation Operation) bool {
+	if operation.Status == StatusRecoveryRequired {
+		return true
+	}
+	if operation.Status != StatusFailed || operation.RecoveryPointID == "" || operation.CurrentStage != "rollback" {
+		return false
+	}
+	if len(operation.Stages) == 0 {
+		return true
+	}
+	last := operation.Stages[len(operation.Stages)-1]
+
+	return last.Name == "rollback" && last.Status == "failed"
+}
+
+func updateRecoveryNeeded(operation Operation) bool {
+	if operation.Kind != KindUpdate || operation.Status != StatusRunning {
+		return false
+	}
+
+	return operation.CurrentStage == "quiesce" || operation.CurrentStage == "backup" || operation.CurrentStage == "rollback"
 }
 
 func (manager *Manager) now() time.Time {

@@ -42,7 +42,7 @@ The scheduled `metadata-refresh.yml` workflow renews snapshot and timestamp meta
 11. Stop new work, confirm all GEOFlow queues are idle, and record the check before handover. The legacy Redis container has no persistent volume, so pending jobs can be lost when it stops.
 12. On each architecture, exercise handover from the standard `geoflow-laravel-prod` project and confirm only one PostgreSQL container can attach the production data directory.
 13. From the managed release, run a transactional update that includes a migration and verify the recovery point, operation stages, new signed version document, and healthy containers.
-14. Force a protected-stage failure on a disposable host and verify automatic database, storage, configuration, and deployment rollback.
+14. Force a protected-stage failure on a disposable host and verify automatic PostgreSQL, Redis, storage, configuration, and deployment rollback.
 15. Restart the updater during migration and during resume, then verify startup reconciliation follows the last durable stage without exposing two active operations.
 
 The publisher rejects a non-increasing release sequence, unrecognized manifest fields, mutable image tags, unofficial image repositories, malformed semantic versions, and a Compose target outside the fixed managed path.

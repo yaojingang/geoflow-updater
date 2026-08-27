@@ -118,6 +118,18 @@ func TestEnrollRejectsSymlinkedInstanceRoot(t *testing.T) {
 	}
 }
 
+func TestEnrollRejectsRootsBlockedByTheInstalledSystemdSandbox(t *testing.T) {
+	t.Parallel()
+
+	service := enrollment.Service{StateDir: filepath.Join(t.TempDir(), "state")}
+	for _, root := range []string{"/home/geoflow", "/root/geoflow", "/usr/local/geoflow", "/etc/geoflow", "/tmp/geoflow"} {
+		_, err := service.Enroll(context.Background(), enrollment.Request{InstanceID: "primary", Root: root})
+		if err == nil || !strings.Contains(err.Error(), "systemd sandbox") {
+			t.Fatalf("Enroll(%q) error = %v, want systemd sandbox rejection", root, err)
+		}
+	}
+}
+
 func TestEnrollRejectsSymlinkedRequiredLayoutPaths(t *testing.T) {
 	t.Parallel()
 

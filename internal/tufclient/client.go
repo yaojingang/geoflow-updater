@@ -23,11 +23,13 @@ const (
 )
 
 var releaseVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
+var sourceCommitPattern = regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`)
 
 type releaseManifest struct {
 	SchemaVersion   int               `json:"schema_version"`
 	ReleaseSequence uint64            `json:"release_sequence"`
 	Version         string            `json:"version"`
+	SourceCommit    string            `json:"source_commit,omitempty"`
 	AppImage        string            `json:"app_image"`
 	WebImage        string            `json:"web_image"`
 	PostgresImages  map[string]string `json:"postgres_images"`
@@ -135,6 +137,7 @@ func DecodeReleaseManifest(manifestBytes []byte, composeBytes []byte, versionDoc
 	release := managed.Release{
 		Sequence:        manifest.ReleaseSequence,
 		Version:         manifest.Version,
+		SourceCommit:    manifest.SourceCommit,
 		AppImage:        manifest.AppImage,
 		WebImage:        manifest.WebImage,
 		PostgresImages:  manifest.PostgresImages,
@@ -169,6 +172,9 @@ func decodeManifest(contents []byte) (releaseManifest, error) {
 	}
 	if manifest.ReleaseSequence == 0 || !releaseVersionPattern.MatchString(manifest.Version) {
 		return releaseManifest{}, errors.New("release manifest sequence or version is invalid")
+	}
+	if manifest.SourceCommit != "" && !sourceCommitPattern.MatchString(manifest.SourceCommit) {
+		return releaseManifest{}, errors.New("release manifest source commit is invalid")
 	}
 	if manifest.ComposeTarget != ManagedComposeTarget {
 		return releaseManifest{}, errors.New("release manifest references an unsupported Compose target")

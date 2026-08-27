@@ -11,6 +11,7 @@ Group=geoflow-updater
 ExecStart=/usr/local/sbin/geoflow-updater serve
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=35min
 UMask=0027
 RuntimeDirectory=geoflow-updater
 RuntimeDirectoryMode=0750

@@ -12,7 +12,7 @@ The current implementation provides:
 - digest-pinned GEOFlow application and web images;
 - a signed bootstrap manifest for the GEOFlow administrator bridge;
 - transaction stages for resolve, preflight, pull, quiesce, backup, migrate, activate, resume, and verify;
-- PostgreSQL custom-format dumps, compressed site storage, deployment state, and configuration recovery points;
+- PostgreSQL custom-format dumps, compressed site storage and persistent Redis data, deployment state, and configuration recovery points;
 - automatic rollback after protected-stage failures and startup reconciliation after interrupted operations;
 - authenticated typed operations for update, backup, verification, recovery-point listing, and rollback;
 - direct CLI operations and administrator update-center controls.
@@ -56,7 +56,7 @@ sudo geoflow-updater doctor --instance primary
 
 Before running `down`, stop new work and confirm every GEOFlow queue is idle. Jobs still held in the legacy Redis container can be lost when that container stops because the legacy deployment does not persist Redis data. The explicit `down` is the planned handover boundary. It stops the standard `geoflow-laravel-prod` project before the signed deployment attaches the same database and storage paths. Both environment files are required: `.env.prod` supplies the site's credentials and volume settings, while `release.env` supplies signed image digests and updater-owned paths.
 
-Enrollment preserves PostgreSQL 16 or 18 and Redis 7 or 8 according to `PGVECTOR_IMAGE` and `REDIS_IMAGE` in `.env.prod`. It resolves a relative `POSTGRES_DATA_DIR` against the existing GEOFlow root, verifies the cluster's `PG_VERSION`, and writes the canonical source and container mount paths into updater-owned state. If either image reference has no recognizable major tag, set `GEOFLOW_UPDATER_POSTGRES_MAJOR` or `GEOFLOW_UPDATER_REDIS_MAJOR` explicitly before enrollment. Missing clusters, version mismatches, unsafe mount targets, and unsupported majors are rejected before managed state or containers change.
+Enrollment preserves PostgreSQL 16 or 18 and Redis 7 or 8 according to `PGVECTOR_IMAGE` and `REDIS_IMAGE` in `.env.prod`. It resolves a relative `POSTGRES_DATA_DIR` against the existing GEOFlow root, verifies the cluster's `PG_VERSION`, and writes the canonical source and container mount paths into updater-owned state. If either image reference has no recognizable major tag, set `GEOFLOW_UPDATER_POSTGRES_MAJOR` or `GEOFLOW_UPDATER_REDIS_MAJOR` explicitly before enrollment. Missing clusters, version mismatches, unsafe mount targets, and unsupported majors are rejected before managed state or containers change. `/opt/geoflow` is the recommended root; paths protected or isolated by the installed systemd sandbox are rejected during enrollment.
 
 The installer does not support a remote `curl | sudo sh` flow. Review the extracted files before running the local script.
 
@@ -74,7 +74,7 @@ sudo geoflow-updater rollback --instance primary --recovery-point RECOVERY_POINT
 
 An update resolves TUF metadata and signed targets, requires a higher release sequence, pulls immutable image digests, enters maintenance mode, and creates a recovery point before migrations or deployment activation. The updater restores the recovery point when migration, activation, startup, or verification fails. Operation state is written atomically after every stage. On service startup, an interrupted update is either safely completed after verification or restored according to its last durable stage.
 
-Recovery points include a PostgreSQL custom-format dump, the complete `storage/` tree with ownership and permissions, `.env.prod`, `version.json`, and updater-owned deployment files. Every artifact is verified against its manifest before restoration begins. The newest five valid recovery points are retained by default.
+Recovery points include a PostgreSQL custom-format dump, the complete `storage/` tree, the stopped Redis data directory, `.env.prod`, `version.json`, and updater-owned deployment files. File ownership and permissions are preserved. Every artifact and directory archive is verified and staged before restoration mutates configuration or data. Nested mounts are rejected to keep external datasets outside backup and cleanup operations. The newest five recovery points are retained by default, and a selected point receives a full integrity check before the deployment enters maintenance mode.
 
 ## Managed state
 

@@ -70,3 +70,23 @@ func TestDecodeReleaseManifestRejectsUnknownFields(t *testing.T) {
 		t.Fatal("DecodeReleaseManifest() accepted an unknown field")
 	}
 }
+
+func TestDecodeReleaseManifestRejectsAMutableSourceReference(t *testing.T) {
+	t.Parallel()
+
+	manifest := []byte(`{
+  "schema_version": 1,
+  "release_sequence": 17,
+  "version": "2.4.0",
+  "source_commit": "main",
+  "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:` + strings.Repeat("1", 64) + `",
+  "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:` + strings.Repeat("2", 64) + `",
+  "postgres_images": {"16":"pgvector/pgvector@sha256:` + strings.Repeat("3", 64) + `","18":"pgvector/pgvector@sha256:` + strings.Repeat("4", 64) + `"},
+  "redis_images": {"7":"redis@sha256:` + strings.Repeat("5", 64) + `","8":"redis@sha256:` + strings.Repeat("6", 64) + `"},
+  "compose_target": "deploy/docker-compose.managed.yml"
+}`)
+
+	if _, err := tufclient.DecodeReleaseManifest(manifest, []byte("services: {}\n")); err == nil {
+		t.Fatal("DecodeReleaseManifest() accepted a mutable source reference")
+	}
+}

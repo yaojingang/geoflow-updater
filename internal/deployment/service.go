@@ -22,7 +22,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var instanceIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+var (
+	instanceIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	recoveryIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$`)
+)
 
 type ReleaseResolver interface {
 	Current(context.Context) (managed.Release, error)
@@ -38,6 +41,7 @@ type CommandRunner interface {
 
 type RecoveryStore interface {
 	Create(context.Context, instance.Config, string, recovery.Database) (recovery.Point, error)
+	Validate(instance.Config, string) error
 	Restore(context.Context, instance.Config, string, recovery.Database) error
 	List(string) ([]recovery.Point, error)
 }
@@ -108,9 +112,26 @@ func (service *Service) Quiesce(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return err
 	}
+
+	return service.quiesce(ctx, instanceID, config)
+}
+
+func (service *Service) QuiesceForRecovery(ctx context.Context, instanceID string, recoveryPointID string) error {
+	if !recoveryIDPattern.MatchString(recoveryPointID) {
+		return errors.New("recovery point identifier is invalid")
+	}
+	config, err := service.loadConfigForRecovery(instanceID, recoveryPointID)
+	if err != nil {
+		return err
+	}
+
+	return service.quiesce(ctx, instanceID, config)
+}
+
+func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config) error {
 	arguments := composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile)
 	_ = service.runner().Run(ctx, nil, io.Discard, "docker", append(arguments, "exec", "-T", "app", "php", "artisan", "down", "--retry=60")...)
-	services := []string{"queue", "knowledge-queue", "system-update-queue", "scheduler", "reverb", "web", "app"}
+	services := []string{"queue", "knowledge-queue", "system-update-queue", "scheduler", "reverb", "web", "app", "redis"}
 	if err := service.runner().Run(ctx, nil, io.Discard, "docker", append(append(arguments, "stop"), services...)...); err != nil {
 		resumeErr := service.Resume(ctx, instanceID)
 		return errors.Join(fmt.Errorf("stop application services: %w", err), resumeErr)
@@ -182,7 +203,10 @@ func (service *Service) Activate(_ context.Context, instanceID string, release m
 }
 
 func (service *Service) Rollback(ctx context.Context, instanceID string, recoveryPointID string) error {
-	config, err := service.loadConfig(instanceID)
+	if !recoveryIDPattern.MatchString(recoveryPointID) {
+		return errors.New("recovery point identifier is invalid")
+	}
+	config, err := service.loadConfigForRecovery(instanceID, recoveryPointID)
 	if err != nil {
 		return err
 	}
@@ -190,6 +214,21 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, recover
 		return errors.New("recovery point store is unavailable")
 	}
 	return service.Recoveries.Restore(ctx, config, recoveryPointID, postgresDatabase{config: config, runner: service.runner()})
+}
+
+func (service *Service) ValidateRecoveryPoint(instanceID string, recoveryPointID string) error {
+	if !recoveryIDPattern.MatchString(recoveryPointID) {
+		return errors.New("recovery point identifier is invalid")
+	}
+	config, err := service.loadConfigForRecovery(instanceID, recoveryPointID)
+	if err != nil {
+		return err
+	}
+	if service.Recoveries == nil {
+		return errors.New("recovery point store is unavailable")
+	}
+
+	return service.Recoveries.Validate(config, recoveryPointID)
 }
 
 func (service *Service) Resume(ctx context.Context, instanceID string) error {
@@ -294,6 +333,10 @@ func replaceEnvironmentValues(contents []byte, replacements map[string]string) (
 }
 
 func (service *Service) loadConfig(instanceID string) (instance.Config, error) {
+	return service.loadConfigForRecovery(instanceID, "")
+}
+
+func (service *Service) loadConfigForRecovery(instanceID string, recoveryPointID string) (instance.Config, error) {
 	if !instanceIDPattern.MatchString(instanceID) {
 		return instance.Config{}, errors.New("managed instance identifier is invalid")
 	}
@@ -350,7 +393,12 @@ func (service *Service) loadConfig(instanceID string) (instance.Config, error) {
 			return instance.Config{}, errors.New("managed site file is unavailable or unsafe")
 		}
 	}
-	storageInfo, err := os.Lstat(filepath.Join(root, "storage"))
+	storagePath := filepath.Join(root, "storage")
+	storageInfo, err := os.Lstat(storagePath)
+	if errors.Is(err, os.ErrNotExist) && recoveryPointID != "" {
+		storagePath = filepath.Join(root, ".geoflow-updater-storage-old-"+recoveryPointID)
+		storageInfo, err = os.Lstat(storagePath)
+	}
 	if err != nil || !storageInfo.IsDir() || storageInfo.Mode()&os.ModeSymlink != 0 {
 		return instance.Config{}, errors.New("managed storage directory is unavailable or unsafe")
 	}
@@ -387,7 +435,7 @@ func (database postgresDatabase) Dump(ctx context.Context, writer io.Writer) err
 
 func (database postgresDatabase) Restore(ctx context.Context, reader io.Reader) error {
 	arguments := composeArguments(database.config.Root, database.config.EnvironmentFile, database.config.ComposeFile)
-	if err := database.runner.Run(ctx, nil, io.Discard, "docker", append(arguments, "up", "-d", "--wait", "postgres", "redis")...); err != nil {
+	if err := database.runner.Run(ctx, nil, io.Discard, "docker", append(arguments, "up", "-d", "--wait", "postgres")...); err != nil {
 		return fmt.Errorf("start database services for restore: %w", err)
 	}
 	arguments = append(arguments, "exec", "-T", "postgres", "sh", "-eu", "-c", `exec pg_restore --exit-on-error --clean --if-exists --create --username="$POSTGRES_USER" --dbname=postgres`)

@@ -31,6 +31,7 @@ type OperationController interface {
 	StartRollback(string, string) (operation.Operation, error)
 	StartVerify(string) (operation.Operation, error)
 	Current(string) (operation.Operation, error)
+	Get(string, string) (operation.Operation, error)
 	RecoveryPoints(string) ([]recovery.Point, error)
 }
 
@@ -147,8 +148,8 @@ func (app App) waitForOperation(ctx context.Context, instanceID string, operatio
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		current, err := app.Operations.Current(instanceID)
-		if err == nil && current.ID == operationID && current.CompletedAt != nil {
+		current, err := app.Operations.Get(instanceID, operationID)
+		if err == nil && current.CompletedAt != nil {
 			return current, nil
 		}
 		if err != nil && !errors.Is(err, os.ErrNotExist) {

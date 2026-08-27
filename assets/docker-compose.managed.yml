@@ -9,17 +9,9 @@ x-app-base: &app-base
     AUTO_FIX_STORAGE_PERMISSIONS: "false"
     AUTO_INSTALL_ONCE: "false"
     AUTO_MIGRATE: "false"
-    GEOFLOW_UPDATER_INSTANCE_ID: ${GEOFLOW_INSTANCE_ID}
-    GEOFLOW_UPDATER_HOST_ROOT: ${GEOFLOW_INSTANCE_ROOT}
-    GEOFLOW_UPDATER_SOCKET: /run/geoflow-updater/geoflow-updater.sock
-    GEOFLOW_UPDATER_CONTROL_TOKEN_FILE: /run/secrets/geoflow-updater-control-token
   volumes:
     - ${GEOFLOW_INSTANCE_ROOT}/.env.prod:/var/www/html/.env:ro
     - ${GEOFLOW_INSTANCE_ROOT}/storage:/var/www/html/storage
-    - /run/geoflow-updater:/run/geoflow-updater:ro
-    - ${GEOFLOW_UPDATER_STATE_DIR:-/var/lib/geoflow-updater}/instances/${GEOFLOW_INSTANCE_ID}/control.token:/run/secrets/geoflow-updater-control-token:ro
-  group_add:
-    - ${GEOFLOW_UPDATER_GROUP_ID:?GEOFLOW_UPDATER_GROUP_ID is required}
   restart: unless-stopped
 
 services:
@@ -81,6 +73,21 @@ services:
   app:
     <<: *app-base
     container_name: geoflow-app-prod
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      AUTO_INSTALL_ONCE: "false"
+      AUTO_MIGRATE: "false"
+      GEOFLOW_UPDATER_INSTANCE_ID: ${GEOFLOW_INSTANCE_ID}
+      GEOFLOW_UPDATER_HOST_ROOT: ${GEOFLOW_INSTANCE_ROOT}
+      GEOFLOW_UPDATER_SOCKET: /run/geoflow-updater/geoflow-updater.sock
+      GEOFLOW_UPDATER_CONTROL_TOKEN_FILE: /run/secrets/geoflow-updater-control-token
+    volumes:
+      - ${GEOFLOW_INSTANCE_ROOT}/.env.prod:/var/www/html/.env:ro
+      - ${GEOFLOW_INSTANCE_ROOT}/storage:/var/www/html/storage
+      - /run/geoflow-updater:/run/geoflow-updater:ro
+      - ${GEOFLOW_UPDATER_STATE_DIR:-/var/lib/geoflow-updater}/instances/${GEOFLOW_INSTANCE_ID}/control.token:/run/secrets/geoflow-updater-control-token:ro
+    group_add:
+      - ${GEOFLOW_UPDATER_GROUP_ID:?GEOFLOW_UPDATER_GROUP_ID is required}
     mem_limit: ${APP_CONTAINER_MEMORY_LIMIT:-768m}
     depends_on:
       init:

@@ -1,10 +1,6 @@
 name: Publish TUF repository
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - tuf/repository/**
   workflow_dispatch:
 
 permissions:

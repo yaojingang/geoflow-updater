@@ -115,10 +115,17 @@ func (store Store) Create(ctx context.Context, config instance.Config, reason st
 	}
 
 	storageArchive := filepath.Join(temporaryPath, "storage.tar.gz")
-	if err := archiveStorage(filepath.Join(config.Root, "storage"), storageArchive); err != nil {
+	if err := archiveDirectory(ctx, filepath.Join(config.Root, "storage"), storageArchive, "storage"); err != nil {
 		return Point{}, err
 	}
 	if files["storage.tar.gz"], err = describeFile(storageArchive); err != nil {
+		return Point{}, err
+	}
+	redisArchive := filepath.Join(temporaryPath, "redis.tar.gz")
+	if err := archiveDirectory(ctx, filepath.Join(config.Root, "docker-data", "prod", "redis"), redisArchive, "redis"); err != nil {
+		return Point{}, fmt.Errorf("archive Redis data: %w", err)
+	}
+	if files["redis.tar.gz"], err = describeFile(redisArchive); err != nil {
 		return Point{}, err
 	}
 
@@ -184,33 +191,90 @@ func (store Store) Restore(ctx context.Context, config instance.Config, id strin
 	if database == nil {
 		return errors.New("database restore service is required")
 	}
-	pointPath, point, err := store.load(config.ID, id)
+	pointPath, point, err := store.validate(config, id)
 	if err != nil {
 		return err
 	}
+
+	return store.restoreValidated(ctx, config, id, pointPath, point, database)
+}
+
+func (store Store) Validate(config instance.Config, id string) error {
+	_, _, err := store.validate(config, id)
+
+	return err
+}
+
+func (store Store) validate(config instance.Config, id string) (string, Point, error) {
+	pointPath, point, err := store.load(config.ID, id)
+	if err != nil {
+		return "", Point{}, err
+	}
 	if point.Root != config.Root {
-		return errors.New("recovery point belongs to a different instance root")
+		return "", Point{}, errors.New("recovery point belongs to a different instance root")
 	}
 	expectedFiles := []string{
 		"database.dump",
 		"managed/docker-compose.yml",
 		"managed/instance.yml",
 		"managed/release.env",
+		"redis.tar.gz",
 		"site.env",
 		"storage.tar.gz",
 		"version.json",
 	}
 	if len(point.Files) != len(expectedFiles) {
-		return errors.New("recovery point file set is incomplete")
+		return "", Point{}, errors.New("recovery point file set is incomplete")
 	}
 	for _, name := range expectedFiles {
 		record, ok := point.Files[name]
 		if !ok {
-			return fmt.Errorf("recovery point is missing %s", name)
+			return "", Point{}, fmt.Errorf("recovery point is missing %s", name)
 		}
 		if err := verifyFile(filepath.Join(pointPath, filepath.FromSlash(name)), record); err != nil {
-			return fmt.Errorf("verify recovery point %s: %w", name, err)
+			return "", Point{}, fmt.Errorf("verify recovery point %s: %w", name, err)
 		}
+	}
+
+	return pointPath, point, nil
+}
+
+func (store Store) restoreValidated(ctx context.Context, config instance.Config, id string, pointPath string, point Point, database Database) error {
+	expectedFiles := []string{
+		"database.dump",
+		"managed/docker-compose.yml",
+		"managed/instance.yml",
+		"managed/release.env",
+		"redis.tar.gz",
+		"site.env",
+		"storage.tar.gz",
+		"version.json",
+	}
+
+	storageStageRoot, err := os.MkdirTemp(config.Root, ".geoflow-updater-restore-")
+	if err != nil {
+		return fmt.Errorf("create recovery restore staging directory: %w", err)
+	}
+	defer os.RemoveAll(storageStageRoot)
+	stagedStorage, err := stageDirectoryArchive(filepath.Join(pointPath, "storage.tar.gz"), storageStageRoot, "storage")
+	if err != nil {
+		return fmt.Errorf("stage storage recovery archive: %w", err)
+	}
+	redisParent := filepath.Join(config.Root, "docker-data", "prod")
+	redisStageRoot, err := os.MkdirTemp(redisParent, ".geoflow-updater-restore-")
+	if err != nil {
+		return fmt.Errorf("create Redis recovery staging directory: %w", err)
+	}
+	defer os.RemoveAll(redisStageRoot)
+	stagedRedis, err := stageDirectoryArchive(filepath.Join(pointPath, "redis.tar.gz"), redisStageRoot, "redis")
+	if err != nil {
+		return fmt.Errorf("stage Redis recovery archive: %w", err)
+	}
+	if err := rejectMountedTree(filepath.Join(config.Root, "storage")); err != nil {
+		return err
+	}
+	if err := rejectMountedTree(filepath.Join(redisParent, "redis")); err != nil {
+		return err
 	}
 
 	destinations := map[string]string{
@@ -242,8 +306,21 @@ func (store Store) Restore(ctx context.Context, config instance.Config, id strin
 		return fmt.Errorf("close database backup: %w", err)
 	}
 
-	if err := restoreStorage(config.Root, filepath.Join(pointPath, "storage.tar.gz"), id); err != nil {
-		return err
+	if err := restoreStagedDirectory(
+		config.Root,
+		filepath.Join(config.Root, "storage"),
+		stagedStorage,
+		filepath.Join(config.Root, ".geoflow-updater-storage-old-"+id),
+	); err != nil {
+		return fmt.Errorf("restore storage: %w", err)
+	}
+	if err := restoreStagedDirectory(
+		redisParent,
+		filepath.Join(redisParent, "redis"),
+		stagedRedis,
+		filepath.Join(redisParent, ".geoflow-updater-redis-old-"+id),
+	); err != nil {
+		return fmt.Errorf("restore Redis data: %w", err)
 	}
 
 	return nil
@@ -358,10 +435,13 @@ func (store Store) load(instanceID string, id string) (string, Point, error) {
 	return pointPath, point, nil
 }
 
-func archiveStorage(storageRoot string, destination string) error {
-	info, err := os.Lstat(storageRoot)
+func archiveDirectory(ctx context.Context, sourceRoot string, destination string, archiveRoot string) error {
+	info, err := os.Lstat(sourceRoot)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("instance storage directory is unavailable or unsafe")
+		return errors.New("source directory is unavailable or unsafe")
+	}
+	if err := rejectNestedMounts(sourceRoot); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return err
@@ -377,7 +457,10 @@ func archiveStorage(storageRoot string, destination string) error {
 	}
 	tarWriter := tar.NewWriter(gzipWriter)
 	var total int64
-	walkErr := filepath.WalkDir(storageRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+	walkErr := filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -394,7 +477,7 @@ func archiveStorage(storageRoot string, destination string) error {
 			}
 			total += info.Size()
 		}
-		relative, err := filepath.Rel(storageRoot, path)
+		relative, err := filepath.Rel(sourceRoot, path)
 		if err != nil {
 			return err
 		}
@@ -408,9 +491,9 @@ func archiveStorage(storageRoot string, destination string) error {
 		}
 		header.Uid = uid
 		header.Gid = gid
-		header.Name = "storage"
+		header.Name = archiveRoot
 		if relative != "." {
-			header.Name = filepath.ToSlash(filepath.Join("storage", relative))
+			header.Name = filepath.ToSlash(filepath.Join(archiveRoot, relative))
 		}
 		if err := tarWriter.WriteHeader(header); err != nil {
 			return err
@@ -422,7 +505,12 @@ func archiveStorage(storageRoot string, destination string) error {
 		if err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(tarWriter, source)
+		openedInfo, statErr := source.Stat()
+		if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+			_ = source.Close()
+			return errors.New("storage entry changed while it was being archived")
+		}
+		_, copyErr := io.Copy(tarWriter, contextReader{ctx: ctx, reader: source})
 		closeErr := source.Close()
 		return errors.Join(copyErr, closeErr)
 	})
@@ -434,50 +522,109 @@ func archiveStorage(storageRoot string, destination string) error {
 	return nil
 }
 
-func restoreStorage(root string, archivePath string, id string) error {
-	stageRoot, err := os.MkdirTemp(root, ".geoflow-updater-restore-")
+func restoreStagedDirectory(syncRoot string, currentDirectory string, stagedDirectory string, oldDirectory string) error {
+	completed, err := reconcileInterruptedDirectorySwap(syncRoot, currentDirectory, oldDirectory)
 	if err != nil {
-		return fmt.Errorf("create storage restore staging directory: %w", err)
-	}
-	defer os.RemoveAll(stageRoot)
-	if err := extractStorage(archivePath, stageRoot); err != nil {
 		return err
 	}
-	stagedStorage := filepath.Join(stageRoot, "storage")
-	if info, err := os.Lstat(stagedStorage); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("recovery point storage archive is incomplete")
+	if completed {
+		return nil
 	}
-	currentStorage := filepath.Join(root, "storage")
-	oldStorage := filepath.Join(root, ".geoflow-updater-storage-old-"+id)
-	if _, err := os.Lstat(oldStorage); err == nil {
-		return errors.New("previous storage restore staging directory still exists")
+
+	if info, err := os.Lstat(stagedDirectory); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("staged recovery directory is incomplete")
+	}
+	if err := rejectMountedTree(currentDirectory); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(oldDirectory); err == nil {
+		return errors.New("previous directory restore staging path still exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.Rename(currentStorage, oldStorage); err != nil {
-		return fmt.Errorf("stage current storage for restore: %w", err)
+	if err := os.Rename(currentDirectory, oldDirectory); err != nil {
+		return fmt.Errorf("stage current directory for restore: %w", err)
+	}
+	if err := syncDirectory(syncRoot); err != nil {
+		_ = os.Rename(oldDirectory, currentDirectory)
+		return fmt.Errorf("sync staged current directory: %w", err)
 	}
 	restored := false
 	defer func() {
 		if !restored {
-			_ = os.Rename(oldStorage, currentStorage)
+			_ = os.Rename(oldDirectory, currentDirectory)
 		}
 	}()
-	if err := os.Rename(stagedStorage, currentStorage); err != nil {
-		return fmt.Errorf("activate restored storage: %w", err)
+	if err := os.Rename(stagedDirectory, currentDirectory); err != nil {
+		return fmt.Errorf("activate restored directory: %w", err)
 	}
 	restored = true
-	syncErr := syncDirectory(root)
-	removeErr := os.RemoveAll(oldStorage)
-	finalSyncErr := syncDirectory(root)
+	if err := rejectNestedMounts(oldDirectory); err != nil {
+		return err
+	}
+	syncErr := syncDirectory(syncRoot)
+	removeErr := os.RemoveAll(oldDirectory)
+	finalSyncErr := syncDirectory(syncRoot)
 	if err := errors.Join(syncErr, removeErr, finalSyncErr); err != nil {
-		return fmt.Errorf("commit restored storage: %w", err)
+		return fmt.Errorf("commit restored directory: %w", err)
 	}
 
 	return nil
 }
 
-func extractStorage(archivePath string, destination string) error {
+func reconcileInterruptedDirectorySwap(syncRoot string, currentDirectory string, oldDirectory string) (bool, error) {
+	oldInfo, err := os.Lstat(oldDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !oldInfo.IsDir() || oldInfo.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("previous storage restore staging directory is unsafe")
+	}
+
+	currentInfo, err := os.Lstat(currentDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(oldDirectory, currentDirectory); err != nil {
+			return false, fmt.Errorf("recover interrupted directory swap: %w", err)
+		}
+		if err := syncDirectory(syncRoot); err != nil {
+			return false, fmt.Errorf("sync recovered directory swap: %w", err)
+		}
+
+		return false, nil
+	}
+	if err != nil || !currentInfo.IsDir() || currentInfo.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("restored storage path is unsafe")
+	}
+
+	if err := rejectNestedMounts(oldDirectory); err != nil {
+		return false, err
+	}
+	if err := syncDirectory(syncRoot); err != nil {
+		return false, fmt.Errorf("sync restored directory: %w", err)
+	}
+	if err := os.RemoveAll(oldDirectory); err != nil {
+		return false, fmt.Errorf("remove previous directory after interrupted restore: %w", err)
+	}
+	if err := syncDirectory(syncRoot); err != nil {
+		return false, fmt.Errorf("commit interrupted directory restore: %w", err)
+	}
+
+	return true, nil
+}
+
+func stageDirectoryArchive(archivePath string, destination string, archiveRoot string) (string, error) {
+	if err := extractDirectoryArchive(archivePath, destination, archiveRoot); err != nil {
+		return "", err
+	}
+	staged := filepath.Join(destination, archiveRoot)
+	if info, err := os.Lstat(staged); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("recovery point directory archive is incomplete")
+	}
+
+	return staged, nil
+}
+
+func extractDirectoryArchive(archivePath string, destination string, archiveRoot string) error {
 	file, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -499,13 +646,13 @@ func extractStorage(archivePath string, destination string) error {
 			return err
 		}
 		name := filepath.Clean(filepath.FromSlash(header.Name))
-		if !filepath.IsLocal(name) || (name != "storage" && !strings.HasPrefix(name, "storage"+string(filepath.Separator))) {
-			return errors.New("storage archive contains an unsafe path")
+		if !filepath.IsLocal(name) || (name != archiveRoot && !strings.HasPrefix(name, archiveRoot+string(filepath.Separator))) {
+			return errors.New("directory archive contains an unsafe path")
 		}
-		total += header.Size
-		if header.Size < 0 || total > maxRestoreBytes {
+		if header.Size < 0 || total > maxRestoreBytes-header.Size {
 			return errors.New("storage archive exceeds the restore limit")
 		}
+		total += header.Size
 		path := filepath.Join(destination, name)
 		switch header.Typeflag {
 		case tar.TypeDir:
@@ -531,6 +678,9 @@ func extractStorage(archivePath string, destination string) error {
 			if copyErr != nil || closeErr != nil {
 				return errors.Join(copyErr, closeErr)
 			}
+			if err := os.Chmod(path, os.FileMode(header.Mode)&0o777); err != nil {
+				return err
+			}
 			if err := os.Chown(path, header.Uid, header.Gid); err != nil {
 				return err
 			}
@@ -538,6 +688,62 @@ func extractStorage(archivePath string, destination string) error {
 			return errors.New("storage archive contains an unsupported entry")
 		}
 	}
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (reader contextReader) Read(buffer []byte) (int, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return reader.reader.Read(buffer)
+}
+
+func rejectNestedMounts(root string) error {
+	return rejectMounts(root, false)
+}
+
+func rejectMountedTree(root string) error {
+	return rejectMounts(root, true)
+}
+
+func rejectMounts(root string, includeRoot bool) error {
+	contents, err := os.ReadFile("/proc/self/mountinfo")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect mounted filesystems: %w", err)
+	}
+	cleanRoot := filepath.Clean(root)
+	prefix := cleanRoot + string(filepath.Separator)
+	for _, line := range strings.Split(string(contents), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		mountPoint := filepath.Clean(decodeMountInfoPath(fields[4]))
+		if (includeRoot && mountPoint == cleanRoot) || strings.HasPrefix(mountPoint, prefix) {
+			return fmt.Errorf("recovery directory contains nested mount point %s", mountPoint)
+		}
+	}
+
+	return nil
+}
+
+func decodeMountInfoPath(value string) string {
+	replacer := strings.NewReplacer(
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+		`\134`, `\`,
+	)
+
+	return replacer.Replace(value)
 }
 
 func copyRegularFile(source string, destination string) error {
@@ -655,6 +861,10 @@ func ensureDirectory(path string, mode os.FileMode) error {
 func writeExclusive(path string, contents []byte, mode os.FileMode) error {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
 		return err
 	}
 	if _, err := file.Write(contents); err != nil {

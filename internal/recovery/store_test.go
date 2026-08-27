@@ -3,9 +3,13 @@ package recovery_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -37,6 +41,7 @@ func TestStoreCreatesVerifiedRecoveryPointAndRestoresDatabaseStorageAndManagedSt
 	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("APP_ENV=production\n"), 0o600)
 	mustWrite(t, filepath.Join(root, "version.json"), []byte("{\"version\":\"2.4.0\"}\n"), 0o644)
 	mustWrite(t, filepath.Join(root, "storage", "app", "customer.txt"), []byte("customer data"), 0o640)
+	mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("redis state"), 0o600)
 	mustWrite(t, filepath.Join(stateDir, "instance.yml"), []byte("old instance\n"), 0o640)
 	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("old release\n"), 0o640)
 	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("old compose\n"), 0o640)
@@ -62,6 +67,7 @@ func TestStoreCreatesVerifiedRecoveryPointAndRestoresDatabaseStorageAndManagedSt
 	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("changed env\n"), 0o600)
 	mustWrite(t, filepath.Join(root, "version.json"), []byte("{\"version\":\"2.5.0\"}\n"), 0o644)
 	mustWrite(t, filepath.Join(root, "storage", "app", "customer.txt"), []byte("changed data"), 0o640)
+	mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("changed redis"), 0o600)
 	mustWrite(t, config.EnvironmentFile, []byte("new release\n"), 0o640)
 
 	if err := store.Restore(context.Background(), config, point.ID, db); err != nil {
@@ -70,6 +76,7 @@ func TestStoreCreatesVerifiedRecoveryPointAndRestoresDatabaseStorageAndManagedSt
 	assertContents(t, filepath.Join(root, ".env.prod"), "APP_ENV=production\n")
 	assertContents(t, filepath.Join(root, "version.json"), "{\"version\":\"2.4.0\"}\n")
 	assertContents(t, filepath.Join(root, "storage", "app", "customer.txt"), "customer data")
+	assertContents(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), "redis state")
 	assertContents(t, config.EnvironmentFile, "old release\n")
 	if !bytes.Equal(db.restored, db.dump) {
 		t.Fatalf("restored database = %q, want %q", db.restored, db.dump)
@@ -84,6 +91,7 @@ func TestStoreRefusesATamperedRecoveryPointBeforeRestoring(t *testing.T) {
 	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("original env\n"), 0o600)
 	mustWrite(t, filepath.Join(root, "version.json"), []byte("{}\n"), 0o644)
 	mustWrite(t, filepath.Join(root, "storage", "file.txt"), []byte("original"), 0o640)
+	mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("redis"), 0o600)
 	mustWrite(t, filepath.Join(stateDir, "instance.yml"), []byte("instance\n"), 0o640)
 	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("release\n"), 0o640)
 	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
@@ -114,6 +122,9 @@ func TestStoreRetainsTheNewestConfiguredRecoveryPoints(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "storage"), 0o750); err != nil {
 		t.Fatalf("mkdir storage: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(root, "docker-data", "prod", "redis"), 0o750); err != nil {
+		t.Fatalf("mkdir redis: %v", err)
+	}
 	mustWrite(t, filepath.Join(stateDir, "instance.yml"), []byte("instance\n"), 0o640)
 	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("release\n"), 0o640)
 	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
@@ -138,6 +149,141 @@ func TestStoreRetainsTheNewestConfiguredRecoveryPoints(t *testing.T) {
 	}
 	if len(points) != 2 || !points[0].CreatedAt.After(points[1].CreatedAt) {
 		t.Fatalf("retained points = %#v", points)
+	}
+}
+
+func TestStoreRecoversAnInterruptedStorageSwapBeforeRetryingRestore(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "site")
+	stateDir := filepath.Join(t.TempDir(), "state", "instances", "primary")
+	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("APP_ENV=production\n"), 0o600)
+	mustWrite(t, filepath.Join(root, "version.json"), []byte("{\"version\":\"2.4.0\"}\n"), 0o640)
+	mustWrite(t, filepath.Join(root, "storage", "app", "customer.txt"), []byte("backup data"), 0o640)
+	mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("redis"), 0o600)
+	mustWrite(t, filepath.Join(stateDir, "instance.yml"), []byte("instance\n"), 0o640)
+	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("release\n"), 0o640)
+	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
+	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
+	store := recovery.Store{BackupRoot: filepath.Join(t.TempDir(), "backups")}
+	db := &database{dump: []byte("database")}
+	point, err := store.Create(context.Background(), config, "before update", db)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	mustWrite(t, filepath.Join(root, "storage", "app", "customer.txt"), []byte("current data"), 0o640)
+	oldStorage := filepath.Join(root, ".geoflow-updater-storage-old-"+point.ID)
+	if err := os.Rename(filepath.Join(root, "storage"), oldStorage); err != nil {
+		t.Fatalf("simulate interrupted storage swap: %v", err)
+	}
+
+	if err := store.Restore(context.Background(), config, point.ID, db); err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+	assertContents(t, filepath.Join(root, "storage", "app", "customer.txt"), "backup data")
+	if _, err := os.Lstat(oldStorage); !os.IsNotExist(err) {
+		t.Fatalf("old storage path still exists after recovery: %v", err)
+	}
+}
+
+func TestStoreStagesEveryDirectoryArchiveBeforeMutatingManagedState(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "site")
+	stateDir := filepath.Join(t.TempDir(), "state", "instances", "primary")
+	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("original env\n"), 0o600)
+	mustWrite(t, filepath.Join(root, "version.json"), []byte("{}\n"), 0o640)
+	mustWrite(t, filepath.Join(root, "storage", "file.txt"), []byte("storage"), 0o640)
+	mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("redis"), 0o600)
+	mustWrite(t, filepath.Join(stateDir, "instance.yml"), []byte("instance\n"), 0o640)
+	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("release\n"), 0o640)
+	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
+	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
+	backupRoot := filepath.Join(t.TempDir(), "backups")
+	db := &database{dump: []byte("database")}
+	store := recovery.Store{BackupRoot: backupRoot}
+	point, err := store.Create(context.Background(), config, "manual", db)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	invalidArchive := []byte("valid checksum, invalid gzip")
+	archivePath := filepath.Join(backupRoot, "primary", point.ID, "storage.tar.gz")
+	mustWrite(t, archivePath, invalidArchive, 0o600)
+	manifestPath := filepath.Join(backupRoot, "primary", point.ID, "manifest.json")
+	manifestContents, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var manifest recovery.Point
+	if err := json.Unmarshal(manifestContents, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	digest := sha256.Sum256(invalidArchive)
+	record := manifest.Files["storage.tar.gz"]
+	record.SHA256 = hex.EncodeToString(digest[:])
+	record.Size = int64(len(invalidArchive))
+	manifest.Files["storage.tar.gz"] = record
+	updatedManifest, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatalf("encode manifest: %v", err)
+	}
+	mustWrite(t, manifestPath, append(updatedManifest, '\n'), 0o600)
+	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("current env\n"), 0o600)
+	db.restored = nil
+
+	if err := store.Restore(context.Background(), config, point.ID, db); err == nil {
+		t.Fatal("Restore() accepted an invalid storage archive")
+	}
+	assertContents(t, filepath.Join(root, ".env.prod"), "current env\n")
+	if db.restored != nil {
+		t.Fatalf("database was mutated before archive staging: %q", db.restored)
+	}
+}
+
+func TestStoreRestoresRegularFileModeDespiteProcessUmask(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "site")
+	stateDir := filepath.Join(t.TempDir(), "state", "instances", "primary")
+	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("env\n"), 0o600)
+	mustWrite(t, filepath.Join(root, "version.json"), []byte("{}\n"), 0o640)
+	mustWrite(t, filepath.Join(root, "storage", "shared.txt"), []byte("shared"), 0o664)
+	if err := os.Chmod(filepath.Join(root, "storage", "shared.txt"), 0o664); err != nil {
+		t.Fatalf("chmod source file: %v", err)
+	}
+	mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("redis"), 0o600)
+	mustWrite(t, filepath.Join(stateDir, "instance.yml"), []byte("instance\n"), 0o640)
+	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("release\n"), 0o660)
+	if err := os.Chmod(filepath.Join(stateDir, "release.env"), 0o660); err != nil {
+		t.Fatalf("chmod release environment: %v", err)
+	}
+	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
+	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
+	store := recovery.Store{BackupRoot: filepath.Join(t.TempDir(), "backups")}
+	db := &database{dump: []byte("database")}
+	oldMask := syscall.Umask(0o027)
+	defer syscall.Umask(oldMask)
+	point, err := store.Create(context.Background(), config, "manual", db)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	if err := store.Restore(context.Background(), config, point.ID, db); err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+	info, err := os.Stat(filepath.Join(root, "storage", "shared.txt"))
+	if err != nil {
+		t.Fatalf("stat restored file: %v", err)
+	}
+	if info.Mode().Perm() != 0o664 {
+		t.Fatalf("restored mode = %o, want 664", info.Mode().Perm())
+	}
+	info, err = os.Stat(config.EnvironmentFile)
+	if err != nil {
+		t.Fatalf("stat restored release environment: %v", err)
+	}
+	if info.Mode().Perm() != 0o660 {
+		t.Fatalf("restored release environment mode = %o, want 660", info.Mode().Perm())
 	}
 }
 

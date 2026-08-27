@@ -45,8 +45,9 @@ type Deployment interface {
 }
 
 type Engine struct {
-	Deployment Deployment
-	Now        func() time.Time
+	Deployment      Deployment
+	Now             func() time.Time
+	RecoveryTimeout time.Duration
 }
 
 type Observer func(Stage) error
@@ -104,6 +105,13 @@ func (engine Engine) Run(ctx context.Context, instanceID string, observe Observe
 		return persistenceFailure("quiesce", err)
 	}
 	if err := engine.Deployment.Quiesce(ctx, instanceID); err != nil {
+		recoveryCtx, cancel := engine.recoveryContext(ctx)
+		defer cancel()
+		if resumeErr := engine.Deployment.Resume(recoveryCtx, instanceID); resumeErr != nil {
+			err = errors.Join(err, fmt.Errorf("resume after failed quiesce: %w", resumeErr))
+		} else if verifyErr := engine.Deployment.Verify(recoveryCtx, instanceID); verifyErr != nil {
+			err = errors.Join(err, fmt.Errorf("verify after failed quiesce: %w", verifyErr))
+		}
 		return fail("quiesce", err)
 	}
 	if err := emit("quiesce", "succeeded", ""); err != nil {
@@ -115,7 +123,9 @@ func (engine Engine) Run(ctx context.Context, instanceID string, observe Observe
 	}
 	recoveryPointID, err := engine.Deployment.CreateRecoveryPoint(ctx, instanceID, "update-to-"+target.Version)
 	if err != nil {
-		resumeErr := engine.Deployment.Resume(ctx, instanceID)
+		recoveryCtx, cancel := engine.recoveryContext(ctx)
+		defer cancel()
+		resumeErr := engine.Deployment.Resume(recoveryCtx, instanceID)
 		if resumeErr != nil {
 			err = errors.Join(err, fmt.Errorf("resume current release: %w", resumeErr))
 		}
@@ -163,18 +173,26 @@ func (engine Engine) rollback(
 	cause error,
 	emit func(string, string, string) error,
 ) Result {
+	recoveryCtx, cancel := engine.recoveryContext(ctx)
+	defer cancel()
+
 	observeErr := emit("rollback", "running", "")
-	if err := engine.Deployment.Rollback(ctx, instanceID, recoveryPointID); err != nil {
+	if err := engine.Deployment.Quiesce(recoveryCtx, instanceID); err != nil {
+		combined := errors.Join(cause, observeErr, fmt.Errorf("quiesce before automatic rollback: %w", err))
+		_ = emit("rollback", "failed", combined.Error())
+		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
+	}
+	if err := engine.Deployment.Rollback(recoveryCtx, instanceID, recoveryPointID); err != nil {
 		combined := errors.Join(cause, observeErr, fmt.Errorf("automatic rollback: %w", err))
 		_ = emit("rollback", "failed", combined.Error())
 		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
 	}
-	if err := engine.Deployment.Resume(ctx, instanceID); err != nil {
+	if err := engine.Deployment.Resume(recoveryCtx, instanceID); err != nil {
 		combined := errors.Join(cause, observeErr, fmt.Errorf("resume rolled back release: %w", err))
 		_ = emit("rollback", "failed", combined.Error())
 		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
 	}
-	if err := engine.Deployment.Verify(ctx, instanceID); err != nil {
+	if err := engine.Deployment.Verify(recoveryCtx, instanceID); err != nil {
 		combined := errors.Join(cause, observeErr, fmt.Errorf("verify rolled back release: %w", err))
 		_ = emit("rollback", "failed", combined.Error())
 		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
@@ -195,15 +213,27 @@ func (engine Engine) resumeAfterPersistenceFailure(
 	persistErr error,
 	emit func(string, string, string) error,
 ) Result {
+	recoveryCtx, cancel := engine.recoveryContext(ctx)
+	defer cancel()
+
 	cause := fmt.Errorf("persist %s stage: %w", stage, persistErr)
-	if err := engine.Deployment.Resume(ctx, instanceID); err != nil {
+	if err := engine.Deployment.Resume(recoveryCtx, instanceID); err != nil {
 		cause = errors.Join(cause, fmt.Errorf("resume current release: %w", err))
-	} else if err := engine.Deployment.Verify(ctx, instanceID); err != nil {
+	} else if err := engine.Deployment.Verify(recoveryCtx, instanceID); err != nil {
 		cause = errors.Join(cause, fmt.Errorf("verify current release: %w", err))
 	}
 	_ = emit(stage, "failed", cause.Error())
 
 	return Result{Status: StatusFailed, Target: target, Error: cause.Error()}
+}
+
+func (engine Engine) recoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := engine.RecoveryTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
+
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
 func (engine Engine) now() time.Time {

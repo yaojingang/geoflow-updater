@@ -19,6 +19,7 @@ var (
 type Release struct {
 	Sequence        uint64
 	Version         string
+	SourceCommit    string
 	AppImage        string
 	WebImage        string
 	PostgresImages  map[string]string

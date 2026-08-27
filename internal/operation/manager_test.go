@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,12 @@ type fakeDeployment struct {
 	calls       []string
 	verifyStart chan struct{}
 	verifyWait  chan struct{}
+	quiesceErr  error
+	resumeErr   error
+	rollbackErr error
+	validateErr error
+	backupWait  bool
+	rejectDead  bool
 }
 
 func (deployment *fakeDeployment) record(call string) {
@@ -43,11 +50,20 @@ func (deployment *fakeDeployment) Pull(context.Context, string, managed.Release)
 
 func (deployment *fakeDeployment) Quiesce(context.Context, string) error {
 	deployment.record("quiesce")
-	return nil
+	return deployment.quiesceErr
 }
 
-func (deployment *fakeDeployment) CreateRecoveryPoint(context.Context, string, string) (string, error) {
+func (deployment *fakeDeployment) QuiesceForRecovery(context.Context, string, string) error {
+	deployment.record("quiesce")
+	return deployment.quiesceErr
+}
+
+func (deployment *fakeDeployment) CreateRecoveryPoint(ctx context.Context, _ string, _ string) (string, error) {
 	deployment.record("backup")
+	if deployment.backupWait {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	return "20260827T123456Z-1234abcd", nil
 }
 
@@ -63,12 +79,20 @@ func (deployment *fakeDeployment) Activate(context.Context, string, managed.Rele
 
 func (deployment *fakeDeployment) Rollback(context.Context, string, string) error {
 	deployment.record("rollback")
-	return nil
+	return deployment.rollbackErr
 }
 
-func (deployment *fakeDeployment) Resume(context.Context, string) error {
+func (deployment *fakeDeployment) ValidateRecoveryPoint(string, string) error {
+	deployment.record("validate")
+	return deployment.validateErr
+}
+
+func (deployment *fakeDeployment) Resume(ctx context.Context, _ string) error {
 	deployment.record("resume")
-	return nil
+	if deployment.rejectDead && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return deployment.resumeErr
 }
 
 func (deployment *fakeDeployment) Verify(context.Context, string) error {
@@ -143,6 +167,30 @@ func TestManagerRejectsConcurrentOperationsForTheSameInstance(t *testing.T) {
 	}
 }
 
+func TestManagerBlocksNewOperationsWhileDurableRecoveryIsRequired(t *testing.T) {
+	t.Parallel()
+
+	manager := &Manager{StateDir: t.TempDir(), Deployment: &fakeDeployment{}}
+	operation := Operation{
+		SchemaVersion:   1,
+		ID:              "20260827T123456.000000000Z-0011223344556677",
+		InstanceID:      "primary",
+		Kind:            KindRollback,
+		Status:          StatusRecoveryRequired,
+		CurrentStage:    "rollback",
+		RecoveryPointID: "20260827T123456Z-1234abcd",
+		Stages:          []update.Stage{{Name: "rollback", Status: "failed"}},
+		StartedAt:       time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC),
+	}
+	if err := manager.save(&operation); err != nil {
+		t.Fatalf("save recovery-required operation: %v", err)
+	}
+
+	if _, err := manager.StartVerify("primary"); !errors.Is(err, ErrActive) {
+		t.Fatalf("StartVerify() error = %v, want ErrActive", err)
+	}
+}
+
 func TestManagerReconcilesInterruptedProtectedOperationWithRollback(t *testing.T) {
 	t.Parallel()
 
@@ -171,7 +219,98 @@ func TestManagerReconcilesInterruptedProtectedOperationWithRollback(t *testing.T
 	if current.Status != StatusRolledBack || current.CurrentStage != "reconciled" || current.CompletedAt == nil {
 		t.Fatalf("reconciled operation = %#v", current)
 	}
-	want := []string{"rollback", "resume", "verify"}
+	want := []string{"quiesce", "rollback", "resume", "verify"}
+	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+}
+
+func TestManagerDoesNotReconcileWhileAnotherProcessOwnsTheOperationLock(t *testing.T) {
+	t.Parallel()
+
+	deployment := &fakeDeployment{}
+	manager := &Manager{StateDir: t.TempDir(), Deployment: deployment}
+	operation := Operation{
+		SchemaVersion: 1,
+		ID:            "20260827T123456.000000000Z-0011223344556677",
+		InstanceID:    "primary",
+		Kind:          KindUpdate,
+		Status:        StatusRunning,
+		CurrentStage:  "activate",
+		StartedAt:     time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC),
+	}
+	if err := manager.save(&operation); err != nil {
+		t.Fatalf("save operation: %v", err)
+	}
+	lock, err := manager.acquireLock("primary")
+	if err != nil {
+		t.Fatalf("acquire operation lock: %v", err)
+	}
+	defer lock.Close()
+
+	if err := manager.Reconcile("primary"); !errors.Is(err, ErrActive) {
+		t.Fatalf("Reconcile() error = %v, want ErrActive", err)
+	}
+	if calls := deployment.snapshotCalls(); len(calls) != 0 {
+		t.Fatalf("reconciliation mutated a live operation: %#v", calls)
+	}
+}
+
+func TestManagerReconcilesAFailedRollbackThatStillRequiresRecovery(t *testing.T) {
+	t.Parallel()
+
+	deployment := &fakeDeployment{}
+	manager := &Manager{StateDir: t.TempDir(), Deployment: deployment}
+	operation := Operation{
+		SchemaVersion:   1,
+		ID:              "20260827T123456.000000000Z-0011223344556677",
+		InstanceID:      "primary",
+		Kind:            KindUpdate,
+		Status:          StatusFailed,
+		CurrentStage:    "rollback",
+		RecoveryPointID: "20260827T123456Z-1234abcd",
+		Stages:          []update.Stage{{Name: "rollback", Status: "failed"}},
+		StartedAt:       time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC),
+	}
+	if err := manager.save(&operation); err != nil {
+		t.Fatalf("save operation: %v", err)
+	}
+
+	if err := manager.Reconcile("primary"); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	current, err := manager.Current("primary")
+	if err != nil {
+		t.Fatalf("Current() error = %v", err)
+	}
+	if current.Status != StatusRolledBack {
+		t.Fatalf("reconciled status = %s, want rolled_back", current.Status)
+	}
+	want := []string{"quiesce", "rollback", "resume", "verify"}
+	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+}
+
+func TestManagerResumesWithAFreshContextAfterABackupTimesOut(t *testing.T) {
+	t.Parallel()
+
+	deployment := &fakeDeployment{backupWait: true, rejectDead: true}
+	manager := &Manager{
+		StateDir:         t.TempDir(),
+		Deployment:       deployment,
+		OperationTimeout: 20 * time.Millisecond,
+		RecoveryTimeout:  time.Second,
+	}
+	started, err := manager.StartBackup("primary")
+	if err != nil {
+		t.Fatalf("StartBackup() error = %v", err)
+	}
+	current := waitForCompletion(t, manager, started.ID)
+	if current.Status != StatusFailed || !strings.Contains(current.Error, "deadline exceeded") {
+		t.Fatalf("backup result = %#v", current)
+	}
+	want := []string{"verify", "quiesce", "backup", "resume"}
 	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}
@@ -243,6 +382,65 @@ func TestManagerCommitsAnInterruptedUpdateWhoseSuccessStageWasPersisted(t *testi
 	want := []string{"resume", "verify"}
 	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+}
+
+func TestManagerLeavesDeploymentStoppedWhenManualRollbackFails(t *testing.T) {
+	t.Parallel()
+
+	deployment := &fakeDeployment{rollbackErr: errors.New("partial restore")}
+	manager := &Manager{StateDir: t.TempDir(), Deployment: deployment}
+	started, err := manager.StartRollback("primary", "20260827T123456Z-1234abcd")
+	if err != nil {
+		t.Fatalf("StartRollback() error = %v", err)
+	}
+	current := waitForCompletion(t, manager, started.ID)
+	if current.Status != StatusRecoveryRequired {
+		t.Fatalf("rollback status = %s, want recovery_required", current.Status)
+	}
+	want := []string{"validate", "quiesce", "rollback"}
+	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+}
+
+func TestManagerRequiresRecoveryWhenFailedQuiesceCannotResume(t *testing.T) {
+	t.Parallel()
+
+	deployment := &fakeDeployment{
+		quiesceErr: errors.New("partial stop"),
+		resumeErr:  errors.New("restart failed"),
+	}
+	manager := &Manager{StateDir: t.TempDir(), Deployment: deployment}
+	started, err := manager.StartRollback("primary", "20260827T123456Z-1234abcd")
+	if err != nil {
+		t.Fatalf("StartRollback() error = %v", err)
+	}
+	current := waitForCompletion(t, manager, started.ID)
+	if current.Status != StatusRecoveryRequired {
+		t.Fatalf("rollback status = %s, want recovery_required", current.Status)
+	}
+	want := []string{"validate", "quiesce", "resume"}
+	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+}
+
+func TestManagerRejectsACorruptRecoveryPointBeforeQuiescing(t *testing.T) {
+	t.Parallel()
+
+	deployment := &fakeDeployment{validateErr: errors.New("checksum mismatch")}
+	manager := &Manager{StateDir: t.TempDir(), Deployment: deployment}
+	started, err := manager.StartRollback("primary", "20260827T123456Z-1234abcd")
+	if err != nil {
+		t.Fatalf("StartRollback() error = %v", err)
+	}
+	current := waitForCompletion(t, manager, started.ID)
+	if current.Status != StatusFailed {
+		t.Fatalf("rollback status = %s, want failed", current.Status)
+	}
+	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, []string{"validate"}) {
+		t.Fatalf("calls = %#v", calls)
 	}
 }
 

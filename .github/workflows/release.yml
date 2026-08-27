@@ -41,6 +41,7 @@ jobs:
       resume: ${{ steps.release-state.outputs.resume }}
       app_digest: ${{ steps.release-state.outputs.app_digest }}
       web_digest: ${{ steps.release-state.outputs.web_digest }}
+      geoflow_sha: ${{ steps.source.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -65,22 +66,41 @@ jobs:
           [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
           [[ "$GEOFLOW_REF" == "v$GEOFLOW_VERSION" || "$GEOFLOW_REF" =~ ^[a-f0-9]{40}$ || "$GEOFLOW_REF" =~ ^[a-f0-9]{64}$ ]]
           test "$(jq -er '.version' geoflow/version.json)" = "$GEOFLOW_VERSION"
+      - id: source
+        name: Pin the resolved GEOFlow source
+        env:
+          GEOFLOW_REF: ${{ inputs.geoflow_ref }}
+        run: |
+          source_sha="$(git -C geoflow rev-parse HEAD)"
+          [[ "$source_sha" =~ ^[a-f0-9]{40}$|^[a-f0-9]{64}$ ]]
+          if [[ "$GEOFLOW_REF" =~ ^[a-f0-9]{40}$|^[a-f0-9]{64}$ ]]; then
+            test "$source_sha" = "$GEOFLOW_REF"
+          fi
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
       - id: release-state
         name: Detect a safe publication resume
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPDATER_VERSION: ${{ inputs.updater_version }}
+          GEOFLOW_SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
           GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
         run: |
           snapshot_version="$(jq -er '.signed.meta["snapshot.json"].version' tuf/repository/metadata/timestamp.json)"
           targets_version="$(jq -er '.signed.meta["targets.json"].version' "tuf/repository/metadata/${snapshot_version}.snapshot.json")"
-          manifest_hash="$(jq -er '.signed.targets["releases/current.json"].hashes.sha256' "tuf/repository/metadata/${targets_version}.targets.json")"
-          manifest="tuf/repository/targets/releases/${manifest_hash}.current.json"
-          current_sequence="$(jq -er '.release_sequence' "$manifest")"
-          current_version="$(jq -er '.version' "$manifest")"
+          targets_metadata="tuf/repository/metadata/${targets_version}.targets.json"
+          current_sequence=0
+          current_version=""
+          manifest=""
+          if jq -e '.signed.targets["releases/current.json"] != null' "$targets_metadata" >/dev/null; then
+            manifest_hash="$(jq -er '.signed.targets["releases/current.json"].hashes.sha256' "$targets_metadata")"
+            manifest="tuf/repository/targets/releases/${manifest_hash}.current.json"
+            current_sequence="$(jq -er '.release_sequence' "$manifest")"
+            current_version="$(jq -er '.version' "$manifest")"
+          fi
           resume=false
           if [ "$current_sequence" = "$RELEASE_SEQUENCE" ] && [ "$current_version" = "$GEOFLOW_VERSION" ]; then
+            test "$(jq -er '.source_commit' "$manifest")" = "$GEOFLOW_SOURCE_COMMIT"
             version_target="$(jq -er '.version_target' "$manifest")"
             test "$version_target" = "releases/$GEOFLOW_VERSION/version.json"
             jq -e --arg target "$version_target" '.signed.targets[$target] != null' "tuf/repository/metadata/${targets_version}.targets.json" >/dev/null
@@ -126,7 +146,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: yaojingang/GEOFlow
-          ref: ${{ inputs.geoflow_ref }}
+          ref: ${{ needs.preflight.outputs.geoflow_sha }}
           path: geoflow
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -169,7 +189,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: yaojingang/GEOFlow
-          ref: ${{ inputs.geoflow_ref }}
+          ref: ${{ needs.preflight.outputs.geoflow_sha }}
           path: geoflow
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -250,6 +270,7 @@ jobs:
           APP_DIGEST: ${{ needs.images.outputs.app_digest }}
           WEB_DIGEST: ${{ needs.images.outputs.web_digest }}
           GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
+          GEOFLOW_SOURCE_COMMIT: ${{ needs.preflight.outputs.geoflow_sha }}
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
           UPDATER_VERSION: ${{ inputs.updater_version }}
         run: |
@@ -261,6 +282,7 @@ jobs:
           jq -n \
             --argjson sequence "$RELEASE_SEQUENCE" \
             --arg version "$GEOFLOW_VERSION" \
+            --arg source_commit "$GEOFLOW_SOURCE_COMMIT" \
             --arg app_image "ghcr.io/yaojingang/geoflow-app@$APP_DIGEST" \
             --arg web_image "ghcr.io/yaojingang/geoflow-web@$WEB_DIGEST" \
             --arg postgres_16_image "pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b" \
@@ -268,7 +290,7 @@ jobs:
             --arg redis_7_image "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf" \
             --arg redis_8_image "redis@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576" \
             --arg version_target "releases/$GEOFLOW_VERSION/version.json" \
-            '{schema_version:1,release_sequence:$sequence,version:$version,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml",version_target:$version_target}' \
+            '{schema_version:1,release_sequence:$sequence,version:$version,source_commit:$source_commit,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml",version_target:$version_target}' \
             > "$targets_dir/releases/current.json"
           go run ./cmd/geoflow-tuf publish \
             --repository-dir tuf/repository \

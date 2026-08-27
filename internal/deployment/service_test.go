@@ -12,6 +12,7 @@ import (
 
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"gopkg.in/yaml.v3"
 )
 
@@ -58,6 +59,27 @@ type recordingRunner struct {
 	commands []recordedCommand
 }
 
+type recordingRecoveryStore struct {
+	restored bool
+}
+
+func (store *recordingRecoveryStore) Validate(instance.Config, string) error {
+	return nil
+}
+
+func (*recordingRecoveryStore) Create(context.Context, instance.Config, string, recovery.Database) (recovery.Point, error) {
+	return recovery.Point{}, nil
+}
+
+func (store *recordingRecoveryStore) Restore(context.Context, instance.Config, string, recovery.Database) error {
+	store.restored = true
+	return nil
+}
+
+func (*recordingRecoveryStore) List(string) ([]recovery.Point, error) {
+	return nil, nil
+}
+
 func (runner *recordingRunner) Run(_ context.Context, stdin io.Reader, _ io.Writer, name string, arguments ...string) error {
 	contents := ""
 	if stdin != nil {
@@ -85,7 +107,7 @@ func TestPostgresBackupAndRestoreUseFixedCustomFormatCommands(t *testing.T) {
 		t.Fatalf("commands = %#v", runner.commands)
 	}
 	common := []string{"compose", "--env-file", "/opt/geoflow/.env.prod", "--env-file", "/state/release.env", "-f", "/state/docker-compose.yml", "exec", "-T", "postgres", "sh", "-eu", "-c"}
-	wantRestoreStart := []string{"compose", "--env-file", "/opt/geoflow/.env.prod", "--env-file", "/state/release.env", "-f", "/state/docker-compose.yml", "up", "-d", "--wait", "postgres", "redis"}
+	wantRestoreStart := []string{"compose", "--env-file", "/opt/geoflow/.env.prod", "--env-file", "/state/release.env", "-f", "/state/docker-compose.yml", "up", "-d", "--wait", "postgres"}
 	wantDump := append(append([]string(nil), common...), `exec pg_dump --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --format=custom --create`)
 	wantRestore := append(append([]string(nil), common...), `exec pg_restore --exit-on-error --clean --if-exists --create --username="$POSTGRES_USER" --dbname=postgres`)
 	if runner.commands[0].name != "docker" || !reflect.DeepEqual(runner.commands[0].arguments, wantDump) {
@@ -160,5 +182,71 @@ func TestActivatePreservesTheCompleteSignedVersionDocument(t *testing.T) {
 	}
 	if !bytes.Equal(actual, versionDocument) {
 		t.Fatalf("version document = %q, want %q", actual, versionDocument)
+	}
+}
+
+func TestRollbackLoadsInstanceWhenStorageSwapWasInterrupted(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+	instanceDir := filepath.Join(stateDir, "instances", "primary")
+	root := filepath.Join(t.TempDir(), "site")
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve root: %v", err)
+	}
+	recoveryPointID := "20260827T123456Z-1234abcd"
+	config := instance.Config{
+		SchemaVersion:   1,
+		ID:              "primary",
+		Root:            root,
+		ComposeFile:     filepath.Join(instanceDir, "docker-compose.managed.yml"),
+		EnvironmentFile: filepath.Join(instanceDir, "release.env"),
+		ControlToken:    filepath.Join(instanceDir, "control.token"),
+		ReleaseSequence: 17,
+		Version:         "2.4.0",
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(root, ".env.prod"):    "APP_ENV=production\n",
+		filepath.Join(root, "version.json"): "{\"version\":\"2.4.0\"}\n",
+		config.ComposeFile:                  "services: {}\n",
+		config.EnvironmentFile:              "GEOFLOW_VERSION=2.4.0\n",
+		config.ControlToken:                 strings.Repeat("a", 43) + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o640); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".geoflow-updater-storage-old-"+recoveryPointID), 0o750); err != nil {
+		t.Fatalf("mkdir interrupted storage path: %v", err)
+	}
+	encoded, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(instanceDir, "instance.yml"), encoded, 0o640); err != nil {
+		t.Fatalf("write instance config: %v", err)
+	}
+
+	recoveries := &recordingRecoveryStore{}
+	runner := &recordingRunner{}
+	service := Service{StateDir: stateDir, Recoveries: recoveries, Runner: runner}
+	if err := service.QuiesceForRecovery(context.Background(), "primary", recoveryPointID); err != nil {
+		t.Fatalf("QuiesceForRecovery() error = %v", err)
+	}
+	if len(runner.commands) != 2 {
+		t.Fatalf("QuiesceForRecovery() commands = %#v", runner.commands)
+	}
+	if err := service.Rollback(context.Background(), "primary", recoveryPointID); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	if !recoveries.restored {
+		t.Fatal("Rollback() did not reach the recovery store")
 	}
 }

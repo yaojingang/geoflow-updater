@@ -174,6 +174,9 @@ func canonicalRoot(root string) (string, error) {
 		return "", errors.New("instance root must be an absolute path")
 	}
 	cleaned := filepath.Clean(root)
+	if protectedByServiceSandbox(cleaned) {
+		return "", errors.New("instance root is blocked by the installed systemd sandbox")
+	}
 	info, err := os.Lstat(cleaned)
 	if err != nil {
 		return "", fmt.Errorf("inspect instance root: %w", err)
@@ -187,6 +190,16 @@ func canonicalRoot(root string) (string, error) {
 	}
 
 	return resolved, nil
+}
+
+func protectedByServiceSandbox(root string) bool {
+	for _, protected := range []string{"/boot", "/efi", "/etc", "/home", "/root", "/run", "/tmp", "/usr", "/var/tmp"} {
+		if root == protected || strings.HasPrefix(root, protected+string(filepath.Separator)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validateLayout(root string) error {
