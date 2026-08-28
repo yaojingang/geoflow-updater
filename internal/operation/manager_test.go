@@ -540,14 +540,18 @@ func TestManagerRejectsACorruptRecoveryPointBeforeQuiescing(t *testing.T) {
 
 func waitForCompletion(t *testing.T, manager *Manager, operationID string) Operation {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		current, err := manager.Current("primary")
-		if err == nil && current.ID == operationID && current.CompletedAt != nil {
-			return current
-		}
-		time.Sleep(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := manager.Wait(ctx); err != nil {
+		current, _ := manager.Current("primary")
+		t.Fatalf("wait for operation %s: %v; current status=%s stage=%s", operationID, err, current.Status, current.CurrentStage)
 	}
-	t.Fatal("operation did not complete")
-	return Operation{}
+	current, err := manager.Get("primary", operationID)
+	if err != nil {
+		t.Fatalf("read completed operation %s: %v", operationID, err)
+	}
+	if current.CompletedAt == nil {
+		t.Fatalf("operation %s completed without completion time", operationID)
+	}
+	return current
 }
