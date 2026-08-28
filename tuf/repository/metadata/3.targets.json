@@ -1,0 +1,52 @@
+{
+	"signatures": [
+		{
+			"keyid": "90eeb9aec5affba98f24d88c505daed4604ba302eae9ac25ddf6e11e818119ae",
+			"sig": "3c3ec89043b50d196426ab7aa2339ec936030a71cd934d0faba9745abd44d7da4f02e5224cfc1ff13f75b631d3b377f0739d795b003dfe42ae9c188e2d92110c"
+		}
+	],
+	"signed": {
+		"_type": "targets",
+		"expires": "2026-11-26T03:13:53.634902084Z",
+		"spec_version": "1.0.31",
+		"targets": {
+			"deploy/docker-compose.managed.yml": {
+				"hashes": {
+					"sha256": "a6a8b6ca1f0e7c9c00c4093a237206a6c24131fc94e5540c3b1dfd1fe84dcc67"
+				},
+				"length": 6245
+			},
+			"releases/2.3.0/version.json": {
+				"hashes": {
+					"sha256": "542587ab8f187b244fb58801dafc8e4b808c8171f6bdcb7ef4511939086efe13"
+				},
+				"length": 1648
+			},
+			"releases/current.json": {
+				"hashes": {
+					"sha256": "cf1c110c5dae5a37fcee6fec937a93002ac1a6fa286bc3493d72a68166d97ae7"
+				},
+				"length": 956
+			},
+			"updater/0.2.0/checksums.txt": {
+				"hashes": {
+					"sha256": "c692b72cd2b76de16bfd10dca68d7e6eb5d3f6369deb421d9baeaa8a017ee398"
+				},
+				"length": 214
+			},
+			"updater/0.2.0/geoflow-updater_0.2.0_linux_amd64.tar.gz": {
+				"hashes": {
+					"sha256": "ef2689e79d0fbe20d5c3b7175f0a5d21ffa73224c4c736716e85b3ad29e13e32"
+				},
+				"length": 4661742
+			},
+			"updater/0.2.0/geoflow-updater_0.2.0_linux_arm64.tar.gz": {
+				"hashes": {
+					"sha256": "700b6ef86b37957590bae84061dcbc9e559e79e25b758d5826b065d68e3542d4"
+				},
+				"length": 4190000
+			}
+		},
+		"version": 3
+	}
+}
