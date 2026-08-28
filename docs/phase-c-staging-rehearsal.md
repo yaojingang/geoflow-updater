@@ -78,3 +78,5 @@ Copy `candidate/candidate.json` unchanged into the `candidate` field of a JSON d
 ```
 
 Encode the completed file with base64 and store it as `PHASE_C_REHEARSAL_EVIDENCE_B64` in the protected `release-signing` environment. Dispatch `release.yml` with the same candidate run ID and the lowercase SHA-256 of the decoded JSON. Publication verifies the protected evidence, candidate identity, source commits, archive attestations and hashes, signed target bytes, image digests, both architectures, and all approvals before changing public state.
+
+An explicitly authorized emergency release may use the repository-owner risk waiver documented in [the release runbook](release-runbook.md#emergency-super-administrator-risk-waiver). The waiver covers only the missing amd64 and arm64 host rehearsal and approvals. Candidate identity, cryptographic verification, signed target bytes, multi-architecture image indexes, protected release environment, and TUF publication controls remain mandatory. The published `publication-authorization.json` identifies the accepted gap so the rehearsal can be completed and tracked after release.

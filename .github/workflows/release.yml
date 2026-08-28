@@ -25,7 +25,23 @@ on:
         type: number
       phase_c_evidence_sha256:
         description: SHA-256 of the approved Phase C rehearsal evidence JSON
+        required: false
+        default: ""
+        type: string
+      superadmin_risk_waiver:
+        description: Emergency owner-only waiver for the dual-architecture rehearsal
         required: true
+        default: false
+        type: boolean
+      superadmin_risk_waiver_acknowledgement:
+        description: Enter I_ACCEPT_PHASE_C_RELEASE_WITHOUT_DUAL_ARCH_REHEARSAL when using the waiver
+        required: false
+        default: ""
+        type: string
+      superadmin_risk_waiver_reason:
+        description: Auditable reason for accepting the unrehearsed release risk
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -178,12 +194,15 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name "phase-c-candidate-$CANDIDATE_RUN_ID" \
             --dir candidate
-      - name: Validate candidate identity and protected rehearsal evidence
+      - name: Validate candidate identity and publication authorization
         env:
           APPROVED_EVIDENCE_B64: ${{ secrets.PHASE_C_REHEARSAL_EVIDENCE_B64 }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PHASE_C_EVIDENCE_SHA256: ${{ inputs.phase_c_evidence_sha256 }}
+          SUPERADMIN_RISK_WAIVER: ${{ inputs.superadmin_risk_waiver }}
+          SUPERADMIN_RISK_WAIVER_ACKNOWLEDGEMENT: ${{ inputs.superadmin_risk_waiver_acknowledgement }}
+          SUPERADMIN_RISK_WAIVER_REASON: ${{ inputs.superadmin_risk_waiver_reason }}
           UPDATER_VERSION: ${{ inputs.updater_version }}
           GEOFLOW_SOURCE_COMMIT: ${{ needs.preflight.outputs.geoflow_sha }}
           GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
@@ -192,7 +211,6 @@ jobs:
           [[ "$UPDATER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           [[ "$GEOFLOW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
-          [[ "$PHASE_C_EVIDENCE_SHA256" =~ ^[a-f0-9]{64}$ ]]
           test "$(jq -er '.schema_version' candidate/candidate.json)" = "1"
           test "$(jq -er '.candidate_run_id' candidate/candidate.json)" = "$CANDIDATE_RUN_ID"
           test "$(jq -er '.updater.version' candidate/candidate.json)" = "$UPDATER_VERSION"
@@ -221,24 +239,70 @@ jobs:
             jq -e 'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "amd64")' <<<"$index" >/dev/null
             jq -e 'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "arm64")' <<<"$index" >/dev/null
           done
-          evidence="$RUNNER_TEMP/phase-c-rehearsal-evidence.json"
-          umask 077
-          printf '%s' "$APPROVED_EVIDENCE_B64" | base64 --decode > "$evidence"
-          test "$(sha256sum "$evidence" | cut -d ' ' -f 1)" = "$PHASE_C_EVIDENCE_SHA256"
-          jq -e --slurpfile candidate candidate/candidate.json '
-            .schema_version == 1 and
-            .candidate == $candidate[0] and
-            .architectures["linux-amd64"].result == "pass" and
-            (.architectures["linux-amd64"].evidence_link | length > 0) and
-            .architectures["linux-arm64"].result == "pass" and
-            (.architectures["linux-arm64"].evidence_link | length > 0) and
-            .approvals.release_operator.decision == "approved" and
-            (.approvals.release_operator.name | length > 0) and
-            .approvals.security_reviewer.decision == "approved" and
-            (.approvals.security_reviewer.name | length > 0) and
-            .approvals.product_owner.decision == "approved" and
-            (.approvals.product_owner.name | length > 0)
-          ' "$evidence" >/dev/null
+          authorization="candidate/dist/publication-authorization.json"
+          if [ "$SUPERADMIN_RISK_WAIVER" = "true" ]; then
+            test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
+            test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
+            test "$SUPERADMIN_RISK_WAIVER_ACKNOWLEDGEMENT" = "I_ACCEPT_PHASE_C_RELEASE_WITHOUT_DUAL_ARCH_REHEARSAL"
+            test "${#SUPERADMIN_RISK_WAIVER_REASON}" -ge 20
+            test "${#SUPERADMIN_RISK_WAIVER_REASON}" -le 500
+            reason_non_whitespace="$(printf '%s' "$SUPERADMIN_RISK_WAIVER_REASON" | tr -d '[:space:]' | wc -c)"
+            test "$reason_non_whitespace" -ge 10
+            test -z "$PHASE_C_EVIDENCE_SHA256"
+            jq -S -n \
+              --slurpfile candidate candidate/candidate.json \
+              --arg actor "$GITHUB_ACTOR" \
+              --arg acknowledgement "$SUPERADMIN_RISK_WAIVER_ACKNOWLEDGEMENT" \
+              --arg reason "$SUPERADMIN_RISK_WAIVER_REASON" \
+              '{
+                schema_version: 1,
+                candidate: $candidate[0],
+                authorization: {
+                  mode: "superadmin-risk-waiver",
+                  actor: $actor,
+                  acknowledgement: $acknowledgement,
+                  reason: $reason,
+                  accepted_risks: [
+                    "linux-amd64 full host rehearsal was not completed",
+                    "linux-arm64 full host rehearsal was not completed"
+                  ]
+                }
+              }' > "$authorization"
+          else
+            test -z "$SUPERADMIN_RISK_WAIVER_ACKNOWLEDGEMENT"
+            test -z "$SUPERADMIN_RISK_WAIVER_REASON"
+            [[ "$PHASE_C_EVIDENCE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+            evidence="$RUNNER_TEMP/phase-c-rehearsal-evidence.json"
+            umask 077
+            printf '%s' "$APPROVED_EVIDENCE_B64" | base64 --decode > "$evidence"
+            test "$(sha256sum "$evidence" | cut -d ' ' -f 1)" = "$PHASE_C_EVIDENCE_SHA256"
+            jq -e --slurpfile candidate candidate/candidate.json '
+              .schema_version == 1 and
+              .candidate == $candidate[0] and
+              .architectures["linux-amd64"].result == "pass" and
+              (.architectures["linux-amd64"].evidence_link | length > 0) and
+              .architectures["linux-arm64"].result == "pass" and
+              (.architectures["linux-arm64"].evidence_link | length > 0) and
+              .approvals.release_operator.decision == "approved" and
+              (.approvals.release_operator.name | length > 0) and
+              .approvals.security_reviewer.decision == "approved" and
+              (.approvals.security_reviewer.name | length > 0) and
+              .approvals.product_owner.decision == "approved" and
+              (.approvals.product_owner.name | length > 0)
+            ' "$evidence" >/dev/null
+            jq -S -n \
+              --slurpfile candidate candidate/candidate.json \
+              --arg evidence_sha256 "$PHASE_C_EVIDENCE_SHA256" \
+              '{
+                schema_version: 1,
+                candidate: $candidate[0],
+                authorization: {
+                  mode: "dual-architecture-rehearsal",
+                  evidence_sha256: $evidence_sha256
+                }
+              }' > "$authorization"
+          fi
+          test "$(jq -er '.candidate' "$authorization" | jq -S .)" = "$(jq -S . candidate/candidate.json)"
           if [ "${{ needs.preflight.outputs.resume }}" = "true" ]; then
             snapshot_version="$(jq -er '.signed.meta["snapshot.json"].version' tuf/repository/metadata/timestamp.json)"
             targets_version="$(jq -er '.signed.meta["targets.json"].version' "tuf/repository/metadata/${snapshot_version}.snapshot.json")"
@@ -251,6 +315,10 @@ jobs:
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
               --source-digest "$GITHUB_SHA"
           done
+      - name: Attest publication authorization
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: candidate/dist/publication-authorization.json
       - name: Materialize online signing keys
         if: needs.preflight.outputs.resume != 'true'
         env:
@@ -278,23 +346,33 @@ jobs:
           UPDATER_VERSION: ${{ inputs.updater_version }}
           GEOFLOW_VERSION: ${{ inputs.geoflow_version }}
         run: |
+          authorization_mode="$(jq -er '.authorization.mode' candidate/dist/publication-authorization.json)"
+          printf '%s\n\n%s\n\n%s\n' \
+            "Installs GEOFlow Updater and enrolls GEOFlow $GEOFLOW_VERSION managed deployments." \
+            "Publication authorization: \`$authorization_mode\`." \
+            "See \`publication-authorization.json\` and its GitHub artifact attestation for the candidate-bound audit record." \
+            > candidate/dist/release-notes.md
           if gh release view "v$UPDATER_VERSION" >/dev/null 2>&1; then
             test "$(gh release view "v$UPDATER_VERSION" --json isDraft --jq '.isDraft')" = true
-            gh release edit "v$UPDATER_VERSION" --target "$GITHUB_SHA"
+            gh release edit "v$UPDATER_VERSION" \
+              --target "$GITHUB_SHA" \
+              --notes-file candidate/dist/release-notes.md
             gh release upload "v$UPDATER_VERSION" \
               candidate/dist/geoflow-updater_*.tar.gz \
               candidate/dist/checksums.txt \
               candidate/dist/bootstrap-manifest.json \
+              candidate/dist/publication-authorization.json \
               --clobber
           else
             gh release create "v$UPDATER_VERSION" \
               candidate/dist/geoflow-updater_*.tar.gz \
               candidate/dist/checksums.txt \
               candidate/dist/bootstrap-manifest.json \
+              candidate/dist/publication-authorization.json \
               --draft \
               --target "$GITHUB_SHA" \
               --title "GEOFlow Updater v$UPDATER_VERSION" \
-              --notes "Installs GEOFlow Updater and enrolls GEOFlow $GEOFLOW_VERSION managed deployments."
+              --notes-file candidate/dist/release-notes.md
           fi
       - name: Commit public TUF metadata
         if: needs.preflight.outputs.resume != 'true'
@@ -319,9 +397,11 @@ jobs:
             "geoflow-updater_${UPDATER_VERSION}_linux_amd64.tar.gz" \
             "geoflow-updater_${UPDATER_VERSION}_linux_arm64.tar.gz" \
             checksums.txt \
-            bootstrap-manifest.json; do
+            bootstrap-manifest.json \
+            publication-authorization.json; do
             printf '%s\n' "$assets" | grep -Fqx "$required"
           done
+          cmp candidate/dist/publication-authorization.json "$release_dir/publication-authorization.json"
           snapshot_version="$(jq -er '.signed.meta["snapshot.json"].version' tuf/repository/metadata/timestamp.json)"
           targets_version="$(jq -er '.signed.meta["targets.json"].version' "tuf/repository/metadata/${snapshot_version}.snapshot.json")"
           targets_metadata="tuf/repository/metadata/${targets_version}.targets.json"
@@ -339,6 +419,10 @@ jobs:
             --manifest "$release_dir/bootstrap-manifest.json" \
             --trusted-root tuf/repository/metadata/root.json \
             --updater-version "$UPDATER_VERSION"
+          gh attestation verify "$release_dir/publication-authorization.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-digest "$GITHUB_SHA"
           for arch in amd64 arm64; do
             archive="geoflow-updater_${UPDATER_VERSION}_linux_${arch}.tar.gz"
             platform="linux-${arch}"
@@ -383,4 +467,5 @@ jobs:
             candidate/dist/geoflow-updater_*.tar.gz
             candidate/dist/checksums.txt
             candidate/dist/bootstrap-manifest.json
+            candidate/dist/publication-authorization.json
           if-no-files-found: error

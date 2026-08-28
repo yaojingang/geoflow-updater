@@ -46,7 +46,15 @@ The scheduled `metadata-refresh.yml` workflow renews snapshot and timestamp meta
 15. Confirm `release.yml` accepts the original archive attestations and hashes, source commits, target bytes, image digests, architecture results, and approvals. It republishes the candidate target bytes into current TUF metadata and promotes the already-tested image digests.
 16. Verify the GitHub Release is public before Pages serves the new TUF timestamp. Confirm the signed manifest references `releases/<version>/version.json` and matches the rehearsed candidate hash.
 
-The publisher rejects a non-increasing release sequence, a Phase C manifest without updater protocol 2, unrecognized fields, mutable image tags, unofficial image repositories, malformed semantic versions, a Compose target outside the fixed managed path, an unapproved candidate, and evidence that does not exactly match the candidate.
+The publisher rejects a non-increasing release sequence, a Phase C manifest without updater protocol 2, unrecognized fields, mutable image tags, unofficial image repositories, malformed semantic versions, a Compose target outside the fixed managed path, an unapproved candidate, and evidence that does not exactly match the candidate. Every published release includes `publication-authorization.json`, bound to the exact candidate and protected with a GitHub artifact attestation.
+
+## Emergency super-administrator risk waiver
+
+The repository owner may explicitly accept the missing dual-architecture host rehearsal when an urgent first release cannot obtain both disposable hosts. This path preserves the protected `release-signing` environment and every candidate, source, archive hash, artifact attestation, target byte, image digest, architecture-index, bootstrap, and TUF signature check.
+
+Set `superadmin_risk_waiver` to `true`, leave `phase_c_evidence_sha256` empty, enter `I_ACCEPT_PHASE_C_RELEASE_WITHOUT_DUAL_ARCH_REHEARSAL`, and provide a 20 to 500 character reason. The initial workflow actor and any rerun actor must both equal the repository owner. Publication records the actor, reason, fixed acknowledgement, accepted architecture risks, and exact candidate in `publication-authorization.json`; the file is attached to the public GitHub Release and receives a GitHub artifact attestation.
+
+Use the waiver for a specifically authorized release. Schedule amd64 and arm64 host rehearsals after publication, record any findings, and issue a new release sequence when remediation changes signed release content.
 
 ## Failure handling
 
