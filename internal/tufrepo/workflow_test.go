@@ -42,7 +42,7 @@ func TestMetadataPublishingWorkflowsExplicitlyDeployPagesAfterBotCommits(t *test
 func TestReleaseWorkflowsAreValidYAML(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"release-candidate.yml", "release.yml"} {
+	for _, name := range []string{"phase-c-rehearsal.yml", "release-candidate.yml", "release.yml"} {
 		contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", name))
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
@@ -50,6 +50,112 @@ func TestReleaseWorkflowsAreValidYAML(t *testing.T) {
 		var document any
 		if err := yaml.Unmarshal(contents, &document); err != nil {
 			t.Errorf("parse %s: %v", name, err)
+		}
+	}
+}
+
+func TestPhaseCRehearsalUsesFreshNativeRunnersAndAnExactCandidate(t *testing.T) {
+	t.Parallel()
+
+	contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "phase-c-rehearsal.yml"))
+	if err != nil {
+		t.Fatalf("read Phase C rehearsal workflow: %v", err)
+	}
+	workflow := string(contents)
+	for _, required := range []string{
+		"workflow_dispatch:",
+		"candidate_run_id:",
+		"ubuntu-24.04",
+		"ubuntu-24.04-arm",
+		"uname -m",
+		"actions/download-artifact",
+		"phase-c-candidate-${{ inputs.candidate_run_id }}",
+		`actions/runs/$CANDIDATE_RUN_ID`,
+		`.github/workflows/release-candidate.yml`,
+		`'.triggering_actor.login'`,
+		"GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+		"persist-credentials: false",
+		`install -d -m 0700 "$GITHUB_WORKSPACE/rehearsal/evidence"`,
+		"gh attestation verify",
+		"scripts/phase-c-rehearsal.sh",
+		"phase-c-rehearsal-${{ matrix.platform }}",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("Phase C rehearsal workflow is missing native-runner control %q", required)
+		}
+	}
+	for _, forbidden := range []string{"docker/setup-qemu", "docker/setup-buildx"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Errorf("Phase C rehearsal workflow uses emulation through %q", forbidden)
+		}
+	}
+}
+
+func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testing.T) {
+	t.Parallel()
+
+	contents, err := os.ReadFile(filepath.Join("..", "..", "scripts", "phase-c-rehearsal.sh"))
+	if err != nil {
+		t.Fatalf("read Phase C rehearsal script: %v", err)
+	}
+	script := string(contents)
+	for _, required := range []string{
+		"go test -race ./...",
+		"/opt/geoflow-phase-c-rehearsal",
+		"packaging/scripts/install.sh",
+		"geoflow-updater enroll",
+		"geoflow-updater authorization-uri",
+		"GEOFLOW_UPDATER_ALLOW_CANDIDATE_REPOSITORY=1",
+		"mutation_authorization_required",
+		"mutation_authorization_replayed",
+		"retired-update-worker",
+		"system-update-queue",
+		"queues:system-updates:reserved",
+		"queues:system-updates:delayed",
+		"website_start_operation system-updates/updater/update",
+		"website_start_operation system-updates/updater/backup",
+		"website_start_operation system-updates/updater/rollback",
+		"website_start_operation system-updates/updater/verify",
+		"data-admin-errors",
+		"GEOFLOW_UPDATE_REQUIRE_ADMIN_PASSWORD",
+		"database.dump",
+		"storage.tar.gz",
+		"redis.tar.gz",
+		"managed/docker-compose.yml",
+		"wait_for_operation",
+		"recovery-points",
+		"forced-migration-failure",
+		"forced-activation-failure",
+		"restart-during-migration",
+		"persistent-recovery",
+		"restart-during-resume",
+		"migrate-completed",
+		"resume-completed",
+		"restore_migrations_sha",
+		"storage/logs",
+		"redact_evidence",
+		".phase-c-rehearsal-owned",
+		`chown -R "$evidence_owner_uid:$evidence_owner_gid"`,
+		`"result":"pass"`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("Phase C rehearsal script is missing host-rehearsal control %q", required)
+		}
+	}
+	for _, forbidden := range []string{"--platform linux/", "docker run --platform"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("Phase C rehearsal script uses architecture emulation through %q", forbidden)
+		}
+	}
+
+	wrapperContents, err := os.ReadFile(filepath.Join("..", "..", "scripts", "rehearsal-docker-wrapper.sh"))
+	if err != nil {
+		t.Fatalf("read Phase C Docker fault wrapper: %v", err)
+	}
+	wrapper := string(wrapperContents)
+	for _, required := range []string{"fail-migrate", "fail-activate", "pause-migrate", "pause-resume", "pause-migrate-fail-restore", "corrupt_recovery_surfaces", "/usr/bin/docker"} {
+		if !strings.Contains(wrapper, required) {
+			t.Errorf("Phase C Docker fault wrapper is missing %q", required)
 		}
 	}
 }

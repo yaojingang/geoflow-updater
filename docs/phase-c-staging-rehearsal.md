@@ -17,12 +17,24 @@ This is a release-blocking evidence record for the first release that retires th
 
 5. Confirm the service environment is readable only by root. Remove the three variables after the rehearsal. Production startup uses the embedded official repository URLs.
 
+## Native GitHub-hosted rehearsal
+
+After the final candidate run succeeds, dispatch `phase-c-rehearsal.yml` from `main` and provide its numeric `candidate_run_id`. The matrix assigns `ubuntu-24.04` to `linux-amd64` and `ubuntu-24.04-arm` to `linux-arm64`. Each job verifies `uname -m`, downloads the named candidate artifact from the exact run, checks its recorded hash and GitHub artifact attestation, and rejects a candidate built from a different updater commit.
+
+Each architecture runs on a fresh GitHub-hosted VM. Its Docker daemon, ports, volumes, `/opt/geoflow-phase-c-rehearsal` deployment, updater state, recovery points, local HTTPS candidate repository, generated credentials, and fault controls exist only inside that VM. The workflow has no route to a developer machine's `localhost`, so a local GEOFlow deployment such as `http://localhost:18080/admin` remains untouched.
+
+The automated host sequence performs the Phase B handover, scoped authenticator checks, a signed migration update, full backup inspection, manual backup, verification, and rollback through authenticated administrator HTTP routes. It verifies login, super-admin authorization, CSRF, the current administrator password, scoped TOTP relay, controller error handling, 90-day history separation, and read-only detail routes. It then covers forced migration and activation failures, service termination after real migration and resume commands have changed state, persistent `recovery_required` recovery with backoff, distributed anti-spray lockout, and repeated generated-secret scans across the updater journal, container output, and Laravel daily logs.
+
+Faults are introduced by a root-owned Docker command wrapper on the disposable host; the updater archive and signed application images stay byte-for-byte identical to the candidate. Every rollback scenario corrupts PostgreSQL data, Redis, storage, the site environment, and managed deployment files after its recovery point is created. The result remains blocked until those values, the migration fingerprint, managed-file hashes, diagnostics, retired-worker state, and completed operation state all return to the recorded Phase B baseline and stay stable across an updater restart. Uploaded diagnostics are redacted again before the evidence directory is returned to the workflow runner.
+
+Download `phase-c-rehearsal-linux-amd64`, `phase-c-rehearsal-linux-arm64`, and the combined `phase-c-rehearsal-<run-id>` artifact. Both architecture `result.json` files must say `pass`. Review their check list and operation records, then complete the three human approvals in `evidence-template.json`. A workflow result does not supply or impersonate those approvals.
+
 ## Architecture matrix
 
 | Architecture | Host | GEOFlow from/to | PostgreSQL | Redis | Operator | Date | Result |
 |---|---|---|---|---|---|---|---|
-| linux/amd64 |  |  |  |  |  |  | pending |
-| linux/arm64 |  |  |  |  |  |  | pending |
+| linux/amd64 | GitHub `ubuntu-24.04` x64 | 2.3.0 → 3.0.0 | 18 | 8 | GitHub Actions |  | pending |
+| linux/arm64 | GitHub `ubuntu-24.04-arm` | 2.3.0 → 3.0.0 | 18 | 8 | GitHub Actions |  | pending |
 
 ## Required evidence per host
 
