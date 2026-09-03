@@ -247,6 +247,11 @@ func (manager *Manager) Reconcile(instanceID string) error {
 	if !instanceIDPattern.MatchString(instanceID) {
 		return errors.New("managed instance identifier is invalid")
 	}
+	if _, err := manager.Current(instanceID); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
 	lock, err := manager.acquireLock(instanceID)
 	if err != nil {
 		return err

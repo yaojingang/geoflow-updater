@@ -3,6 +3,8 @@ package operation
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -14,6 +16,20 @@ import (
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/update"
 )
+
+func TestManagerReconcileBeforeEnrollmentDoesNotCreateInstanceState(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+	manager := &Manager{StateDir: stateDir}
+
+	if err := manager.Reconcile("primary"); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "instances", "primary")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pre-enrollment reconciliation created instance state: %v", err)
+	}
+}
 
 type fakeDeployment struct {
 	mu          sync.Mutex
