@@ -19,6 +19,7 @@ import (
 func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 	t.Parallel()
 
+	baseTime := time.Now().UTC().Add(-time.Hour)
 	workingDir := t.TempDir()
 	keysDir := filepath.Join(workingDir, "offline-and-online-keys")
 	repositoryDir := filepath.Join(workingDir, "repository")
@@ -43,7 +44,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		KeysDir:       keysDir,
 		RepositoryDir: repositoryDir,
 		TargetsDir:    targetsDir,
-		Now:           func() time.Time { return time.Date(2026, time.August, 27, 0, 0, 0, 0, time.UTC) },
+		Now:           func() time.Time { return baseTime },
 	})
 	if err != nil {
 		t.Fatalf("Initialize() error = %v", err)
@@ -101,7 +102,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		TargetsKeyPath:   filepath.Join(keysDir, "targets.pem"),
 		SnapshotKeyPath:  filepath.Join(keysDir, "snapshot.pem"),
 		TimestampKeyPath: filepath.Join(keysDir, "timestamp.pem"),
-		Now:              func() time.Time { return time.Date(2026, time.August, 28, 0, 0, 0, 0, time.UTC) },
+		Now:              func() time.Time { return baseTime.Add(24 * time.Hour) },
 	}); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
@@ -137,7 +138,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		TargetsKeyPath:   filepath.Join(keysDir, "targets.pem"),
 		SnapshotKeyPath:  filepath.Join(keysDir, "snapshot.pem"),
 		TimestampKeyPath: filepath.Join(keysDir, "timestamp.pem"),
-		Now:              func() time.Time { return time.Date(2026, time.August, 28, 12, 0, 0, 0, time.UTC) },
+		Now:              func() time.Time { return baseTime.Add(36 * time.Hour) },
 	})
 	if rollbackErr == nil || !strings.Contains(rollbackErr.Error(), "greater than published sequence 18") {
 		t.Fatalf("Publish() rollback error = %v", rollbackErr)
@@ -160,7 +161,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		RepositoryDir:    repositoryDir,
 		SnapshotKeyPath:  filepath.Join(keysDir, "snapshot.pem"),
 		TimestampKeyPath: filepath.Join(keysDir, "timestamp.pem"),
-		Now:              func() time.Time { return time.Date(2026, time.August, 29, 0, 0, 0, 0, time.UTC) },
+		Now:              func() time.Time { return baseTime.Add(48 * time.Hour) },
 	}); err != nil {
 		t.Fatalf("RefreshOnline() error = %v", err)
 	}
@@ -196,7 +197,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		TargetsKeyPath:   filepath.Join(keysDir, "targets.pem"),
 		SnapshotKeyPath:  filepath.Join(keysDir, "snapshot.pem"),
 		TimestampKeyPath: filepath.Join(keysDir, "timestamp.pem"),
-		Now:              func() time.Time { return time.Date(2026, time.August, 30, 0, 0, 0, 0, time.UTC) },
+		Now:              func() time.Time { return baseTime.Add(72 * time.Hour) },
 	}); err != nil {
 		t.Fatalf("Refresh() error = %v", err)
 	}
