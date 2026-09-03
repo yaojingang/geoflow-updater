@@ -100,6 +100,7 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 	}
 	script := string(contents)
 	for _, required := range []string{
+		"go mod download",
 		"go test -race ./...",
 		"/opt/geoflow-phase-c-rehearsal",
 		"packaging/scripts/install.sh",
@@ -140,6 +141,20 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("Phase C rehearsal script is missing host-rehearsal control %q", required)
+		}
+	}
+	compatibilityAt := strings.Index(script, "current_check=phase-b-compose-compatibility")
+	handoverAt := strings.Index(script, "current_check=managed-phase-b-handover")
+	if compatibilityAt < 0 || handoverAt < 0 || compatibilityAt >= handoverAt {
+		t.Fatal("Phase B signed Compose compatibility repair must run before managed handover")
+	}
+	for _, required := range []string{
+		"a6a8b6ca1f0e7c9c00c4093a237206a6c24131fc94e5540c3b1dfd1fe84dcc67",
+		"95383a1b19ee80c7c4b05cfffc0868c6492ab4e5870f173e581e4240ebbcce6f",
+		`cmp "$instance_dir/docker-compose.managed.yml" "$updater_root/assets/docker-compose.managed.yml"`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("Phase C rehearsal script is missing Phase B compatibility control %q", required)
 		}
 	}
 	for _, forbidden := range []string{"--platform linux/", "docker run --platform"} {
