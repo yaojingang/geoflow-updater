@@ -675,7 +675,20 @@ record_check native-host "GitHub-hosted $(uname -m) Linux VM; no architecture em
 
 current_check=native-updater-tests
 log "Running updater tests on the native host"
-(cd "$updater_root" && go test -race ./...) 2>&1 | tee "$evidence_dir/go-test.txt"
+: > "$evidence_dir/go-test.txt"
+modules_ready=false
+for attempt in 1 2 3; do
+    if (cd "$updater_root" && go mod download) >> "$evidence_dir/go-test.txt" 2>&1; then
+        modules_ready=true
+        break
+    fi
+    if (( attempt < 3 )); then
+        printf 'Go module download failed; retrying attempt %d of 3.\n' "$((attempt + 1))" | tee -a "$evidence_dir/go-test.txt"
+        sleep "$((attempt * 5))"
+    fi
+done
+test "$modules_ready" = true
+(cd "$updater_root" && go test -race ./...) 2>&1 | tee -a "$evidence_dir/go-test.txt"
 record_check native-updater-tests "Full Go race suite, including protected-stage rollback, restart reconciliation, persistent recovery backoff, and authorization expiry"
 
 current_check=candidate-install
@@ -796,6 +809,26 @@ test -f "$instance_dir/instance.yml"
 control_token=$(tr -d '\n' < "$instance_dir/control.token")
 mask_value "$control_token"
 record_check enrollment-boundary "Blocked /tmp root and enrolled canonical /opt root against the signed Phase B release"
+
+current_check=phase-b-compose-compatibility
+phase_b_compose_mode=$(stat -c '%a:%u:%g' "$instance_dir/docker-compose.managed.yml")
+test "$(sha256sum "$instance_dir/docker-compose.managed.yml" | cut -d ' ' -f 1)" = a6a8b6ca1f0e7c9c00c4093a237206a6c24131fc94e5540c3b1dfd1fe84dcc67
+PHASE_C_COMPOSE_PATH=$instance_dir/docker-compose.managed.yml python3 - <<'PY'
+import os
+import pathlib
+
+path = pathlib.Path(os.environ["PHASE_C_COMPOSE_PATH"])
+contents = path.read_text()
+old = """      test: ["CMD-SHELL", "wget -q --header='Host: $${GEOFLOW_NGINX_PRIMARY_HOST}' -O /dev/null http://127.0.0.1/up"]"""
+new = r"""      test: ["CMD-SHELL", "wget -q --header=\"Host: $${GEOFLOW_NGINX_PRIMARY_HOST}\" -O /dev/null http://127.0.0.1/up"]"""
+if contents.count(old) != 1:
+    raise SystemExit("the signed Phase B Compose compatibility defect did not match exactly once")
+path.write_text(contents.replace(old, new))
+PY
+test "$(stat -c '%a:%u:%g' "$instance_dir/docker-compose.managed.yml")" = "$phase_b_compose_mode"
+test "$(sha256sum "$instance_dir/docker-compose.managed.yml" | cut -d ' ' -f 1)" = 95383a1b19ee80c7c4b05cfffc0868c6492ab4e5870f173e581e4240ebbcce6f
+cmp "$instance_dir/docker-compose.managed.yml" "$updater_root/assets/docker-compose.managed.yml"
+record_check phase-b-compose-compatibility "Verified the signed sequence-1 Compose digest and applied its exact Host healthcheck compatibility correction"
 
 current_check=managed-phase-b-handover
 managed_compose=(docker compose --env-file "$instance_root/.env.prod" --env-file "$instance_dir/release.env" -f "$instance_dir/docker-compose.managed.yml")
