@@ -431,6 +431,10 @@ func writeExclusive(path string, data []byte, mode os.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("set permissions on %s: %w", path, err)
+	}
 	if _, err := file.Write(data); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("write %s: %w", path, err)
