@@ -98,6 +98,14 @@ record_check() {
 collect_diagnostics() {
     systemctl status geoflow-updater.service --no-pager > "$evidence_dir/updater-service.txt" 2>&1 || true
     docker ps -a --format '{{json .}}' > "$evidence_dir/docker-containers.jsonl" 2>/dev/null || true
+    if docker inspect --type=container geoflow-web-prod >/dev/null 2>&1; then
+        docker inspect --format '{{json .State.Health}}' geoflow-web-prod > "$evidence_dir/web-health.json" 2>/dev/null || true
+        docker logs geoflow-web-prod > "$evidence_dir/web-container.log" 2>&1 || true
+        docker exec geoflow-web-prod nginx -T > "$evidence_dir/web-nginx-config.txt" 2>&1 || true
+        docker exec geoflow-web-prod sh -lc \
+            'wget -S -O - --header="Host: ${GEOFLOW_NGINX_PRIMARY_HOST:-localhost}" http://127.0.0.1/up' \
+            > "$evidence_dir/web-health-probe.txt" 2>&1 || true
+    fi
     uname -a > "$evidence_dir/kernel.txt" 2>&1 || true
     docker version > "$evidence_dir/docker-version.txt" 2>&1 || true
     docker compose version > "$evidence_dir/compose-version.txt" 2>&1 || true
