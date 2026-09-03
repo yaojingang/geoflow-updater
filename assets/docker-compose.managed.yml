@@ -117,7 +117,7 @@ services:
       reverb:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --header='Host: $${GEOFLOW_NGINX_PRIMARY_HOST}' -O /dev/null http://127.0.0.1/up"]
+      test: ["CMD-SHELL", "wget -q --header=\"Host: $${GEOFLOW_NGINX_PRIMARY_HOST}\" -O /dev/null http://127.0.0.1/up"]
       interval: 30s
       timeout: 5s
       retries: 3

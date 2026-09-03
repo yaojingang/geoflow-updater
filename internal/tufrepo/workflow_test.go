@@ -207,6 +207,32 @@ func TestManagedComposeMountsUpdaterControlCapabilityOnlyIntoTheWebApplication(t
 	}
 }
 
+func TestManagedComposeWebHealthcheckExpandsThePrimaryHost(t *testing.T) {
+	t.Parallel()
+
+	contents, err := os.ReadFile(filepath.Join("..", "..", "assets", "docker-compose.managed.yml"))
+	if err != nil {
+		t.Fatalf("read managed Compose template: %v", err)
+	}
+	var document struct {
+		Services map[string]struct {
+			Healthcheck struct {
+				Test []string `yaml:"test"`
+			} `yaml:"healthcheck"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatalf("decode managed Compose template: %v", err)
+	}
+	healthcheck := document.Services["web"].Healthcheck.Test
+	if len(healthcheck) != 2 {
+		t.Fatalf("web healthcheck = %#v, want CMD-SHELL and one command", healthcheck)
+	}
+	if !strings.Contains(healthcheck[1], `--header="Host: $${GEOFLOW_NGINX_PRIMARY_HOST}"`) {
+		t.Fatalf("web healthcheck does not expand its primary Host inside the container: %q", healthcheck[1])
+	}
+}
+
 func containsSubstring(values []any, expected string) bool {
 	for _, value := range values {
 		if text, ok := value.(string); ok && strings.Contains(text, expected) {
