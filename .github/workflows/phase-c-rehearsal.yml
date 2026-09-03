@@ -1,0 +1,184 @@
+name: Rehearse Phase C candidate on native Linux hosts
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful Build Phase C release candidate run ID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  contents: read
+  packages: read
+
+concurrency:
+  group: phase-c-rehearsal-${{ inputs.candidate_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  rehearse:
+    name: ${{ matrix.platform }} native host
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            archive_arch: amd64
+            kernel_arch: x86_64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            archive_arch: arm64
+            kernel_arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check out the immutable Phase B bridge source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yaojingang/GEOFlow
+          ref: 0381ba595473d2020ca2cdb641614d22b0f731c2
+          path: rehearsal/geoflow-phase-b
+          persist-credentials: false
+      - name: Authenticate to the candidate image registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download the exact candidate
+        uses: actions/download-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase-c-candidate-${{ inputs.candidate_run_id }}
+          path: rehearsal/candidate
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+      - name: Bind the native host to the candidate identity
+        env:
+          ARCHIVE_ARCH: ${{ matrix.archive_arch }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          EXPECTED_KERNEL_ARCH: ${{ matrix.kernel_arch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = "$EXPECTED_KERNEL_ARCH"
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          candidate_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
+          test "$(jq -er '.name' <<< "$candidate_run")" = "Build Phase C release candidate"
+          test "$(jq -er '.event' <<< "$candidate_run")" = workflow_dispatch
+          test "$(jq -er '.conclusion' <<< "$candidate_run")" = success
+          test "$(jq -er '.head_branch' <<< "$candidate_run")" = main
+          test "$(jq -er '.head_sha' <<< "$candidate_run")" = "$GITHUB_SHA"
+          test "$(jq -er '.actor.login' <<< "$candidate_run")" = "$GITHUB_REPOSITORY_OWNER"
+          test "$(jq -er '.triggering_actor.login' <<< "$candidate_run")" = "$GITHUB_REPOSITORY_OWNER"
+          workflow_id="$(jq -er '.workflow_id' <<< "$candidate_run")"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id" --jq '.path')" = ".github/workflows/release-candidate.yml"
+          test "$(jq -er '.candidate_run_id | tostring' rehearsal/candidate/candidate.json)" = "$CANDIDATE_RUN_ID"
+          test "$(jq -er '.updater.commit' rehearsal/candidate/candidate.json)" = "$GITHUB_SHA"
+          updater_version="$(jq -er '.updater.version' rehearsal/candidate/candidate.json)"
+          archive="rehearsal/candidate/dist/geoflow-updater_${updater_version}_linux_${ARCHIVE_ARCH}.tar.gz"
+          expected_sha="$(jq -er --arg platform "$PLATFORM" '.updater.archives[$platform]' rehearsal/candidate/candidate.json)"
+          test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$expected_sha"
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+      - name: Run the isolated Phase C rehearsal
+        env:
+          ARCHIVE_ARCH: ${{ matrix.archive_arch }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          install -d -m 0700 "$GITHUB_WORKSPACE/rehearsal/evidence"
+          sudo --preserve-env=ARCHIVE_ARCH,CANDIDATE_RUN_ID,PLATFORM \
+            bash scripts/phase-c-rehearsal.sh \
+              --candidate-dir "$GITHUB_WORKSPACE/rehearsal/candidate" \
+              --phase-b-root "$GITHUB_WORKSPACE/rehearsal/geoflow-phase-b" \
+              --evidence-dir "$GITHUB_WORKSPACE/rehearsal/evidence/$PLATFORM"
+      - name: Upload architecture evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase-c-rehearsal-${{ matrix.platform }}
+          path: rehearsal/evidence/${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 30
+
+  evidence:
+    name: Assemble publication evidence template
+    if: ${{ always() }}
+    needs: rehearse
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download architecture evidence
+        uses: actions/download-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          pattern: phase-c-rehearsal-linux-*
+          path: evidence/architectures
+      - name: Download the exact candidate identity
+        uses: actions/download-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase-c-candidate-${{ inputs.candidate_run_id }}
+          path: evidence/candidate
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+      - name: Build the review and approval template
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          REHEARSAL_JOB_RESULT: ${{ needs.rehearse.result }}
+        run: |
+          set -Eeuo pipefail
+          run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          for platform in linux-amd64 linux-arm64; do
+            test -f "evidence/architectures/phase-c-rehearsal-$platform/result.json"
+            test "$(jq -er '.platform' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = "$platform"
+            test "$(jq -er '.candidate_run_id' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = "$CANDIDATE_RUN_ID"
+            test "$(jq -er '.result' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = pass
+            test "$(jq -r '.checks | length >= 18' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = true
+          done
+          test "$(jq -er '.kernel_arch' evidence/architectures/phase-c-rehearsal-linux-amd64/result.json)" = x86_64
+          test "$(jq -er '.kernel_arch' evidence/architectures/phase-c-rehearsal-linux-arm64/result.json)" = aarch64
+          mkdir -p evidence/publication
+          jq -n \
+            --slurpfile candidate evidence/candidate/candidate.json \
+            --arg run_url "$run_url" \
+            --slurpfile amd64 evidence/architectures/phase-c-rehearsal-linux-amd64/result.json \
+            --slurpfile arm64 evidence/architectures/phase-c-rehearsal-linux-arm64/result.json \
+            '{
+              schema_version: 1,
+              candidate: $candidate[0],
+              architectures: {
+                "linux-amd64": {result: $amd64[0].result, evidence_link: $run_url},
+                "linux-arm64": {result: $arm64[0].result, evidence_link: $run_url}
+              },
+              approvals: {
+                release_operator: {name: "", decision: "pending"},
+                security_reviewer: {name: "", decision: "pending"},
+                product_owner: {name: "", decision: "pending"}
+              }
+            }' > evidence/publication/evidence-template.json
+          jq . evidence/publication/evidence-template.json
+          test "$REHEARSAL_JOB_RESULT" = success
+          test "$(jq -r '[.architectures[].result] | all(. == "pass")' evidence/publication/evidence-template.json)" = true
+      - name: Upload the publication evidence template
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase-c-rehearsal-${{ github.run_id }}
+          path: evidence/publication
+          if-no-files-found: error
+          retention-days: 30
