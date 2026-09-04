@@ -223,11 +223,31 @@ scan_runtime_logs() {
     for sensitive in "${sensitive_values[@]}"; do
         if grep -Fq -- "$sensitive" "$combined_logs"; then
             rm -f "$combined_logs"
+            diagnose_runtime_log_match
             echo "A sensitive rehearsal value appeared in runtime logs." >&2
             return 1
         fi
     done
     rm -f "$combined_logs"
+}
+
+diagnose_runtime_log_match() {
+    local sample_file container_name log_file
+    sample_file=$(mktemp /var/tmp/geoflow-log-classification.XXXXXX)
+    journalctl -u geoflow-updater.service --output=cat --lines=10000 > "$sample_file" 2>/dev/null || true
+    printf '%s\0' "${rollback_code:-}" "${sensitive_values[@]}" | python3 "$updater_root/scripts/diagnose-log-match.py" updater-journal "$sample_file" >> "$evidence_dir/log-match-diagnostic.jsonl"
+    while IFS= read -r container_name; do
+        docker logs "$container_name" 2>&1 | tail -c 4194304 > "$sample_file" || true
+        printf '%s\0' "${rollback_code:-}" "${sensitive_values[@]}" | python3 "$updater_root/scripts/diagnose-log-match.py" container-output "$sample_file" >> "$evidence_dir/log-match-diagnostic.jsonl"
+    done < <(docker ps -a --format '{{.Names}}')
+    if [[ -d $instance_root/storage/logs ]]; then
+        while IFS= read -r -d '' log_file; do
+            tail -c 4194304 "$log_file" > "$sample_file" || true
+            printf '%s\0' "${rollback_code:-}" "${sensitive_values[@]}" | python3 "$updater_root/scripts/diagnose-log-match.py" application-log "$sample_file" >> "$evidence_dir/log-match-diagnostic.jsonl"
+        done < <(find "$instance_root/storage/logs" -type f -print0)
+    fi
+    rm -f "$sample_file"
+    docker exec geoflow-app-prod php -r 'echo json_encode(["sapi" => PHP_SAPI, "exception_ignore_args" => ini_get("zend.exception_ignore_args"), "exception_string_param_max_len" => ini_get("zend.exception_string_param_max_len")], JSON_THROW_ON_ERROR);' > "$evidence_dir/php-exception-cli-settings.json"
 }
 
 read_environment_value() {
@@ -1160,6 +1180,9 @@ next_totp rollback
 rollback_code=$totp_code
 website_expect_validation_error "" data-admin-errors system-updates/updater/rollback \
     "current_admin_password=$admin_password" "updater_authorization_code=$rollback_code" "recovery_point_id=$manual_backup"
+current_check=diagnostic-log-match-no-publication
+log "Diagnostic reached the rejected rollback target without a log hit; stopping before fixture corruption"
+exit 0
 docker exec geoflow-postgres-prod psql --username=geo_user --dbname=geo_flow --set ON_ERROR_STOP=1 \
     --command "DELETE FROM system_update_runs WHERE run_uuid='${marker}-recent'; INSERT INTO system_update_runs (run_uuid, action, status, current_version, target_version, created_at, updated_at) VALUES ('${marker}-post', 'apply', 'completed', '3.0.0', '3.0.0', NOW(), NOW()) ON CONFLICT (run_uuid) DO NOTHING" >/dev/null
 printf 'after-update\n' > "$instance_root/storage/app/phase-c-rehearsal.txt"
