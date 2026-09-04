@@ -72,6 +72,7 @@ repository_pid=""
 website_cookie_jar=""
 regular_cookie_jar=""
 anonymous_cookie_jar=""
+permission_probe_installed=false
 fault_file=$state_dir/rehearsal-fault
 fault_marker_dir=$state_dir/rehearsal-markers
 result_status=fail
@@ -169,6 +170,9 @@ PY
 finish() {
     local exit_code=$?
     set +e
+    if [[ $permission_probe_installed == true ]]; then
+        docker exec geoflow-app-prod rm -f /tmp/geoflow-permission-probe.php
+    fi
     collect_diagnostics
     if [[ -n $repository_pid ]]; then
         kill "$repository_pid" >/dev/null 2>&1 || true
@@ -915,6 +919,54 @@ test "$(jq -r '.backup' "$evidence_dir/website-phase-b-policy.json")" = false
 test "$(jq -r '.rollback' "$evidence_dir/website-phase-b-policy.json")" = false
 record_check phase-b-doctor "Exactly retired-update-worker fails; website policy permits only the signed update handover"
 
+current_check=website-process-permission-diagnostic
+docker inspect --format '{{json .HostConfig.GroupAdd}}' geoflow-app-prod > "$evidence_dir/app-group-add.json"
+stat -c '%n mode=%a uid=%u gid=%g' "$instance_dir/control.token" /run/geoflow-updater "$runtime_socket" > "$evidence_dir/host-bridge-permissions.txt"
+docker exec geoflow-app-prod test ! -e /tmp/geoflow-permission-probe.php
+permission_probe_installed=true
+docker cp "$updater_root/scripts/phase-c-permission-probe.php" geoflow-app-prod:/tmp/geoflow-permission-probe.php
+docker exec geoflow-app-prod php /tmp/geoflow-permission-probe.php | jq . > "$evidence_dir/permission-root-cli.json"
+fpm_address=$(docker inspect --format '{{(index .NetworkSettings.Networks "geoflow-phase-c-rehearsal-net").IPAddress}}' geoflow-app-prod)
+PHASE_C_FPM_ADDRESS=$fpm_address python3 - <<'PY' > "$evidence_dir/permission-real-fpm.json"
+import ipaddress, json, os, socket, struct
+
+address = str(ipaddress.IPv4Address(os.environ['PHASE_C_FPM_ADDRESS']))
+params = {'SCRIPT_FILENAME': '/tmp/geoflow-permission-probe.php', 'REQUEST_METHOD': 'GET', 'SERVER_PROTOCOL': 'HTTP/1.1', 'GATEWAY_INTERFACE': 'CGI/1.1', 'SERVER_NAME': 'localhost', 'SERVER_PORT': '80', 'REMOTE_ADDR': '127.0.0.1', 'REDIRECT_STATUS': '200'}
+payload = b''
+for key, value in params.items():
+    key, value = key.encode(), value.encode()
+    assert len(key) < 128 and len(value) < 128
+    payload += bytes([len(key), len(value)]) + key + value
+def record(kind, content):
+    return struct.pack('!BBHHBB', 1, kind, 1, len(content), 0, 0) + content
+with socket.create_connection((address, 9000), timeout=15) as stream:
+    stream.sendall(record(1, struct.pack('!HB5x', 1, 0)) + record(4, payload) + record(4, b'') + record(5, b''))
+    def exact(length):
+        data = b''
+        while len(data) < length:
+            chunk = stream.recv(length - len(data))
+            if not chunk:
+                raise RuntimeError('incomplete FastCGI response')
+            data += chunk
+        return data
+    output = b''
+    for _ in range(128):
+        version, kind, request_id, length, padding, _ = struct.unpack('!BBHHBB', exact(8))
+        assert version == 1 and request_id == 1
+        content = exact(length)
+        exact(padding)
+        if kind == 6:
+            output += content
+            assert len(output) <= 65536
+        if kind == 3:
+            assert len(content) == 8 and struct.unpack('!IB3x', content) == (0, 0)
+            print(json.dumps(json.loads(output.split(b'\r\n\r\n', 1)[1]), indent=2))
+            break
+    else:
+        raise RuntimeError('FastCGI response record limit exceeded')
+PY
+docker exec geoflow-app-prod rm /tmp/geoflow-permission-probe.php
+permission_probe_installed=false
 current_check=website-security-boundary
 regular_admin_password=$(openssl rand -base64 36 | tr -d '\n')
 wrong_admin_password=$(openssl rand -base64 36 | tr -d '\n')
@@ -950,6 +1002,14 @@ website_expect_validation_error '管理员密码不正确。' admin-flash-alert 
     "current_admin_password=$wrong_admin_password" 'updater_authorization_code=000000'
 website_get "$website_cookie_jar" system-updates "$boundary_page"
 test "$website_status" = 200
+authorization_input=false
+password_input=false
+grep -Fq 'name="updater_authorization_code"' "$boundary_page" && authorization_input=true
+grep -Fq 'name="current_admin_password"' "$boundary_page" && password_input=true
+jq -n --argjson authorization "$authorization_input" --argjson password "$password_input" '{http_status:200,authorization_input:$authorization,password_input:$password}' > "$evidence_dir/website-permission-state.json"
+current_check=diagnostic-only-no-publication
+log "Permission evidence collected; stopping before candidate repository and update operations"
+exit 0
 grep -Fq 'name="updater_authorization_code"' "$boundary_page"
 grep -Fq 'name="current_admin_password"' "$boundary_page"
 scan_runtime_logs
