@@ -633,6 +633,7 @@ assert_restore_fixture() {
     test -z "$(docker ps -a --filter 'name=^/geoflow-system-update-queue-prod$' --format '{{.Names}}')"
     geoflow-updater doctor --instance primary --json > "$evidence_dir/doctor-${restore_fixture_id}.json"
     test "$(jq -er '.status' "$evidence_dir/doctor-${restore_fixture_id}.json")" = pass
+    verify_fpm_bridge_permissions "$evidence_dir/fpm-${restore_fixture_id}.json"
     local operation_state_sha
     operation_state_sha=$(sha256sum "$instance_dir/operations/current.json" | cut -d ' ' -f 1)
     systemctl restart geoflow-updater.service
@@ -641,9 +642,45 @@ assert_restore_fixture() {
     test "$(sha256sum "$instance_dir/operations/current.json" | cut -d ' ' -f 1)" = "$operation_state_sha"
 }
 
+verify_fpm_bridge_permissions() {
+    docker exec -i geoflow-app-prod php <<'PHP' | jq . > "$1"
+<?php
+$token = lstat('/run/secrets/geoflow-updater-control-token');
+$directory = lstat('/run/geoflow-updater');
+$socket = lstat('/run/geoflow-updater/geoflow-updater.sock');
+$gid = $token['gid'];
+foreach ([[$token, 0100640], [$directory, 0040750], [$socket, 0140660]] as [$stat, $mode]) {
+    if ($gid <= 0 || $stat['uid'] !== 0 || $stat['gid'] !== $gid || ($stat['mode'] & 0177777) !== $mode) {
+        throw new RuntimeException('Updater ownership or permissions changed.');
+    }
+}
+$workers = 0;
+foreach (glob('/proc/[0-9]*/status') as $path) {
+    $status = @file_get_contents($path);
+    if (!is_string($status) || !preg_match('/^Name:\s+php-fpm\s*$/m', $status)
+        || !preg_match('/^Uid:\s+\d+\s+(\d+)/m', $status, $uid) || (int) $uid[1] === 0) {
+        continue;
+    }
+    preg_match('/^Gid:\s+\d+\s+(\d+)/m', $status, $group);
+    preg_match('/^Groups:([^\n]*)/m', $status, $groups);
+    if ((int) $uid[1] !== 33 || (int) $group[1] !== $gid
+        || !in_array((string) $gid, preg_split('/\s+/', trim($groups[1])), true)) {
+        throw new RuntimeException('Real FPM worker lost its non-root bridge identity.');
+    }
+    $workers++;
+}
+if ($workers === 0) {
+    throw new RuntimeException('No real FPM workers were inspected.');
+}
+echo json_encode(['worker_count' => $workers, 'worker_uid' => 33, 'bridge_gid' => $gid,
+    'token_mode' => '0640', 'directory_mode' => '0750', 'socket_mode' => '0660'], JSON_THROW_ON_ERROR);
+PHP
+}
+
 run_bridge_probe() {
     local mode=$1
     local output=$2
+    verify_fpm_bridge_permissions "${output%.json}-fpm-permissions.json"
     local php_source
     if [[ $mode == phase-b ]]; then
         php_source='require "/var/www/html/vendor/autoload.php"; $app = require "/var/www/html/bootstrap/app.php"; $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap(); $client = $app->make(App\Contracts\SystemUpdater\AgentClient::class); $status = $client->status(); $policy = $app->make(App\Services\Admin\SystemUpdaterMutationPolicy::class); echo json_encode(["status" => $status["status"], "update" => $policy->allows($status, "update"), "backup" => $policy->allows($status, "backup"), "rollback" => $policy->allows($status, "rollback")], JSON_THROW_ON_ERROR);'
@@ -822,14 +859,25 @@ path = pathlib.Path(os.environ["PHASE_C_COMPOSE_PATH"])
 contents = path.read_text()
 old = """      test: ["CMD-SHELL", "wget -q --header='Host: $${GEOFLOW_NGINX_PRIMARY_HOST}' -O /dev/null http://127.0.0.1/up"]"""
 new = r"""      test: ["CMD-SHELL", "wget -q --header=\"Host: $${GEOFLOW_NGINX_PRIMARY_HOST}\" -O /dev/null http://127.0.0.1/up"]"""
-if contents.count(old) != 1:
+app = "    container_name: geoflow-app-prod\n"
+worker_group = r"""    command:
+      - /bin/sh
+      - -ec
+      - |
+        bridge_gid=$$(stat -c '%g' /run/secrets/geoflow-updater-control-token)
+        case "$$bridge_gid" in ''|*[!0-9]*) exit 1 ;; esac
+        test "$$bridge_gid" -gt 0
+        printf '[www]\ngroup = %s\n' "$$bridge_gid" > /usr/local/etc/php-fpm.d/zzz-geoflow-updater-group.conf
+        exec php-fpm -F
+"""
+if contents.count(old) != 1 or contents.count(app) != 1:
     raise SystemExit("the signed Phase B Compose compatibility defect did not match exactly once")
-path.write_text(contents.replace(old, new))
+path.write_text(contents.replace(old, new).replace(app, app + worker_group))
 PY
 test "$(stat -c '%a:%u:%g' "$instance_dir/docker-compose.managed.yml")" = "$phase_b_compose_mode"
-test "$(sha256sum "$instance_dir/docker-compose.managed.yml" | cut -d ' ' -f 1)" = 95383a1b19ee80c7c4b05cfffc0868c6492ab4e5870f173e581e4240ebbcce6f
+test "$(sha256sum "$instance_dir/docker-compose.managed.yml" | cut -d ' ' -f 1)" = f5b7d6d0ee8fcfda7df7777126785d99ac81e648bd8c4dd4b9f2c2c41f1ca498
 cmp "$instance_dir/docker-compose.managed.yml" "$updater_root/assets/docker-compose.managed.yml"
-record_check phase-b-compose-compatibility "Verified the signed sequence-1 Compose digest and applied its exact Host healthcheck compatibility correction"
+record_check phase-b-compose-compatibility "Verified signed sequence-1 Compose and applied exact Host healthcheck and FPM worker-group corrections without changing credential permissions"
 
 current_check=managed-phase-b-handover
 managed_compose=(docker compose --env-file "$instance_root/.env.prod" --env-file "$instance_dir/release.env" -f "$instance_dir/docker-compose.managed.yml")
@@ -1097,6 +1145,7 @@ test "$restored_pre_rows" = 1
 test "$restored_post_rows" = 0
 test "$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli GET "geoflow:${marker}:before" 2>/dev/null)" = before-update
 test "$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli EXISTS "geoflow:${marker}:post" 2>/dev/null)" = 0
+verify_fpm_bridge_permissions "$evidence_dir/fpm-website-rollback.json"
 record_check website-rollback "Website accepted only the newest pre-update checkpoint and restored database, Redis, storage, environment, deployment state, and version"
 
 current_check=forced-migration-failure

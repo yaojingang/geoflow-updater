@@ -2,6 +2,7 @@ package tufrepo_test
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -170,7 +171,9 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 	}
 	for _, required := range []string{
 		"a6a8b6ca1f0e7c9c00c4093a237206a6c24131fc94e5540c3b1dfd1fe84dcc67",
-		"95383a1b19ee80c7c4b05cfffc0868c6492ab4e5870f173e581e4240ebbcce6f",
+		"f5b7d6d0ee8fcfda7df7777126785d99ac81e648bd8c4dd4b9f2c2c41f1ca498",
+		"verify_fpm_bridge_permissions",
+		"Real FPM worker lost its non-root bridge identity.",
 		`cmp "$instance_dir/docker-compose.managed.yml" "$updater_root/assets/docker-compose.managed.yml"`,
 	} {
 		if !strings.Contains(script, required) {
@@ -239,6 +242,60 @@ func TestManagedComposeMountsUpdaterControlCapabilityOnlyIntoTheWebApplication(t
 	queue := document.Services["queue"]
 	if !containsSubstring(queue.Command, "--queue=system-updates,") {
 		t.Fatal("managed queue does not consume tombstone system update jobs during Phase C")
+	}
+}
+
+func TestManagedComposeFPMRetainsTheDynamicBridgeGroup(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "assets", "docker-compose.managed.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Services map[string]struct {
+			Command []string `yaml:"command"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	command := document.Services["app"].Command
+	if len(command) != 3 || command[0] != "/bin/sh" || command[1] != "-ec" {
+		t.Fatal("web startup does not configure the FPM worker bridge group")
+	}
+	for _, gid := range []string{"987", "1234", "0", "", "not-a-number", "987; exit 0"} {
+		t.Run(gid, func(t *testing.T) {
+			root := t.TempDir()
+			pool := filepath.Join(root, "pool.conf")
+			for name, source := range map[string]string{
+				"stat":    "#!/bin/sh\ntest \"$#\" = 3 && test \"$1\" = -c && test \"$2\" = %g && test \"$3\" = /run/secrets/geoflow-updater-control-token || exit 1\nprintf '%s\\n' \"$PROBE_GID\"\n",
+				"php-fpm": "#!/bin/sh\ntest \"$#\" = 1 && test \"$1\" = -F || exit 1\nprintf 'FPM started\\n'\n",
+			} {
+				if err := os.WriteFile(filepath.Join(root, name), []byte(source), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			script := strings.ReplaceAll(command[2], "$$", "$")
+			script = strings.ReplaceAll(script, "/usr/local/etc/php-fpm.d/zzz-geoflow-updater-group.conf", pool)
+			process := exec.Command("sh", "-ec", script)
+			process.Env = append(os.Environ(), "PATH="+root+":"+os.Getenv("PATH"), "PROBE_GID="+gid)
+			output, runErr := process.CombinedOutput()
+			if gid != "987" && gid != "1234" {
+				if runErr == nil || strings.Contains(string(output), "FPM started") {
+					t.Fatalf("unsafe group accepted: %q, output=%s", gid, output)
+				}
+				if _, err := os.Stat(pool); !os.IsNotExist(err) {
+					t.Fatal("unsafe group wrote FPM configuration")
+				}
+				return
+			}
+			if runErr != nil || string(output) != "FPM started\n" {
+				t.Fatalf("startup failed: %v, output=%s", runErr, output)
+			}
+			configured, err := os.ReadFile(pool)
+			if err != nil || string(configured) != "[www]\ngroup = "+gid+"\n" {
+				t.Fatalf("FPM group configuration = %q, error=%v", configured, err)
+			}
+		})
 	}
 }
 
