@@ -866,7 +866,6 @@ pending_jobs=$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-p
 reserved_jobs=$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli ZCARD queues:system-updates:reserved 2>/dev/null)
 delayed_jobs=$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli ZCARD queues:system-updates:delayed 2>/dev/null)
 test "$((pending_jobs + reserved_jobs + delayed_jobs))" = 0
-docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli SET "geoflow:${marker}:before" before-update >/dev/null 2>&1
 record_check pre-cutover-idle "No queued/running legacy mutation row and no pending/reserved system-updates job"
 
 current_check=enrollment-boundary
@@ -919,6 +918,9 @@ current_check=managed-phase-b-handover
 managed_compose=(docker compose --env-file "$instance_root/.env.prod" --env-file "$instance_dir/release.env" -f "$instance_dir/docker-compose.managed.yml")
 "${managed_compose[@]}" down --remove-orphans
 "${managed_compose[@]}" up -d --remove-orphans --wait --wait-timeout 600
+# Seed recovery data in the managed Redis store after the legacy handover.
+docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli SET "geoflow:${marker}:before" before-update >/dev/null 2>&1
+test "$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli GET "geoflow:${marker}:before" 2>/dev/null)" = before-update
 stable_app_image=$(awk -F= '$1 == "GEOFLOW_APP_IMAGE" {print substr($0, index($0, "=")+1)}' "$instance_dir/release.env")
 test -n "$stable_app_image"
 network_name=$(read_environment_value DOCKER_NETWORK_NAME)
