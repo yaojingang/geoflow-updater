@@ -118,7 +118,7 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 		"website_start_operation system-updates/updater/backup",
 		"website_start_operation system-updates/updater/rollback",
 		"website_start_operation system-updates/updater/verify",
-		"data-admin-errors",
+		"admin-flash-alert",
 		"GEOFLOW_UPDATE_REQUIRE_ADMIN_PASSWORD",
 		"database.dump",
 		"storage.tar.gz",
@@ -157,7 +157,7 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 		`local expected_error_marker=$2`,
 		`grep -Fq "$expected_error_marker" "$page"`,
 		`website_expect_validation_error "" admin-flash-alert system-updates/updater/update`,
-		`website_expect_validation_error "" data-admin-errors system-updates/updater/rollback`,
+		`website_expect_validation_error '操作提交失败，请稍后重试并查看服务端日志。' admin-flash-alert system-updates/updater/rollback`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("Phase C rehearsal script is missing version-specific website validation control %q", required)

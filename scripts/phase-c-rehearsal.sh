@@ -1154,7 +1154,7 @@ current_check=website-rollback
 expect_api_error POST rollbacks "" "{\"recovery_point_id\":\"$update_checkpoint\"}" 403 mutation_authorization_required
 next_totp rollback
 rollback_code=$totp_code
-website_expect_validation_error "" data-admin-errors system-updates/updater/rollback \
+website_expect_validation_error '操作提交失败，请稍后重试并查看服务端日志。' admin-flash-alert system-updates/updater/rollback \
     "current_admin_password=$admin_password" "updater_authorization_code=$rollback_code" "recovery_point_id=$manual_backup"
 docker exec geoflow-postgres-prod psql --username=geo_user --dbname=geo_flow --set ON_ERROR_STOP=1 \
     --command "DELETE FROM system_update_runs WHERE run_uuid='${marker}-recent'; INSERT INTO system_update_runs (run_uuid, action, status, current_version, target_version, created_at, updated_at) VALUES ('${marker}-post', 'apply', 'completed', '3.0.0', '3.0.0', NOW(), NOW()) ON CONFLICT (run_uuid) DO NOTHING" >/dev/null
