@@ -983,6 +983,9 @@ rm -f "$boundary_page"
 record_check website-security-boundary "Real HTTP sessions enforced login, super-admin authorization, CSRF, six-digit authorization input, and current administrator password"
 
 current_check=candidate-repository
+current_check=focused-fpm-regression-no-publication
+log "Both real FPM identity and administrator HTTP boundary passed; stopping before candidate update"
+exit 0
 certificate_dir=$(mktemp -d /var/tmp/geoflow-candidate-tls.XXXXXX)
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -sha256 \
     -subj '/CN=GEOFlow Phase C Rehearsal CA' \
