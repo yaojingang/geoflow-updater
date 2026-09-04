@@ -1,0 +1,185 @@
+name: ${GEOFLOW_COMPOSE_PROJECT_NAME:-geoflow-laravel-prod}
+
+x-app-base: &app-base
+  image: ${GEOFLOW_APP_IMAGE:?signed GEOFLOW_APP_IMAGE is required}
+  working_dir: /var/www/html
+  env_file:
+    - ${GEOFLOW_INSTANCE_ROOT:?GEOFLOW_INSTANCE_ROOT is required}/.env.prod
+  environment:
+    AUTO_FIX_STORAGE_PERMISSIONS: "false"
+    AUTO_INSTALL_ONCE: "false"
+    AUTO_MIGRATE: "false"
+  volumes:
+    - ${GEOFLOW_INSTANCE_ROOT}/.env.prod:/var/www/html/.env:ro
+    - ${GEOFLOW_INSTANCE_ROOT}/storage:/var/www/html/storage
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: ${GEOFLOW_POSTGRES_IMAGE:?signed GEOFLOW_POSTGRES_IMAGE is required}
+    container_name: geoflow-postgres-prod
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-geo_flow}
+      POSTGRES_USER: ${DB_USERNAME:-geo_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - type: bind
+        source: ${GEOFLOW_POSTGRES_DATA_DIR:?verified GEOFLOW_POSTGRES_DATA_DIR is required}
+        target: ${GEOFLOW_POSTGRES_CONTAINER_DATA_DIR:?verified GEOFLOW_POSTGRES_CONTAINER_DATA_DIR is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: ${GEOFLOW_REDIS_IMAGE:?signed GEOFLOW_REDIS_IMAGE is required}
+    container_name: geoflow-redis-prod
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ -n "$${REDIS_PASSWORD:-}" ]; then
+          exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"
+        fi
+        exec redis-server --appendonly yes
+    volumes:
+      - ${GEOFLOW_INSTANCE_ROOT}/docker-data/prod/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$${REDIS_PASSWORD:-}\" ]; then redis-cli -a \"$${REDIS_PASSWORD}\" ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  init:
+    <<: *app-base
+    container_name: geoflow-init-prod
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "true"
+      AUTO_INSTALL_ONCE: "false"
+      AUTO_MIGRATE: "false"
+    command: ["php", "artisan", "about"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    <<: *app-base
+    container_name: geoflow-app-prod
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        bridge_gid=$$(stat -c '%g' /run/secrets/geoflow-updater-control-token)
+        case "$$bridge_gid" in ''|*[!0-9]*) exit 1 ;; esac
+        test "$$bridge_gid" -gt 0
+        printf '[www]\ngroup = %s\n' "$$bridge_gid" > /usr/local/etc/php-fpm.d/zzz-geoflow-updater-group.conf
+        exec php-fpm -F
+    environment:
+      AUTO_FIX_STORAGE_PERMISSIONS: "false"
+      AUTO_INSTALL_ONCE: "false"
+      AUTO_MIGRATE: "false"
+      GEOFLOW_UPDATER_INSTANCE_ID: ${GEOFLOW_INSTANCE_ID}
+      GEOFLOW_UPDATER_HOST_ROOT: ${GEOFLOW_INSTANCE_ROOT}
+      GEOFLOW_UPDATER_SOCKET: /run/geoflow-updater/geoflow-updater.sock
+      GEOFLOW_UPDATER_CONTROL_TOKEN_FILE: /run/secrets/geoflow-updater-control-token
+    volumes:
+      - ${GEOFLOW_INSTANCE_ROOT}/.env.prod:/var/www/html/.env:ro
+      - ${GEOFLOW_INSTANCE_ROOT}/storage:/var/www/html/storage
+      - /run/geoflow-updater:/run/geoflow-updater:ro
+      - ${GEOFLOW_UPDATER_STATE_DIR:-/var/lib/geoflow-updater}/instances/${GEOFLOW_INSTANCE_ID}/control.token:/run/secrets/geoflow-updater-control-token:ro
+    group_add:
+      - ${GEOFLOW_UPDATER_GROUP_ID:?GEOFLOW_UPDATER_GROUP_ID is required}
+    mem_limit: ${APP_CONTAINER_MEMORY_LIMIT:-768m}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "php-fpm -t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    image: ${GEOFLOW_WEB_IMAGE:?signed GEOFLOW_WEB_IMAGE is required}
+    container_name: geoflow-web-prod
+    ports:
+      - ${WEB_PORT:-18080}:80
+    environment:
+      GEOFLOW_NGINX_PRIMARY_HOST: ${GEOFLOW_NGINX_PRIMARY_HOST:-localhost}
+      GEOFLOW_NGINX_PRIMARY_ALIASES: ${GEOFLOW_NGINX_PRIMARY_ALIASES:-}
+      GEOFLOW_NGINX_HOSTED_ROOT_DOMAIN: ${GEOFLOW_NGINX_HOSTED_ROOT_DOMAIN:-invalid}
+      GEOFLOW_NGINX_PUBLIC_SCHEME: ${GEOFLOW_NGINX_PUBLIC_SCHEME:-http}
+      GEOFLOW_NGINX_PUBLIC_PORT: ${GEOFLOW_NGINX_PUBLIC_PORT:-80}
+    volumes:
+      - ${GEOFLOW_INSTANCE_ROOT}/storage:/var/www/html/storage:ro
+    depends_on:
+      app:
+        condition: service_started
+      reverb:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --header=\"Host: $${GEOFLOW_NGINX_PRIMARY_HOST}\" -O /dev/null http://127.0.0.1/up"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  queue:
+    <<: *app-base
+    container_name: geoflow-queue-prod
+    command: ["php", "-d", "memory_limit=256M", "artisan", "queue:work", "redis", "--queue=system-updates,ai-workspace-interactive,ai-workspace,geoflow,distribution,theme-replication,default", "--sleep=1", "--tries=1", "--timeout=930", "--memory=128", "--max-jobs=100", "--max-time=3600"]
+    mem_limit: ${QUEUE_CONTAINER_MEMORY_LIMIT:-384m}
+    stop_grace_period: 960s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  knowledge-queue:
+    <<: *app-base
+    container_name: geoflow-knowledge-queue-prod
+    command: ["php", "-d", "memory_limit=160M", "artisan", "queue:work", "redis", "--queue=knowledge", "--sleep=1", "--tries=1", "--timeout=210", "--memory=128", "--max-jobs=20", "--max-time=1800"]
+    mem_limit: ${KNOWLEDGE_QUEUE_CONTAINER_MEMORY_LIMIT:-256m}
+    stop_grace_period: 240s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    <<: *app-base
+    container_name: geoflow-scheduler-prod
+    command: ["php", "artisan", "schedule:work"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  reverb:
+    <<: *app-base
+    container_name: geoflow-reverb-prod
+    command: ["php", "artisan", "reverb:start", "--host=0.0.0.0"]
+    expose:
+      - ${REVERB_SERVER_PORT:-18080}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+networks:
+  default:
+    name: ${DOCKER_NETWORK_NAME:-geoflow-prod-net}
+    ipam:
+      config:
+        - subnet: ${DOCKER_NETWORK_SUBNET:-10.88.0.0/16}
+          gateway: ${DOCKER_NETWORK_GATEWAY:-10.88.0.1}
