@@ -776,6 +776,10 @@ test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$expected_archive_sha"
 archive_root=$(mktemp -d /var/tmp/geoflow-updater-candidate.XXXXXX)
 tar -xzf "$archive" -C "$archive_root"
 bash "$archive_root/packaging/scripts/install.sh"
+install -o root -g root -m 0644 "$updater_root/packaging/systemd/geoflow-updater.service" /etc/systemd/system/geoflow-updater.service
+systemctl daemon-reload
+cmp "$updater_root/packaging/systemd/geoflow-updater.service" /etc/systemd/system/geoflow-updater.service
+log "Diagnostic service-unit overlay applied; verified candidate binary is unchanged"
 test "$(geoflow-updater version)" = "$updater_version"
 record_check candidate-install "Candidate archive checksum, native execution, installer, systemd unit"
 
@@ -1316,6 +1320,7 @@ scan_runtime_logs
 record_check secret-free-logs "Updater journal, container output, and bounded Laravel daily logs contain none of the generated credentials, session tokens, control token, factor URIs, secrets, or accepted codes"
 
 current_check=complete
-result_status=pass
+current_check=diagnostic-full-runtime-no-publication
+result_status=fail
 # Machine evidence concludes with {"result":"pass"} only after every check above succeeds.
 log "Native Phase C rehearsal passed for $PLATFORM"
