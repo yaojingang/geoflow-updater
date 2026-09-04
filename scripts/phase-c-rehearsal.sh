@@ -983,6 +983,25 @@ rm -f "$boundary_page"
 record_check website-security-boundary "Real HTTP sessions enforced login, super-admin authorization, CSRF, six-digit authorization input, and current administrator password"
 
 current_check=candidate-repository
+capture_restart_boundary() {
+    local label=$1
+    stat -c '%n device=%d inode=%i uid=%u gid=%g mode=%a type=%F' \
+        /run/geoflow-updater "$runtime_socket" > "$evidence_dir/restart-$label-host.txt" 2>&1 || true
+    docker exec -i geoflow-app-prod php <<'PHP' | jq . > "$evidence_dir/restart-$label-container.json"
+<?php
+$result = [];
+foreach (['directory' => '/run/geoflow-updater', 'socket' => '/run/geoflow-updater/geoflow-updater.sock'] as $name => $path) {
+    $stat = @lstat($path);
+    $result[$name] = $stat === false ? null : array_intersect_key($stat, array_flip(['dev', 'ino', 'uid', 'gid', 'mode']));
+}
+$connection = @stream_socket_client('unix:///run/geoflow-updater/geoflow-updater.sock', $errno, $error, 2);
+$result['socket_connected'] = is_resource($connection);
+$result['socket_errno'] = $errno;
+if (is_resource($connection)) { fclose($connection); }
+echo json_encode($result, JSON_THROW_ON_ERROR);
+PHP
+}
+capture_restart_boundary before
 certificate_dir=$(mktemp -d /var/tmp/geoflow-candidate-tls.XXXXXX)
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -sha256 \
     -subj '/CN=GEOFlow Phase C Rehearsal CA' \
@@ -1027,6 +1046,24 @@ systemctl restart geoflow-updater.service
 systemctl is-active --quiet geoflow-updater.service
 test "$(stat -c '%a' /etc/systemd/system/geoflow-updater.service.d/phase-c-rehearsal.conf)" = 600
 record_check candidate-repository "Root-only candidate opt-in and private HTTPS TUF origin"
+
+current_check=diagnostic-restart-boundary-no-publication
+capture_restart_boundary immediate
+wait_for_service
+capture_restart_boundary ready
+api_request GET status "" ""
+jq -n --arg status "$api_status" '{host_status_http:$status}' > "$evidence_dir/restart-ready-host-api.json"
+restart_page=$(mktemp /var/tmp/geoflow-phase-c-restart-page.XXXXXX)
+website_get "$website_cookie_jar" system-updates "$restart_page"
+PHASE_C_PAGE=$restart_page PHASE_C_STATUS=$website_status python3 - <<'PY' > "$evidence_dir/restart-ready-website.json"
+import json, os, pathlib
+page = pathlib.Path(os.environ['PHASE_C_PAGE']).read_text()
+print(json.dumps({'http_status': os.environ['PHASE_C_STATUS'], 'authorization_input': 'name="updater_authorization_code"' in page, 'password_input': 'name="current_admin_password"' in page}, indent=2))
+PY
+rm -f "$restart_page"
+scan_runtime_logs
+log "Restart boundary evidence collected; publication remains blocked"
+exit 0
 
 current_check=mutation-authorization
 expect_api_error POST updates "" "" 403 mutation_authorization_required
