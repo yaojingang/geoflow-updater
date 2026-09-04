@@ -73,6 +73,15 @@ services:
   app:
     <<: *app-base
     container_name: geoflow-app-prod
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        bridge_gid=$$(stat -c '%g' /run/secrets/geoflow-updater-control-token)
+        case "$$bridge_gid" in ''|*[!0-9]*) exit 1 ;; esac
+        test "$$bridge_gid" -gt 0
+        printf '[www]\ngroup = %s\n' "$$bridge_gid" > /usr/local/etc/php-fpm.d/zzz-geoflow-updater-group.conf
+        exec php-fpm -F
     environment:
       AUTO_FIX_STORAGE_PERMISSIONS: "false"
       AUTO_INSTALL_ONCE: "false"
