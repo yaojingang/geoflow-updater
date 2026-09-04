@@ -153,6 +153,16 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 		t.Fatalf("Phase C Laravel probes with Composer autoload = %d, want 3", got)
 	}
 	for _, required := range []string{
+		`local expected_error_marker=$2`,
+		`grep -Fq "$expected_error_marker" "$page"`,
+		`website_expect_validation_error "" admin-flash-alert system-updates/updater/update`,
+		`website_expect_validation_error "" data-admin-errors system-updates/updater/rollback`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("Phase C rehearsal script is missing version-specific website validation control %q", required)
+		}
+	}
+	for _, required := range []string{
 		"a6a8b6ca1f0e7c9c00c4093a237206a6c24131fc94e5540c3b1dfd1fe84dcc67",
 		"95383a1b19ee80c7c4b05cfffc0868c6492ab4e5870f173e581e4240ebbcce6f",
 		`cmp "$instance_dir/docker-compose.managed.yml" "$updater_root/assets/docker-compose.managed.yml"`,
