@@ -638,6 +638,7 @@ assert_restore_fixture() {
     operation_state_sha=$(sha256sum "$instance_dir/operations/current.json" | cut -d ' ' -f 1)
     systemctl restart geoflow-updater.service
     wait_for_service
+    verify_restarted_website_bridge "restore-${restore_fixture_id}" phase-b
     test "$(current_operation_id)" = "$operation_id"
     test "$(sha256sum "$instance_dir/operations/current.json" | cut -d ' ' -f 1)" = "$operation_state_sha"
 }
@@ -688,6 +689,29 @@ run_bridge_probe() {
         php_source='require "/var/www/html/vendor/autoload.php"; $app = require "/var/www/html/bootstrap/app.php"; $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap(); $client = $app->make(App\Contracts\SystemUpdater\AgentClient::class); $status = $client->status(); $points = $client->recoveryPoints(); $history = $app->make(App\Services\Admin\SystemUpdateStateService::class); $recent = $history->summary("recent"); $archived = $history->summary("archived"); $routes = $app->make("router")->getRoutes(); $marker = getenv("PHASE_C_MARKER"); echo json_encode(["status" => $status["status"], "recovery_points" => count($points), "recent_visible" => $recent["recent_runs"]->getCollection()->contains("run_uuid", $marker."-recent"), "archive_visible" => $archived["recent_runs"]->getCollection()->contains("run_uuid", $marker."-archive"), "run_detail_methods" => $routes->getByName("admin.system-updates.runs.show")->methods(), "backup_detail_methods" => $routes->getByName("admin.system-updates.backups.show")->methods()], JSON_THROW_ON_ERROR);'
     fi
     docker exec --env "PHASE_C_MARKER=${marker:-}" geoflow-app-prod php -r "$php_source" | jq . > "$output"
+}
+
+verify_restarted_website_bridge() {
+    local label=$1
+    local phase=$2
+    local page
+    page=$(mktemp /var/tmp/geoflow-phase-c-restart-page.XXXXXX)
+    website_get "$website_cookie_jar" system-updates "$page"
+    local marker='name="updater_authorization_code"'
+    if [[ $phase == phase-c ]]; then
+        marker=data-system-updater-authorized-action
+    fi
+    local controls_available=false
+    if grep -Fq "$marker" "$page"; then
+        controls_available=true
+    fi
+    jq -n --arg http_status "$website_status" --argjson controls_available "$controls_available" \
+        '{http_status:$http_status,controls_available:$controls_available}' \
+        > "$evidence_dir/website-restart-${label}.json"
+    rm -f "$page"
+    test "$website_status" = 200
+    test "$controls_available" = true
+    verify_fpm_bridge_permissions "$evidence_dir/fpm-restart-${label}.json"
 }
 
 current_check=native-host
@@ -1028,6 +1052,11 @@ systemctl is-active --quiet geoflow-updater.service
 test "$(stat -c '%a' /etc/systemd/system/geoflow-updater.service.d/phase-c-rehearsal.conf)" = 600
 record_check candidate-repository "Root-only candidate opt-in and private HTTPS TUF origin"
 
+current_check=website-bridge-after-restart
+wait_for_service
+verify_restarted_website_bridge candidate-repository phase-b
+record_check website-bridge-after-restart "Authenticated website controls and non-root FPM bridge permissions survive updater restart"
+
 current_check=mutation-authorization
 expect_api_error POST updates "" "" 403 mutation_authorization_required
 expect_api_error POST backups "" "" 403 mutation_authorization_required
@@ -1237,6 +1266,7 @@ test "$(jq -er '.current_stage' "$evidence_dir/operation-restart-during-resume.j
 test "$(jq -er '.version' "$instance_root/version.json")" = 3.0.0
 geoflow-updater doctor --instance primary --json > "$evidence_dir/doctor-final.json"
 test "$(jq -r '.status' "$evidence_dir/doctor-final.json")" = pass
+verify_restarted_website_bridge resume phase-c
 record_check restart-during-resume "The real resume completed while its stage remained durable-running; SIGKILL before command return reconciled the activated candidate to healthy succeeded"
 
 current_check=anti-spray
@@ -1266,6 +1296,7 @@ expect_api_error POST backups "$invalid_code" "" 429 mutation_authorization_rate
 systemctl restart geoflow-updater.service
 systemctl is-active --quiet geoflow-updater.service
 expect_api_error POST updates "$valid_update" "" 429 mutation_authorization_rate_limited
+verify_restarted_website_bridge anti-spray phase-c
 awk '{print "failures=" $1 " locked=yes"}' "$instance_dir/mutation.attempts" > "$evidence_dir/anti-spray-state.txt"
 record_check anti-spray "Five distributed failures triggered a persisted 15-minute lockout that survived service restart; native tests cover expiry and scoped clearing"
 
