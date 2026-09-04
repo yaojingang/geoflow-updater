@@ -15,6 +15,8 @@ TimeoutStopSec=35min
 UMask=0027
 RuntimeDirectory=geoflow-updater
 RuntimeDirectoryMode=0750
+# Keep the parent inode stable for application bind mounts across service stops.
+RuntimeDirectoryPreserve=yes
 StateDirectory=geoflow-updater
 StateDirectoryMode=0750
 ProtectSystem=full

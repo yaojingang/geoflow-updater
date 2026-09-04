@@ -343,13 +343,25 @@ wait_for_operation_status() {
 }
 
 wait_for_service() {
+    local response_file
+    response_file=$(mktemp /var/tmp/geoflow-phase-c-readiness.XXXXXX)
+    local response_status
     for _ in $(seq 1 90); do
-        if systemctl is-active --quiet geoflow-updater.service && [[ -S $runtime_socket ]]; then
-            return 0
+        if systemctl is-active --quiet geoflow-updater.service && \
+            response_status=$(curl --silent --connect-timeout 1 --max-time 2 \
+                --unix-socket "$runtime_socket" --header "Authorization: Bearer $control_token" \
+                --output "$response_file" --write-out '%{http_code}' \
+                http://localhost/v1/instances/primary/operations/current); then
+            if { [[ $response_status == 200 ]] && jq -e '.id | type == "string" and length > 0' "$response_file" >/dev/null; } || \
+                { [[ $response_status == 404 ]] && jq -e '.error == "operation_not_found"' "$response_file" >/dev/null; }; then
+                rm -f "$response_file"
+                return 0
+            fi
         fi
         sleep 1
     done
-    echo "Updater service did not return after restart." >&2
+    rm -f "$response_file"
+    echo "Authenticated updater API did not become ready after restart." >&2
     return 1
 }
 
@@ -1048,12 +1060,11 @@ printf '%s\n' \
 chmod 0600 /etc/systemd/system/geoflow-updater.service.d/phase-c-rehearsal.conf
 systemctl daemon-reload
 systemctl restart geoflow-updater.service
-systemctl is-active --quiet geoflow-updater.service
+wait_for_service
 test "$(stat -c '%a' /etc/systemd/system/geoflow-updater.service.d/phase-c-rehearsal.conf)" = 600
 record_check candidate-repository "Root-only candidate opt-in and private HTTPS TUF origin"
 
 current_check=website-bridge-after-restart
-wait_for_service
 verify_restarted_website_bridge candidate-repository phase-b
 record_check website-bridge-after-restart "Authenticated website controls and non-root FPM bridge permissions survive updater restart"
 
@@ -1294,7 +1305,7 @@ for attempt in 1 2 3 4; do
 done
 expect_api_error POST backups "$invalid_code" "" 429 mutation_authorization_rate_limited
 systemctl restart geoflow-updater.service
-systemctl is-active --quiet geoflow-updater.service
+wait_for_service
 expect_api_error POST updates "$valid_update" "" 429 mutation_authorization_rate_limited
 verify_restarted_website_bridge anti-spray phase-c
 awk '{print "failures=" $1 " locked=yes"}' "$instance_dir/mutation.attempts" > "$evidence_dir/anti-spray-state.txt"
