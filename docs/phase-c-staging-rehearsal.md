@@ -39,6 +39,8 @@ The HTTP regression in `go test -race ./...` executes the rehearsal's actual for
 
 Faults are introduced by a root-owned Docker command wrapper on the disposable host; the updater archive and signed application images stay byte-for-byte identical to the candidate. Every rollback scenario corrupts PostgreSQL data, Redis, storage, the site environment, and managed deployment files after its recovery point is created. The result remains blocked until those values, the migration fingerprint, managed-file hashes, diagnostics, retired-worker state, and completed operation state all return to the recorded Phase B baseline and stay stable across an updater restart. Uploaded diagnostics are redacted again before the evidence directory is returned to the workflow runner.
 
+After successful reconciliation, the operation JSON omits the zero-valued `reconcile_attempts` field. The rehearsal accepts that omission or an explicit numeric zero, rejects nonzero and invalid values, and then continues every restored-data and restart assertion. Executable regression cases use the actual operation serializer and the rehearsal's post-recovery assertions.
+
 Download `phase-c-rehearsal-linux-amd64`, `phase-c-rehearsal-linux-arm64`, and the combined `phase-c-rehearsal-<run-id>` artifact. Both architecture `result.json` files must say `pass`. Review their check list and operation records, then complete the three human approvals in `evidence-template.json`. A workflow result does not supply or impersonate those approvals.
 
 ## Architecture matrix
