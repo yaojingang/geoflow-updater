@@ -928,7 +928,8 @@ website_expect_validation_error '管理员密码不正确。' admin-flash-alert 
     "current_admin_password=$wrong_admin_password" 'updater_authorization_code=000000'
 website_get "$website_cookie_jar" system-updates "$boundary_page"
 test "$website_status" = 200
-grep -Fq 'data-system-updater-authorized-action' "$boundary_page"
+grep -Fq 'name="updater_authorization_code"' "$boundary_page"
+grep -Fq 'name="current_admin_password"' "$boundary_page"
 scan_runtime_logs
 rm -f "$boundary_page"
 record_check website-security-boundary "Real HTTP sessions enforced login, super-admin authorization, CSRF, six-digit authorization input, and current administrator password"
@@ -1036,6 +1037,11 @@ test "$(jq -r '.recent_visible' "$evidence_dir/website-phase-c-bridge.json")" = 
 test "$(jq -r '.archive_visible' "$evidence_dir/website-phase-c-bridge.json")" = true
 test "$(jq -c '.run_detail_methods' "$evidence_dir/website-phase-c-bridge.json")" = '["GET","HEAD"]'
 test "$(jq -c '.backup_detail_methods' "$evidence_dir/website-phase-c-bridge.json")" = '["GET","HEAD"]'
+phase_c_update_page=$(mktemp /var/tmp/geoflow-phase-c-update-center.XXXXXX)
+website_get "$website_cookie_jar" system-updates "$phase_c_update_page"
+test "$website_status" = 200
+grep -Fq 'data-system-updater-authorized-action' "$phase_c_update_page"
+rm -f "$phase_c_update_page"
 website_start_operation system-updates/updater/verify
 wait_for_operation website-verify succeeded verify
 geoflow-updater recovery-points --instance primary > "$evidence_dir/recovery-points-after-update.json"

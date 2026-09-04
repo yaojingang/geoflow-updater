@@ -162,6 +162,12 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 			t.Errorf("Phase C rehearsal script is missing version-specific website validation control %q", required)
 		}
 	}
+	phaseBLegacyControlsAt := strings.Index(script, `grep -Fq 'name="updater_authorization_code"'`)
+	phaseCWebsiteAt := strings.Index(script, "current_check=website-bridge")
+	phaseCAuthorizedActionAt := strings.Index(script, `grep -Fq 'data-system-updater-authorized-action'`)
+	if phaseBLegacyControlsAt < 0 || phaseCWebsiteAt < 0 || phaseCAuthorizedActionAt < phaseCWebsiteAt {
+		t.Fatal("Website rehearsal must verify legacy Phase B controls before checking the Phase C authorized-action marker")
+	}
 	for _, required := range []string{
 		"a6a8b6ca1f0e7c9c00c4093a237206a6c24131fc94e5540c3b1dfd1fe84dcc67",
 		"95383a1b19ee80c7c4b05cfffc0868c6492ab4e5870f173e581e4240ebbcce6f",
