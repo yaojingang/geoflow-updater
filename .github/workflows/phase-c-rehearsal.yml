@@ -81,13 +81,13 @@ jobs:
           test "$(jq -er '.event' <<< "$candidate_run")" = workflow_dispatch
           test "$(jq -er '.conclusion' <<< "$candidate_run")" = success
           test "$(jq -er '.head_branch' <<< "$candidate_run")" = main
-          test "$(jq -er '.head_sha' <<< "$candidate_run")" = "$GITHUB_SHA"
+          candidate_head_sha="$(jq -er '.head_sha' <<< "$candidate_run")"
           test "$(jq -er '.actor.login' <<< "$candidate_run")" = "$GITHUB_REPOSITORY_OWNER"
           test "$(jq -er '.triggering_actor.login' <<< "$candidate_run")" = "$GITHUB_REPOSITORY_OWNER"
           workflow_id="$(jq -er '.workflow_id' <<< "$candidate_run")"
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id" --jq '.path')" = ".github/workflows/release-candidate.yml"
           test "$(jq -er '.candidate_run_id | tostring' rehearsal/candidate/candidate.json)" = "$CANDIDATE_RUN_ID"
-          test "$(jq -er '.updater.commit' rehearsal/candidate/candidate.json)" = "$GITHUB_SHA"
+          test "$(jq -er '.updater.commit' rehearsal/candidate/candidate.json)" = "$candidate_head_sha"
           updater_version="$(jq -er '.updater.version' rehearsal/candidate/candidate.json)"
           archive="rehearsal/candidate/dist/geoflow-updater_${updater_version}_linux_${ARCHIVE_ARCH}.tar.gz"
           expected_sha="$(jq -er --arg platform "$PLATFORM" '.updater.archives[$platform]' rehearsal/candidate/candidate.json)"

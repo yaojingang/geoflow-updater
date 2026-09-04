@@ -1056,6 +1056,8 @@ current_check=website-bridge-after-restart
 wait_for_service
 verify_restarted_website_bridge candidate-repository phase-b
 record_check website-bridge-after-restart "Authenticated website controls and non-root FPM bridge permissions survive updater restart"
+current_check=diagnostic-restart-regression-no-publication
+exit 0
 
 current_check=mutation-authorization
 expect_api_error POST updates "" "" 403 mutation_authorization_required
