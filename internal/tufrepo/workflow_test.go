@@ -148,6 +148,10 @@ func TestPhaseCRehearsalExercisesTheInstalledAgentAndManagedDeployment(t *testin
 	if compatibilityAt < 0 || handoverAt < 0 || compatibilityAt >= handoverAt {
 		t.Fatal("Phase B signed Compose compatibility repair must run before managed handover")
 	}
+	laravelBootstrap := `require "/var/www/html/vendor/autoload.php"; $app = require "/var/www/html/bootstrap/app.php";`
+	if got := strings.Count(script, laravelBootstrap); got != 3 {
+		t.Fatalf("Phase C Laravel probes with Composer autoload = %d, want 3", got)
+	}
 	for _, required := range []string{
 		"a6a8b6ca1f0e7c9c00c4093a237206a6c24131fc94e5540c3b1dfd1fe84dcc67",
 		"95383a1b19ee80c7c4b05cfffc0868c6492ab4e5870f173e581e4240ebbcce6f",
