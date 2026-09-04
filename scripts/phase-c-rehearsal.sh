@@ -528,23 +528,45 @@ website_expect_validation_error() {
     shift 2
     local page
     page=$(mktemp /var/tmp/geoflow-phase-c-validation.XXXXXX)
+    log "Website validation probe: load update center"
     website_get "$website_cookie_jar" system-updates "$page"
-    test "$website_status" = 200
+    if [[ $website_status != 200 ]]; then
+        echo "Website validation probe initial GET returned $website_status." >&2
+        return 1
+    fi
     local csrf_token
     csrf_token=$(extract_csrf_token "$page")
     mask_value "$csrf_token"
     local previous_operation
     previous_operation=$(current_operation_id)
+    log "Website validation probe: submit rejected mutation"
     website_post "$website_cookie_jar" "$path" "$csrf_token" "$page" "$@"
-    test "$website_status" = 302
-    scan_runtime_logs
-    website_get "$website_cookie_jar" system-updates "$page"
-    test "$website_status" = 200
-    grep -Fq 'data-admin-errors' "$page"
-    if [[ -n $expected_marker ]]; then
-        grep -Fq "$expected_marker" "$page"
+    if [[ $website_status != 302 ]]; then
+        echo "Website validation probe POST returned $website_status." >&2
+        return 1
     fi
-    test "$(current_operation_id)" = "$previous_operation"
+    scan_runtime_logs
+    log "Website validation probe: read flashed validation response"
+    website_get "$website_cookie_jar" system-updates "$page"
+    cp "$page" "$evidence_dir/website-validation-response.html"
+    if [[ $website_status != 200 ]]; then
+        echo "Website validation probe response GET returned $website_status." >&2
+        return 1
+    fi
+    if ! grep -Fq 'data-admin-errors' "$page"; then
+        echo "Website validation response did not expose the global error marker." >&2
+        return 1
+    fi
+    if [[ -n $expected_marker ]]; then
+        if ! grep -Fq "$expected_marker" "$page"; then
+            echo "Website validation response did not expose the expected localized message." >&2
+            return 1
+        fi
+    fi
+    if [[ $(current_operation_id) != "$previous_operation" ]]; then
+        echo "Website validation probe unexpectedly changed the current operation." >&2
+        return 1
+    fi
     rm -f "$page"
 }
 
