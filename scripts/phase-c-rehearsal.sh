@@ -524,8 +524,9 @@ current_operation_id() {
 
 website_expect_validation_error() {
     local expected_marker=$1
-    local path=$2
-    shift 2
+    local expected_error_marker=$2
+    local path=$3
+    shift 3
     local page
     page=$(mktemp /var/tmp/geoflow-phase-c-validation.XXXXXX)
     website_get "$website_cookie_jar" system-updates "$page"
@@ -540,7 +541,7 @@ website_expect_validation_error() {
     scan_runtime_logs
     website_get "$website_cookie_jar" system-updates "$page"
     test "$website_status" = 200
-    grep -Fq 'data-admin-errors' "$page"
+    grep -Fq "$expected_error_marker" "$page"
     if [[ -n $expected_marker ]]; then
         grep -Fq "$expected_marker" "$page"
     fi
@@ -921,9 +922,9 @@ website_post "$website_cookie_jar" system-updates/updater/update "" "$boundary_p
     "current_admin_password=$admin_password" 'updater_authorization_code=000000'
 test "$website_status" = 419
 test "$(current_operation_id)" = "$previous_operation"
-website_expect_validation_error "" system-updates/updater/update \
+website_expect_validation_error "" admin-flash-alert system-updates/updater/update \
     "current_admin_password=$admin_password"
-website_expect_validation_error '管理员密码不正确。' system-updates/updater/update \
+website_expect_validation_error '管理员密码不正确。' admin-flash-alert system-updates/updater/update \
     "current_admin_password=$wrong_admin_password" 'updater_authorization_code=000000'
 website_get "$website_cookie_jar" system-updates "$boundary_page"
 test "$website_status" = 200
@@ -1059,7 +1060,7 @@ current_check=website-rollback
 expect_api_error POST rollbacks "" "{\"recovery_point_id\":\"$update_checkpoint\"}" 403 mutation_authorization_required
 next_totp rollback
 rollback_code=$totp_code
-website_expect_validation_error "" system-updates/updater/rollback \
+website_expect_validation_error "" data-admin-errors system-updates/updater/rollback \
     "current_admin_password=$admin_password" "updater_authorization_code=$rollback_code" "recovery_point_id=$manual_backup"
 docker exec geoflow-postgres-prod psql --username=geo_user --dbname=geo_flow --set ON_ERROR_STOP=1 \
     --command "DELETE FROM system_update_runs WHERE run_uuid='${marker}-recent'; INSERT INTO system_update_runs (run_uuid, action, status, current_version, target_version, created_at, updated_at) VALUES ('${marker}-post', 'apply', 'completed', '3.0.0', '3.0.0', NOW(), NOW()) ON CONFLICT (run_uuid) DO NOTHING" >/dev/null
