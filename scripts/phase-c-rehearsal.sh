@@ -190,6 +190,30 @@ finish() {
     exit "$exit_code"
 }
 trap finish EXIT
+trap 'printf "%s\n" "$LINENO" >> "$evidence_dir/diagnostic-error-lines.txt"' ERR
+
+diagnostic_value() {
+    local id=$1 expected=$2 actual="" command_ok=false matches_expected=false
+    shift 2
+    if actual=$("$@" 2>/dev/null); then
+        command_ok=true
+        if [[ $actual == "$expected" ]]; then
+            matches_expected=true
+        fi
+    fi
+    jq -cn --arg id "$id" --argjson command_ok "$command_ok" --argjson matches_expected "$matches_expected" \
+        '{id:$id,command_ok:$command_ok,matches_expected:$matches_expected}' >> "$evidence_dir/rollback-diagnostic.jsonl"
+}
+
+diagnostic_expect() {
+    local id=$1 passed=false
+    shift
+    if "$@" >/dev/null 2>&1; then
+        passed=true
+    fi
+    jq -cn --arg id "$id" --argjson passed "$passed" \
+        '{id:$id,pass:$passed}' >> "$evidence_dir/rollback-diagnostic.jsonl"
+}
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || {
@@ -867,6 +891,7 @@ reserved_jobs=$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-
 delayed_jobs=$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli ZCARD queues:system-updates:delayed 2>/dev/null)
 test "$((pending_jobs + reserved_jobs + delayed_jobs))" = 0
 docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli SET "geoflow:${marker}:before" before-update >/dev/null 2>&1
+diagnostic_value redis-before-handover before-update docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli GET "geoflow:${marker}:before"
 record_check pre-cutover-idle "No queued/running legacy mutation row and no pending/reserved system-updates job"
 
 current_check=enrollment-boundary
@@ -919,6 +944,7 @@ current_check=managed-phase-b-handover
 managed_compose=(docker compose --env-file "$instance_root/.env.prod" --env-file "$instance_dir/release.env" -f "$instance_dir/docker-compose.managed.yml")
 "${managed_compose[@]}" down --remove-orphans
 "${managed_compose[@]}" up -d --remove-orphans --wait --wait-timeout 600
+diagnostic_value redis-after-handover before-update docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli GET "geoflow:${marker}:before"
 stable_app_image=$(awk -F= '$1 == "GEOFLOW_APP_IMAGE" {print substr($0, index($0, "=")+1)}' "$instance_dir/release.env")
 test -n "$stable_app_image"
 network_name=$(read_environment_value DOCKER_NETWORK_NAME)
@@ -1077,6 +1103,7 @@ test "$(jq -r '.schema_version' <<< "$api_body")" = 1
 next_totp update
 update_code=$totp_code
 expect_api_error POST backups "$update_code" "" 403 mutation_authorization_invalid
+diagnostic_value redis-before-update before-update docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli GET "geoflow:${marker}:before"
 website_start_operation system-updates/updater/update \
     "current_admin_password=$admin_password" "updater_authorization_code=$update_code"
 first_update_operation=$operation_id
@@ -1175,6 +1202,15 @@ docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli S
 website_start_operation system-updates/updater/rollback \
     "current_admin_password=$admin_password" "updater_authorization_code=$rollback_code" "recovery_point_id=$update_checkpoint"
 wait_for_operation website-rollback succeeded rollback
+diagnostic_value rollback-version 2.3.0 jq -er '.version' "$instance_root/version.json"
+diagnostic_value rollback-storage before-update cat "$instance_root/storage/app/phase-c-rehearsal.txt"
+diagnostic_expect rollback-no-new-file test ! -e "$instance_root/storage/app/phase-c-post-update.txt"
+diagnostic_expect rollback-environment grep -qx 'PHASE_C_REHEARSAL_MARKER=before-update' "$instance_root/.env.prod"
+diagnostic_value rollback-database-before 1 docker exec geoflow-postgres-prod psql --username=geo_user --dbname=geo_flow --tuples-only --no-align --command "SELECT count(*) FROM system_update_runs WHERE run_uuid='${marker}-recent'"
+diagnostic_value rollback-database-post 0 docker exec geoflow-postgres-prod psql --username=geo_user --dbname=geo_flow --tuples-only --no-align --command "SELECT count(*) FROM system_update_runs WHERE run_uuid='${marker}-post'"
+diagnostic_value rollback-redis-before before-update docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli GET "geoflow:${marker}:before"
+diagnostic_value rollback-redis-post 0 docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli EXISTS "geoflow:${marker}:post"
+diagnostic_expect rollback-fpm verify_fpm_bridge_permissions "$evidence_dir/fpm-diagnostic-website-rollback.json"
 test "$(jq -er '.version' "$instance_root/version.json")" = 2.3.0
 test "$(<"$instance_root/storage/app/phase-c-rehearsal.txt")" = before-update
 test ! -e "$instance_root/storage/app/phase-c-post-update.txt"
@@ -1187,6 +1223,9 @@ test "$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod red
 test "$(docker exec --env REDISCLI_AUTH="$redis_password" geoflow-redis-prod redis-cli EXISTS "geoflow:${marker}:post" 2>/dev/null)" = 0
 verify_fpm_bridge_permissions "$evidence_dir/fpm-website-rollback.json"
 record_check website-rollback "Website accepted only the newest pre-update checkpoint and restored database, Redis, storage, environment, deployment state, and version"
+
+current_check=diagnostic-rollback-fixture-no-publication
+exit 1
 
 current_check=forced-migration-failure
 prepare_restore_fixture forced-migration-failure

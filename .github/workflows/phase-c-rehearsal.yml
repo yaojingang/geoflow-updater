@@ -15,7 +15,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: phase-c-rehearsal-${{ inputs.candidate_run_id }}
+  group: diagnostic-rollback-fixture-${{ inputs.candidate_run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -39,6 +39,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -75,24 +76,28 @@ jobs:
           set -Eeuo pipefail
           test "$(uname -s)" = Linux
           test "$(uname -m)" = "$EXPECTED_KERNEL_ARCH"
+          test "$GITHUB_REF" = refs/heads/codex/diagnose-rollback-fixture
+          test "$CANDIDATE_RUN_ID" = 33868069641
+          diagnostic_source=d5a03b5eec6107402c275d9bdf9595d5597d9152
+          git diff --exit-code "$diagnostic_source" HEAD -- cmd internal/agent internal/authorization internal/bootstrap internal/cli internal/deployment internal/doctor internal/enrollment internal/instance internal/managed internal/operation internal/recovery internal/tufclient internal/update packaging assets tuf go.mod go.sum
           [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           candidate_run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
           test "$(jq -er '.name' <<< "$candidate_run")" = "Build Phase C release candidate"
           test "$(jq -er '.event' <<< "$candidate_run")" = workflow_dispatch
           test "$(jq -er '.conclusion' <<< "$candidate_run")" = success
           test "$(jq -er '.head_branch' <<< "$candidate_run")" = main
-          test "$(jq -er '.head_sha' <<< "$candidate_run")" = "$GITHUB_SHA"
+          test "$(jq -er '.head_sha' <<< "$candidate_run")" = "$diagnostic_source"
           test "$(jq -er '.actor.login' <<< "$candidate_run")" = "$GITHUB_REPOSITORY_OWNER"
           test "$(jq -er '.triggering_actor.login' <<< "$candidate_run")" = "$GITHUB_REPOSITORY_OWNER"
           workflow_id="$(jq -er '.workflow_id' <<< "$candidate_run")"
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id" --jq '.path')" = ".github/workflows/release-candidate.yml"
           test "$(jq -er '.candidate_run_id | tostring' rehearsal/candidate/candidate.json)" = "$CANDIDATE_RUN_ID"
-          test "$(jq -er '.updater.commit' rehearsal/candidate/candidate.json)" = "$GITHUB_SHA"
+          test "$(jq -er '.updater.commit' rehearsal/candidate/candidate.json)" = "$diagnostic_source"
           updater_version="$(jq -er '.updater.version' rehearsal/candidate/candidate.json)"
           archive="rehearsal/candidate/dist/geoflow-updater_${updater_version}_linux_${ARCHIVE_ARCH}.tar.gz"
           expected_sha="$(jq -er --arg platform "$PLATFORM" '.updater.archives[$platform]' rehearsal/candidate/candidate.json)"
           test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$expected_sha"
-          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" --source-digest "$diagnostic_source" --source-ref refs/heads/main --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" --deny-self-hosted-runners
       - name: Run the isolated Phase C rehearsal
         env:
           ARCHIVE_ARCH: ${{ matrix.archive_arch }}
@@ -116,7 +121,7 @@ jobs:
 
   evidence:
     name: Assemble publication evidence template
-    if: ${{ always() }}
+    if: ${{ false }}
     needs: rehearse
     runs-on: ubuntu-24.04
     permissions:
