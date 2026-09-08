@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -33,7 +34,7 @@ func TestFreshInstallAndRetryKeepCredentialsAndData(t *testing.T) {
 }
 func testInstallRetry(t *testing.T, fault string) {
 	state := canonicalTemp(t)
-	root := filepath.Join(canonicalTemp(t), "site")
+	root := filepath.Join(installSiteParent(t), "site")
 	release := testRelease(t, false)
 	var calls []string
 	adminSeeded, knowledgeSynced := false, false
@@ -183,6 +184,42 @@ func testInstallRetry(t *testing.T, fault string) {
 	second, e := os.ReadFile(filepath.Join(root, ".env.prod"))
 	if e != nil || string(second) != string(env) {
 		t.Fatal("retry rotated application identity")
+	}
+}
+
+func installSiteParent(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return canonicalTemp(t)
+	}
+	// Linux's default /tmp is intentionally refused by enrollment. A separate
+	// tmpfs fixture exercises the unchanged production guard and real install path.
+	parent, err := os.MkdirTemp("/dev/shm", "geoflow-install-test-")
+	if err != nil {
+		t.Fatalf("create isolated installation fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(parent); err != nil {
+			t.Errorf("remove isolated installation fixture: %v", err)
+		}
+	})
+	resolved, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enrollment.ValidateRootAccess(resolved); err != nil {
+		t.Fatalf("installation fixture must pass the production root guard: %v", err)
+	}
+	return resolved
+}
+
+func TestFreshInstallPreservesServiceSandboxGuard(t *testing.T) {
+	service := Service{StateDir: canonicalTemp(t)}
+	_, err := service.Install(context.Background(), InstallRequest{
+		InstanceID: "primary", Root: "/tmp/geoflow-install-forbidden", URL: "https://example.test",
+	})
+	if err == nil || !strings.Contains(err.Error(), "blocked by the installed systemd sandbox") {
+		t.Fatalf("installation must reject hidden sandbox roots before resolving a release: %v", err)
 	}
 }
 
