@@ -43,7 +43,7 @@ func TestMetadataPublishingWorkflowsExplicitlyDeployPagesAfterBotCommits(t *test
 func TestReleaseWorkflowsAreValidYAML(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"phase-c-rehearsal.yml", "release-candidate.yml", "release.yml"} {
+	for _, name := range []string{"phase-c-rehearsal.yml", "planned-acceptance.yml", "release-candidate.yml", "release.yml", "ci.yml"} {
 		contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", name))
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
@@ -416,8 +416,10 @@ func TestReleaseWorkflowPublishesOnlyAnApprovedExactCandidate(t *testing.T) {
 	candidate := string(candidateContents)
 	for _, required := range []string{
 		"candidate-${{ github.run_id }}-${{ github.run_attempt }}",
-		"schema_version:2",
-		"minimum_updater_protocol:2",
+		"schema_version:3",
+		"minimum_updater_protocol:$minimum_protocol",
+		"geoflow/deployment/generate-upgrade-plan.py --check",
+		"upgrade_plan_target:$upgrade_plan_target",
 		"candidate/tuf/repository",
 		"phase-c-candidate-${{ github.run_id }}",
 	} {
@@ -431,5 +433,42 @@ func TestReleaseWorkflowPublishesOnlyAnApprovedExactCandidate(t *testing.T) {
 	}
 	if !strings.Contains(string(updaterMain), "GEOFLOW_UPDATER_ALLOW_CANDIDATE_REPOSITORY") {
 		t.Fatal("release binary has no explicit root-only candidate repository opt-in")
+	}
+}
+
+func TestPlannedAcceptanceBindsSignedPlanAndReportsItsActualScope(t *testing.T) {
+	root := filepath.Join("..", "..")
+	data, err := os.ReadFile(filepath.Join(root, ".github/workflows/planned-acceptance.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"ubuntu-24.04-arm", "scripts/planned-candidate-acceptance.sh", "GEOFLOW_DOCKER_TEST=1", "TestDockerIngress", "planned-container-contract-and-ingress", "Full installed-host upgrade, backup restoration, and crash recovery require separate rehearsal.", "gh attestation verify"} {
+		if !strings.Contains(string(data), required) {
+			t.Errorf("missing planned acceptance contract %s", required)
+		}
+	}
+	script, err := os.ReadFile(filepath.Join(root, "scripts/planned-candidate-acceptance.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"trap cleanup EXIT", "docker network create", "php artisan migrate --force", "php artisan geoflow:install", "php artisan geoflow:upgrade --phase=verify", "upgrade_plan_sha256", ".pending_migrations | length == 0",
+		`docker exec --user 33:33 "$name-app" "$@"`,
+		`docker run -d --name "$name-app" --user 33:33`,
+		`--volume "$acceptance_root/environment:/var/www/html/.env:ro"`,
+		`app_exec test ! -r /var/www/html/.env`,
+		`app_exec /usr/local/bin/geoflow-entrypoint-prod php artisan about`,
+		"AUTO_OPTIMIZE=false", "AUTO_FIX_STORAGE_PERMISSIONS=false",
+		"VIEW_COMPILED_PATH=/var/www/html/bootstrap/cache/views",
+		"for phase in inspect apply verify", "upgrade-apply-repeat.json", "upgrade-journal.json",
+		`app_exec test ! -e "$journal"`, `.checks.journal.status == "pass"`,
+		`[[ $(app_exec sha256sum "$journal" | cut -d ' ' -f 1) == "$journal_sha" ]]`,
+	} {
+		if !strings.Contains(string(script), required) {
+			t.Errorf("missing real candidate check %s", required)
+		}
+	}
+	if output, err := exec.Command("bash", "-n", filepath.Join(root, "scripts/planned-candidate-acceptance.sh")).CombinedOutput(); err != nil {
+		t.Fatalf("acceptance shell syntax: %s %v", output, err)
 	}
 }

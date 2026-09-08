@@ -39,7 +39,7 @@ func TestDecodeReleaseManifestAcceptsOnlyPinnedOfficialImagesAndFixedComposeTarg
 		t.Fatalf("legacy release = %#v, error = %v", legacyRelease, err)
 	}
 
-	newerProtocol := []byte(strings.Replace(string(manifest), "\"minimum_updater_protocol\": 2", "\"minimum_updater_protocol\": 3", 1))
+	newerProtocol := []byte(strings.Replace(string(manifest), "\"minimum_updater_protocol\": 2", "\"minimum_updater_protocol\": 5", 1))
 	if _, err := tufclient.DecodeReleaseManifest(newerProtocol, []byte("services: {}\n"), versionDocument); err == nil || !strings.Contains(err.Error(), "current protocol") {
 		t.Fatalf("newer protocol error = %v", err)
 	}

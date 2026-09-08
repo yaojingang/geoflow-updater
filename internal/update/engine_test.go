@@ -154,16 +154,16 @@ func TestEngineUsesAFreshContextForCompensationAfterTheOperationIsCanceled(t *te
 	}
 }
 
-func TestEngineRequiescesServicesBeforeRollbackAfterVerificationFails(t *testing.T) {
+func TestEnginePreservesNewWritesAfterVerificationFails(t *testing.T) {
 	t.Parallel()
 
 	deployment := &fakeDeployment{failAt: "verify"}
 	result := (update.Engine{Deployment: deployment}).Run(context.Background(), "primary", nil)
 
-	if result.Status != update.StatusFailed || !strings.Contains(result.Error, "verify rolled back release") {
+	if result.Status != update.StatusRecoveryRequired || !strings.Contains(result.Error, "verify failed") {
 		t.Fatalf("result = %#v", result)
 	}
-	want := []string{"resolve", "preflight", "pull", "quiesce", "backup", "migrate", "activate", "resume", "verify", "quiesce", "rollback", "resume", "verify"}
+	want := []string{"resolve", "preflight", "pull", "quiesce", "backup", "migrate", "activate", "resume", "verify"}
 	if !reflect.DeepEqual(deployment.calls, want) {
 		t.Fatalf("calls = %#v, want %#v", deployment.calls, want)
 	}

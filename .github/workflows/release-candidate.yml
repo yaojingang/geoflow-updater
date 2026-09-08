@@ -161,6 +161,10 @@ jobs:
         run: |
           mkdir -p candidate/targets-source/deploy "candidate/targets-source/releases/$GEOFLOW_VERSION" "candidate/targets-source/updater/$UPDATER_VERSION"
           cp assets/docker-compose.managed.yml candidate/targets-source/deploy/docker-compose.managed.yml
+          python3 geoflow/deployment/generate-upgrade-plan.py --check
+          cp geoflow/deployment/upgrade-plan.json "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json"
+          plan_strategy="$(jq -er '.strategy' geoflow/deployment/upgrade-plan.json)"
+          case "$plan_strategy" in maintenance) minimum_protocol=3 ;; online) minimum_protocol=4 ;; *) exit 1 ;; esac
           cp geoflow/version.json "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json"
           cp candidate/dist/geoflow-updater_*.tar.gz candidate/dist/checksums.txt "candidate/targets-source/updater/$UPDATER_VERSION/"
           jq -n \
@@ -174,7 +178,9 @@ jobs:
             --arg redis_7_image "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf" \
             --arg redis_8_image "redis@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576" \
             --arg version_target "releases/$GEOFLOW_VERSION/version.json" \
-            '{schema_version:2,minimum_updater_protocol:2,release_sequence:$sequence,version:$version,source_commit:$source_commit,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml",version_target:$version_target}' \
+            --arg upgrade_plan_target "releases/$GEOFLOW_VERSION/upgrade-plan.json" \
+            --argjson minimum_protocol "$minimum_protocol" \
+            '{schema_version:3,minimum_updater_protocol:$minimum_protocol,release_sequence:$sequence,version:$version,source_commit:$source_commit,app_image:$app_image,web_image:$web_image,postgres_images:{"16":$postgres_16_image,"18":$postgres_18_image},redis_images:{"7":$redis_7_image,"8":$redis_8_image},compose_target:"deploy/docker-compose.managed.yml",version_target:$version_target,upgrade_plan_target:$upgrade_plan_target}' \
             > candidate/targets-source/releases/current.json
           mkdir -p candidate/tuf
           cp -R tuf/repository candidate/tuf/repository
@@ -207,7 +213,8 @@ jobs:
             --arg release_manifest_sha256 "$(sha256sum candidate/targets-source/releases/current.json | cut -d ' ' -f 1)" \
             --arg compose_sha256 "$(sha256sum candidate/targets-source/deploy/docker-compose.managed.yml | cut -d ' ' -f 1)" \
             --arg version_document_sha256 "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json" | cut -d ' ' -f 1)" \
-            '{schema_version:1,candidate_run_id:$candidate_run_id,updater:{version:$updater_version,commit:$updater_commit,archives:{"linux-amd64":$amd64_sha256,"linux-arm64":$arm64_sha256}},geoflow:{version:$geoflow_version,commit:$geoflow_commit,release_sequence:$release_sequence,app_digest:$app_digest,web_digest:$web_digest},targets:{release_manifest_sha256:$release_manifest_sha256,compose_sha256:$compose_sha256,version_document_sha256:$version_document_sha256}}' \
+            --arg upgrade_plan_sha256 "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json" | cut -d ' ' -f 1)" \
+            '{schema_version:1,candidate_run_id:$candidate_run_id,updater:{version:$updater_version,commit:$updater_commit,archives:{"linux-amd64":$amd64_sha256,"linux-arm64":$arm64_sha256}},geoflow:{version:$geoflow_version,commit:$geoflow_commit,release_sequence:$release_sequence,app_digest:$app_digest,web_digest:$web_digest},targets:{release_manifest_sha256:$release_manifest_sha256,compose_sha256:$compose_sha256,version_document_sha256:$version_document_sha256,upgrade_plan_sha256:$upgrade_plan_sha256}}' \
             > candidate/candidate.json
           jq . candidate/candidate.json
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

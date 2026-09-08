@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -20,6 +21,7 @@ import (
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/operation"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
+	"github.com/yaojingang/geoflow-updater/internal/update"
 )
 
 var (
@@ -89,7 +91,11 @@ func (server Server) instanceRequest(response http.ResponseWriter, request *http
 	switch endpoint {
 	case "status":
 		server.instanceStatus(response, request, instanceID)
+	case "plan":
+		server.preview(response, request, instanceID)
 	case "updates":
+		server.startUpdate(response, request, instanceID)
+	case "switch-backs":
 		if request.Method != http.MethodPost {
 			writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
 			return
@@ -99,7 +105,11 @@ func (server Server) instanceRequest(response http.ResponseWriter, request *http
 			return
 		}
 		server.startMutationOperation(response, request, instanceID, authorization.ScopeUpdate, func() (operation.Operation, error) {
-			return server.Operations.StartUpdate(instanceID)
+			planned, ok := server.Operations.(plannedOperations)
+			if !ok {
+				return operation.Operation{}, errors.New("code switch-back is unavailable")
+			}
+			return planned.StartSwitchBack(instanceID)
 		})
 	case "backups":
 		if request.Method == http.MethodGet {
@@ -413,7 +423,7 @@ func ListenAndServe(ctx context.Context, socketPath string, handler http.Handler
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      30 * time.Minute,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    8 * 1024,
 	}
@@ -469,4 +479,114 @@ func writeError(response http.ResponseWriter, status int, code string) {
 func writeJSON(response http.ResponseWriter, status int, payload any) {
 	response.WriteHeader(status)
 	_ = json.NewEncoder(response).Encode(payload)
+}
+
+type plannedOperations interface {
+	Preview(context.Context, string) (update.PlanSummary, error)
+	StartUpdateWithOptions(string, update.Options) (operation.Operation, error)
+	StartSwitchBack(string) (operation.Operation, error)
+}
+
+func (server Server) preview(response http.ResponseWriter, request *http.Request, instanceID string) {
+	if request.Method != http.MethodGet {
+		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	planned, ok := server.Operations.(plannedOperations)
+	if !ok {
+		writeError(response, http.StatusServiceUnavailable, "plan_unavailable")
+		return
+	}
+	plan, err := planned.Preview(request.Context(), instanceID)
+	if err != nil {
+		writeError(response, http.StatusServiceUnavailable, "plan_failed")
+		return
+	}
+	writeJSON(response, http.StatusOK, plan)
+}
+
+func (server Server) startUpdate(response http.ResponseWriter, request *http.Request, instanceID string) {
+	if request.Method != http.MethodPost {
+		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	request.Body = http.MaxBytesReader(response, request.Body, 4096)
+	contents, err := io.ReadAll(request.Body)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var options update.Options
+	if len(contents) != 0 {
+		// Require an object and native JSON types; null never authorizes an option.
+		fields := map[string]json.RawMessage{}
+		decoder := json.NewDecoder(bytes.NewReader(contents))
+		opening, err := decoder.Token()
+		if err != nil || opening != json.Delim('{') {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		for decoder.More() {
+			token, err := decoder.Token()
+			key, ok := token.(string)
+			if err != nil || !ok {
+				writeError(response, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			if _, duplicate := fields[key]; duplicate {
+				writeError(response, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			var value json.RawMessage
+			if err := decoder.Decode(&value); err != nil {
+				writeError(response, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			fields[key] = value
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
+
+		for key, value := range fields {
+			switch key {
+			case "allow_maintenance":
+				if string(value) != "true" && string(value) != "false" {
+					writeError(response, http.StatusBadRequest, "invalid_request")
+					return
+				}
+			case "expected_plan_sha256":
+				var hash string
+				if json.Unmarshal(value, &hash) != nil || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(hash) {
+					writeError(response, http.StatusBadRequest, "invalid_request")
+					return
+				}
+			default:
+				writeError(response, http.StatusBadRequest, "invalid_request")
+				return
+			}
+		}
+		if json.Unmarshal(contents, &options) != nil {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
+	}
+	server.startMutationOperation(response, request, instanceID, authorization.ScopeUpdate, func() (operation.Operation, error) {
+		if len(contents) == 0 {
+			return server.Operations.StartUpdate(instanceID)
+		}
+		if planned, ok := server.Operations.(plannedOperations); ok {
+			return planned.StartUpdateWithOptions(instanceID, options)
+		}
+		if len(contents) != 0 {
+			return operation.Operation{}, errors.New("planned updates are unavailable")
+		}
+		return server.Operations.StartUpdate(instanceID)
+	})
 }

@@ -222,6 +222,12 @@ func loadConfig(path string) (instance.Config, error) {
 		return instance.Config{}, errors.New("required instance fields are missing")
 	}
 
+	if config.Layout != "" && config.Layout != "blue-green" {
+		return instance.Config{}, errors.New("unsupported deployment layout")
+	}
+	if config.Layout == "blue-green" && (config.ActiveSlot != "blue" && config.ActiveSlot != "green") {
+		return instance.Config{}, errors.New("invalid active slot")
+	}
 	return config, nil
 }
 
@@ -444,6 +450,9 @@ func validateManagedDeployment(ctx context.Context, probe Probe, stateDir string
 	if _, err := probe.CommandOutput(ctx, "docker", append(composeArguments, "config", "--quiet")...); err != nil {
 		return fmt.Errorf("Compose configuration check failed: %w", err)
 	}
+	if config.Layout == "blue-green" {
+		return validateSlots(ctx, probe, instanceDir, config)
+	}
 	containers := map[string]string{
 		"geoflow-postgres-prod":        "healthy",
 		"geoflow-redis-prod":           "healthy",
@@ -499,4 +508,84 @@ func (RealProbe) CommandOutput(ctx context.Context, name string, arguments ...st
 	}
 
 	return string(output), err
+}
+
+// Inspect all declared services, including domain queues and every Compose replica.
+func validateSlots(ctx context.Context, probe Probe, instanceDir string, config instance.Config) error {
+	if filepath.Dir(config.ComposeFile) != filepath.Join(instanceDir, "slots", config.ActiveSlot) {
+		return errors.New("active slot paths mismatch")
+	}
+	for _, files := range [][2]string{{config.ComposeFile, config.EnvironmentFile}, {config.InfraComposeFile, config.InfraEnvironmentFile}} {
+		for _, path := range files {
+			if err := validateOwnedPath(instanceDir, path); err != nil {
+				return err
+			}
+			if err := regularFile(path); err != nil {
+				return err
+			}
+		}
+		data, err := os.ReadFile(files[0])
+		if err != nil {
+			return err
+		}
+		var spec struct {
+			Services map[string]struct {
+				Healthcheck any `yaml:"healthcheck"`
+			} `yaml:"services"`
+		}
+		if err := yaml.Unmarshal(data, &spec); err != nil {
+			return err
+		}
+		args := []string{"compose", "--env-file", filepath.Join(config.Root, ".env.prod"), "--env-file", files[1], "-f", files[0]}
+		if _, err := probe.CommandOutput(ctx, "docker", append(args, "config", "--quiet")...); err != nil {
+			return err
+		}
+		for name, definition := range spec.Services {
+			if name == "init" {
+				continue
+			}
+			if !regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`).MatchString(name) {
+				return errors.New("invalid service name")
+			}
+			output, err := probe.CommandOutput(ctx, "docker", append(args, "ps", "--all", "--quiet", name)...)
+			if err != nil {
+				return err
+			}
+			ids := strings.Fields(output)
+			if len(ids) == 0 {
+				return fmt.Errorf("required service %s is absent", name)
+			}
+			for _, id := range ids {
+				if len(id) < 12 || len(id) > 64 || strings.Trim(id, "0123456789abcdef") != "" {
+					return errors.New("invalid container identity")
+				}
+			}
+			output, err = probe.CommandOutput(ctx, "docker", append([]string{"inspect", "--format={{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"}, ids...)...)
+			if err != nil {
+				return err
+			}
+			lines := strings.Split(strings.TrimSpace(output), "\n")
+			if len(lines) != len(ids) {
+				return errors.New("missing container inspection")
+			}
+			for _, line := range lines {
+				if line != "running|healthy" && !(definition.Healthcheck == nil && line == "running|none") {
+					return fmt.Errorf("service %s is not ready", name)
+				}
+			}
+		}
+	}
+	args := []string{"compose", "--env-file", filepath.Join(config.Root, ".env.prod"), "--env-file", config.InfraEnvironmentFile, "-f", config.InfraComposeFile, "exec", "-T", "edge", "wget", "-q", "-T", "3", "-O", "-", "http://127.0.0.1:8081/release"}
+	output, err := probe.CommandOutput(ctx, "docker", args...)
+	if err != nil {
+		return err
+	}
+	var identity struct {
+		Slot     string `json:"slot"`
+		Sequence uint64 `json:"sequence"`
+	}
+	if err := json.Unmarshal([]byte(output), &identity); err != nil || identity.Slot != config.ActiveSlot || identity.Sequence != config.ReleaseSequence {
+		return errors.New("ingress identity differs from active slot")
+	}
+	return nil
 }

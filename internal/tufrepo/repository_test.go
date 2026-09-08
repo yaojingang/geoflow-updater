@@ -82,10 +82,11 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		t.Fatalf("release = %#v", release)
 	}
 
+	mustWrite(t, filepath.Join(targetsDir, "releases", "2.4.1", "upgrade-plan.json"), []byte(testUpgradePlan))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "2.4.1", "version.json"), []byte(`{"version":"2.4.1"}`))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(`{
-  "schema_version": 2,
-  "minimum_updater_protocol": 2,
+  "schema_version": 3,
+  "minimum_updater_protocol": 3,
   "release_sequence": 18,
   "version": "2.4.1",
   "source_commit": "`+strings.Repeat("b", 40)+`",
@@ -94,6 +95,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
   "postgres_images": {"16":"pgvector/pgvector@sha256:`+strings.Repeat("7", 64)+`","18":"pgvector/pgvector@sha256:`+strings.Repeat("8", 64)+`"},
   "redis_images": {"7":"redis@sha256:`+strings.Repeat("9", 64)+`","8":"redis@sha256:`+strings.Repeat("a", 64)+`"},
   "compose_target": "deploy/docker-compose.managed.yml",
+  "upgrade_plan_target": "releases/2.4.1/upgrade-plan.json",
   "version_target": "releases/2.4.1/version.json"
 }`))
 	if err := tufrepo.Publish(tufrepo.PublishOptions{
@@ -118,10 +120,11 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 	if release.Sequence != 18 || release.Version != "2.4.1" {
 		t.Fatalf("published release = %#v", release)
 	}
+	mustWrite(t, filepath.Join(targetsDir, "releases", "2.4.2", "upgrade-plan.json"), []byte(testUpgradePlan))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "2.4.2", "version.json"), []byte(`{"version":"2.4.2"}`))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(`{
-  "schema_version": 2,
-  "minimum_updater_protocol": 2,
+  "schema_version": 3,
+  "minimum_updater_protocol": 3,
   "release_sequence": 17,
   "version": "2.4.2",
   "source_commit": "`+strings.Repeat("b", 40)+`",
@@ -130,6 +133,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
   "postgres_images": {"16":"pgvector/pgvector@sha256:`+strings.Repeat("7", 64)+`","18":"pgvector/pgvector@sha256:`+strings.Repeat("8", 64)+`"},
   "redis_images": {"7":"redis@sha256:`+strings.Repeat("9", 64)+`","8":"redis@sha256:`+strings.Repeat("a", 64)+`"},
   "compose_target": "deploy/docker-compose.managed.yml",
+  "upgrade_plan_target": "releases/2.4.2/upgrade-plan.json",
   "version_target": "releases/2.4.2/version.json"
 }`))
 	rollbackErr := tufrepo.Publish(tufrepo.PublishOptions{
@@ -144,8 +148,8 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
 		t.Fatalf("Publish() rollback error = %v", rollbackErr)
 	}
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(`{
-  "schema_version": 2,
-  "minimum_updater_protocol": 2,
+  "schema_version": 3,
+  "minimum_updater_protocol": 3,
   "release_sequence": 18,
   "version": "2.4.1",
   "source_commit": "`+strings.Repeat("b", 40)+`",
@@ -154,6 +158,7 @@ func TestInitializeCreatesTwoOfThreeRootAndConsumableRepository(t *testing.T) {
   "postgres_images": {"16":"pgvector/pgvector@sha256:`+strings.Repeat("7", 64)+`","18":"pgvector/pgvector@sha256:`+strings.Repeat("8", 64)+`"},
   "redis_images": {"7":"redis@sha256:`+strings.Repeat("9", 64)+`","8":"redis@sha256:`+strings.Repeat("a", 64)+`"},
   "compose_target": "deploy/docker-compose.managed.yml",
+  "upgrade_plan_target": "releases/2.4.1/upgrade-plan.json",
   "version_target": "releases/2.4.1/version.json"
 }`))
 
@@ -277,10 +282,11 @@ func TestPublishSkipsOrphanedImmutableMetadataVersions(t *testing.T) {
 
 func mustWriteReleaseManifest(t *testing.T, targetsDir string, sequence int, version string, appDigest string, webDigest string) {
 	t.Helper()
+	mustWrite(t, filepath.Join(targetsDir, "releases", version, "upgrade-plan.json"), []byte(testUpgradePlan))
 	mustWrite(t, filepath.Join(targetsDir, "releases", version, "version.json"), []byte(fmt.Sprintf(`{"version":%q}`, version)))
 	mustWrite(t, filepath.Join(targetsDir, "releases", "current.json"), []byte(fmt.Sprintf(`{
-  "schema_version": 2,
-  "minimum_updater_protocol": 2,
+  "schema_version": 3,
+  "minimum_updater_protocol": 3,
   "release_sequence": %d,
   "version": %q,
   "source_commit": "%s",
@@ -289,6 +295,7 @@ func mustWriteReleaseManifest(t *testing.T, targetsDir string, sequence int, ver
   "postgres_images": {"16":"pgvector/pgvector@sha256:%s","18":"pgvector/pgvector@sha256:%s"},
   "redis_images": {"7":"redis@sha256:%s","8":"redis@sha256:%s"},
   "compose_target": "deploy/docker-compose.managed.yml",
+  "upgrade_plan_target": "releases/%s/upgrade-plan.json",
   "version_target": "releases/%s/version.json"
 }`,
 		sequence,
@@ -300,6 +307,7 @@ func mustWriteReleaseManifest(t *testing.T, targetsDir string, sequence int, ver
 		strings.Repeat("6", 64),
 		strings.Repeat("7", 64),
 		strings.Repeat("8", 64),
+		version,
 		version,
 	)))
 }
@@ -338,5 +346,92 @@ func assertNoPrivateKeys(t *testing.T, root string) {
 	})
 	if err != nil {
 		t.Fatalf("inspect repository for private keys: %v", err)
+	}
+}
+
+const testUpgradePlan = `{"schema_version":1,"strategy":"maintenance","allowed_sources":[],"migrations":[],"compatibility":{"schema":false,"queue":false,"cache":false,"storage":false},"steps":[{"id":"migrate","kind":"migrate","phase":"apply","timeout_seconds":600,"online":false}]}`
+
+func TestPublisherRejectsMissingTamperedOrUnsupportedUpgradePlansBeforeSigning(t *testing.T) {
+	for _, scenario := range []string{"missing-plan", "tampered-plan", "wrong-target", "unsupported-protocol", "online-protocol-too-low", "legacy-new-release"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			targets := filepath.Join(root, "source")
+			repo := filepath.Join(root, "repo")
+			keys := filepath.Join(root, "keys")
+			mustWrite(t, filepath.Join(targets, "deploy", "docker-compose.managed.yml"), []byte("services: {}\n"))
+			mustWriteReleaseManifest(t, targets, 17, "2.4.0", "1", "2")
+			if err := tufrepo.Initialize(tufrepo.InitializeOptions{KeysDir: keys, RepositoryDir: repo, TargetsDir: targets}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(filepath.Join(repo, "metadata", "timestamp.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWriteReleaseManifest(t, targets, 18, "2.4.1", "3", "4")
+			manifestPath := filepath.Join(targets, "releases", "current.json")
+			manifest, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planPath := filepath.Join(targets, "releases", "2.4.1", "upgrade-plan.json")
+			switch scenario {
+			case "missing-plan":
+				if err := os.Remove(planPath); err != nil {
+					t.Fatal(err)
+				}
+			case "tampered-plan":
+				mustWrite(t, planPath, []byte(strings.Replace(testUpgradePlan, `"kind":"migrate"`, `"kind":"shell"`, 1)))
+			case "wrong-target":
+				manifest = []byte(strings.Replace(string(manifest), "releases/2.4.1/upgrade-plan.json", "releases/2.4.0/upgrade-plan.json", 1))
+			case "unsupported-protocol":
+				manifest = []byte(strings.Replace(string(manifest), `"minimum_updater_protocol": 3`, `"minimum_updater_protocol": 99`, 1))
+			case "online-protocol-too-low":
+				plan := strings.ReplaceAll(testUpgradePlan, "false", "true")
+				plan = strings.Replace(plan, `"strategy":"maintenance"`, `"strategy":"online"`, 1)
+				plan = strings.Replace(plan, `"allowed_sources":[]`, `"allowed_sources":[17]`, 1)
+				mustWrite(t, planPath, []byte(plan))
+			case "legacy-new-release":
+				manifest = []byte(strings.Replace(string(manifest), `"schema_version": 3`, `"schema_version": 2`, 1))
+			}
+			mustWrite(t, manifestPath, manifest)
+			if err := tufrepo.Publish(tufrepo.PublishOptions{RepositoryDir: repo, TargetsDir: targets, TargetsKeyPath: filepath.Join(keys, "targets.pem"), SnapshotKeyPath: filepath.Join(keys, "snapshot.pem"), TimestampKeyPath: filepath.Join(keys, "timestamp.pem")}); err == nil {
+				t.Fatal("unsafe release was published")
+			}
+			after, err := os.ReadFile(filepath.Join(repo, "metadata", "timestamp.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(before) != string(after) {
+				t.Fatal("rejected release changed trusted timestamp")
+			}
+		})
+	}
+}
+
+func TestSignedUpgradePlanTamperingIsRejectedByClient(t *testing.T) {
+	root := t.TempDir()
+	targets := filepath.Join(root, "source")
+	repo := filepath.Join(root, "repo")
+	keys := filepath.Join(root, "keys")
+	mustWrite(t, filepath.Join(targets, "deploy", "docker-compose.managed.yml"), []byte("services: {}\n"))
+	mustWriteReleaseManifest(t, targets, 17, "2.4.0", "1", "2")
+	if err := tufrepo.Initialize(tufrepo.InitializeOptions{KeysDir: keys, RepositoryDir: repo, TargetsDir: targets}); err != nil {
+		t.Fatal(err)
+	}
+	rootBytes, err := os.ReadFile(filepath.Join(repo, "metadata", "root.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".upgrade-plan.json") {
+			_, _ = w.Write([]byte(strings.Replace(testUpgradePlan, "maintenance", "online", 1)))
+			return
+		}
+		http.FileServer(http.Dir(repo)).ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	_, err = (tufclient.Client{MetadataURL: server.URL + "/metadata", TargetsURL: server.URL + "/targets", CacheDir: filepath.Join(root, "cache"), TrustedRoot: rootBytes}).Current(context.Background())
+	if err == nil {
+		t.Fatal("tampered signed plan was accepted")
 	}
 }

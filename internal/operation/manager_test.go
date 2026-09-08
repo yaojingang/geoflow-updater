@@ -514,7 +514,7 @@ func TestManagerLeavesDeploymentStoppedWhenManualRollbackFails(t *testing.T) {
 	}
 }
 
-func TestManagerRequiresRecoveryWhenFailedQuiesceCannotResume(t *testing.T) {
+func TestManagerPreservesMaintenanceWhenRollbackQuiesceFails(t *testing.T) {
 	t.Parallel()
 
 	deployment := &fakeDeployment{
@@ -530,7 +530,7 @@ func TestManagerRequiresRecoveryWhenFailedQuiesceCannotResume(t *testing.T) {
 	if current.Status != StatusRecoveryRequired {
 		t.Fatalf("rollback status = %s, want recovery_required", current.Status)
 	}
-	want := []string{"validate", "quiesce", "resume"}
+	want := []string{"validate", "quiesce"}
 	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}

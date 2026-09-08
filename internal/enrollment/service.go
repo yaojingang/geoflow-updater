@@ -1,6 +1,7 @@
 package enrollment
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -98,6 +99,41 @@ func (service Service) Enroll(ctx context.Context, request Request) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
+	return service.register(root, infrastructure, release, false)
+}
+
+// ProvisionFresh only registers the updater-owned empty layout created by Install.
+func (service Service) ProvisionFresh(request Request, release managed.Release) (Result, error) {
+	if request.InstanceID != "primary" {
+		return Result{}, errors.New("fresh installation supports only primary")
+	}
+	root, err := canonicalRoot(request.Root)
+	if err != nil {
+		return Result{}, err
+	}
+	access := service.RootAccess
+	if access == nil {
+		access = validateServiceSandboxRoot
+	}
+	if err := access(root); err != nil {
+		return Result{}, err
+	}
+	if err := release.Validate(); err != nil {
+		return Result{}, err
+	}
+	if err := validateLayout(root); err != nil {
+		return Result{}, err
+	}
+	infrastructure := infrastructureConfig{PostgresMajor: "18", RedisMajor: "8", PostgresDataDir: filepath.Join(root, "docker-data", "prod", "postgres"), PostgresContainerDataDir: "/var/lib/postgresql"}
+	entries, err := os.ReadDir(infrastructure.PostgresDataDir)
+	if err != nil || len(entries) != 0 {
+		return Result{}, errors.New("fresh PostgreSQL directory must be empty")
+	}
+	return service.register(root, infrastructure, release, true)
+}
+
+func (service Service) register(root string, infrastructure infrastructureConfig, release managed.Release, fresh bool) (Result, error) {
+	request := Request{InstanceID: "primary", Root: root}
 	postgresImage, redisImage, err := release.InfrastructureImages(infrastructure.PostgresMajor, infrastructure.RedisMajor)
 	if err != nil {
 		return Result{}, err
@@ -113,19 +149,22 @@ func (service Service) Enroll(ctx context.Context, request Request) (Result, err
 	}
 	instanceDir := filepath.Join(stateDir, "instances", request.InstanceID)
 	if _, err := os.Stat(instanceDir); err == nil {
-		return Result{}, fmt.Errorf("instance %q is already enrolled", request.InstanceID)
+		entries, readErr := os.ReadDir(instanceDir)
+		if !fresh || readErr != nil || !freshStateFiles(entries) {
+			return Result{}, fmt.Errorf("instance %q is already enrolled", request.InstanceID)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Result{}, fmt.Errorf("inspect instance state: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(instanceDir), 0o750); err != nil {
 		return Result{}, fmt.Errorf("create instances state: %w", err)
 	}
-	if err := os.Mkdir(instanceDir, 0o750); err != nil {
+	if err := os.Mkdir(instanceDir, 0o750); err != nil && !(fresh && errors.Is(err, os.ErrExist)) {
 		return Result{}, fmt.Errorf("create instance state: %w", err)
 	}
 	committed := false
 	defer func() {
-		if !committed {
+		if !committed && !fresh {
 			_ = os.RemoveAll(instanceDir)
 		}
 	}()
@@ -147,9 +186,34 @@ func (service Service) Enroll(ctx context.Context, request Request) (Result, err
 	}
 
 	token, err := service.controlToken()
-	if err != nil {
-		return Result{}, fmt.Errorf("generate control token: %w", err)
+	if fresh {
+		if existing, readErr := os.ReadFile(config.ControlToken); readErr == nil {
+			token = strings.TrimSpace(string(existing))
+			if !regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`).MatchString(token) {
+				token, err = service.controlToken()
+				if err != nil {
+					return Result{}, err
+				}
+			}
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			return Result{}, readErr
+		}
 	}
+	if err != nil {
+		return Result{}, err
+	}
+	if fresh {
+		if existing, readErr := os.ReadFile(filepath.Join(instanceDir, "instance.yml")); readErr == nil {
+			var saved instance.Config
+			if yaml.Unmarshal(existing, &saved) != nil || saved.ID != config.ID || saved.Root != config.Root || saved.Version != config.Version || saved.ReleaseSequence != config.ReleaseSequence || saved.Layout != "" || saved.ComposeFile != config.ComposeFile || saved.EnvironmentFile != config.EnvironmentFile || saved.ControlToken != config.ControlToken {
+				return Result{}, errors.New("prepared enrollment identity changed")
+			}
+			config.EnrolledAt = saved.EnrolledAt
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			return Result{}, readErr
+		}
+	}
+
 	instanceYAML, err := yaml.Marshal(config)
 	if err != nil {
 		return Result{}, fmt.Errorf("encode instance config: %w", err)
@@ -166,7 +230,29 @@ func (service Service) Enroll(ctx context.Context, request Request) (Result, err
 		{filepath.Join(instanceDir, "instance.yml"), instanceYAML, 0o640},
 	}
 	for _, file := range files {
-		if err := writeExclusive(file.path, file.data, file.mode); err != nil {
+		if fresh {
+			if existing, err := os.ReadFile(file.path); err == nil {
+				if bytes.Equal(existing, file.data) {
+					continue
+				}
+				// Preparation owns these artifacts before any application is started.
+				// A truncated legacy write can be safely replaced by the intended bytes.
+				if file.path != config.ControlToken && !bytes.HasPrefix(file.data, existing) {
+					return Result{}, errors.New("prepared enrollment file changed")
+				}
+				if err := writeFreshAtomic(file.path, file.data, file.mode); err != nil {
+					return Result{}, err
+				}
+				continue
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return Result{}, err
+			}
+		}
+		writer := writeExclusive
+		if fresh {
+			writer = writeFreshAtomic
+		}
+		if err := writer(file.path, file.data, file.mode); err != nil {
 			return Result{}, err
 		}
 	}
@@ -465,4 +551,49 @@ func (service Service) controlToken() (string, error) {
 	}
 
 	return base64.RawURLEncoding.EncodeToString(bytes), nil
+}
+
+func ValidateRootAccess(root string) error { return validateServiceSandboxRoot(filepath.Clean(root)) }
+
+func freshStateFiles(entries []os.DirEntry) bool {
+	allowed := map[string]bool{"operation.lock": true, "installation.json": true, "control.token": true, "docker-compose.managed.yml": true, "release.env": true, "instance.yml": true}
+	for _, entry := range entries {
+		ownTemporary := regexp.MustCompile(`^\.geoflow-updater-(?:enroll-)?[0-9]+$`).MatchString(entry.Name())
+		if (!allowed[entry.Name()] && !ownTemporary) || entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func writeFreshAtomic(path string, data []byte, mode os.FileMode) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".geoflow-updater-enroll-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if err := file.Chmod(mode); err != nil {
+		file.Close()
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }

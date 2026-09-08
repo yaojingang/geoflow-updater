@@ -37,6 +37,7 @@ type releaseManifest struct {
 	RedisImages            map[string]string `json:"redis_images"`
 	ComposeTarget          string            `json:"compose_target"`
 	VersionTarget          string            `json:"version_target,omitempty"`
+	UpgradePlanTarget      string            `json:"upgrade_plan_target,omitempty"`
 }
 
 type Client struct {
@@ -106,7 +107,14 @@ func (client Client) Current(ctx context.Context) (managed.Release, error) {
 		}
 	}
 
-	return DecodeReleaseManifest(manifestBytes, composeBytes, versionBytes)
+	var planBytes []byte
+	if manifest.UpgradePlanTarget != "" {
+		planBytes, err = downloadTarget(trustedUpdater, manifest.UpgradePlanTarget, managed.UpgradePlanLimit)
+		if err != nil {
+			return managed.Release{}, err
+		}
+	}
+	return DecodeReleaseBundle(manifestBytes, composeBytes, versionBytes, planBytes)
 }
 
 func sameOriginRedirects(baseURLs ...string) func(*http.Request, []*http.Request) error {
@@ -131,31 +139,34 @@ func sameOriginRedirects(baseURLs ...string) func(*http.Request, []*http.Request
 }
 
 func DecodeReleaseManifest(manifestBytes []byte, composeBytes []byte, versionDocuments ...[]byte) (managed.Release, error) {
+	if len(versionDocuments) > 1 {
+		return managed.Release{}, errors.New("only one signed version document is allowed")
+	}
+	var version []byte
+	if len(versionDocuments) == 1 {
+		version = versionDocuments[0]
+	}
+	return DecodeReleaseBundle(manifestBytes, composeBytes, version, nil)
+}
+
+func DecodeReleaseBundle(manifestBytes, composeBytes, version, plan []byte) (managed.Release, error) {
 	manifest, err := decodeManifest(manifestBytes)
 	if err != nil {
 		return managed.Release{}, err
 	}
+	if (manifest.UpgradePlanTarget == "") != (len(plan) == 0) {
+		return managed.Release{}, errors.New("signed upgrade plan does not match the release manifest")
+	}
 	release := managed.Release{
-		Sequence:               manifest.ReleaseSequence,
-		MinimumUpdaterProtocol: manifest.MinimumUpdaterProtocol,
-		Version:                manifest.Version,
-		SourceCommit:           manifest.SourceCommit,
-		AppImage:               manifest.AppImage,
-		WebImage:               manifest.WebImage,
-		PostgresImages:         manifest.PostgresImages,
-		RedisImages:            manifest.RedisImages,
-		ComposeTemplate:        composeBytes,
-	}
-	if len(versionDocuments) > 1 {
-		return managed.Release{}, errors.New("only one signed version document is allowed")
-	}
-	if len(versionDocuments) == 1 {
-		release.VersionDocument = versionDocuments[0]
+		Sequence: manifest.ReleaseSequence, MinimumUpdaterProtocol: manifest.MinimumUpdaterProtocol,
+		Version: manifest.Version, SourceCommit: manifest.SourceCommit,
+		AppImage: manifest.AppImage, WebImage: manifest.WebImage,
+		PostgresImages: manifest.PostgresImages, RedisImages: manifest.RedisImages,
+		ComposeTemplate: composeBytes, VersionDocument: version, UpgradePlan: plan,
 	}
 	if err := release.Validate(); err != nil {
 		return managed.Release{}, fmt.Errorf("validate release manifest: %w", err)
 	}
-
 	return release, nil
 }
 
@@ -175,7 +186,7 @@ func decodeManifest(contents []byte) (releaseManifest, error) {
 			return releaseManifest{}, errors.New("legacy release manifest declares an updater protocol")
 		}
 		manifest.MinimumUpdaterProtocol = 1
-	case 2:
+	case 2, 3:
 		if manifest.MinimumUpdaterProtocol < 2 {
 			return releaseManifest{}, errors.New("Phase C release manifest requires updater protocol 2")
 		}
@@ -187,6 +198,13 @@ func decodeManifest(contents []byte) (releaseManifest, error) {
 		}
 	default:
 		return releaseManifest{}, fmt.Errorf("unsupported release manifest schema %d", manifest.SchemaVersion)
+	}
+	if manifest.SchemaVersion == 3 {
+		if manifest.MinimumUpdaterProtocol < 3 || manifest.UpgradePlanTarget != "releases/"+manifest.Version+"/upgrade-plan.json" {
+			return releaseManifest{}, errors.New("release upgrade plan target or protocol is invalid")
+		}
+	} else if manifest.UpgradePlanTarget != "" || manifest.MinimumUpdaterProtocol > 2 {
+		return releaseManifest{}, errors.New("legacy manifest cannot declare an upgrade plan protocol")
 	}
 	if manifest.ReleaseSequence == 0 || !releaseVersionPattern.MatchString(manifest.Version) {
 		return releaseManifest{}, errors.New("release manifest sequence or version is invalid")
