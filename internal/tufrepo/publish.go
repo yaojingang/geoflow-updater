@@ -17,6 +17,7 @@ import (
 
 	"github.com/theupdateframework/go-tuf/v2/metadata"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
+	"github.com/yaojingang/geoflow-updater/internal/tufclient"
 )
 
 var publicationSourceCommitPattern = regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`)
@@ -154,6 +155,7 @@ type publicationManifest struct {
 	RedisImages            map[string]string `json:"redis_images"`
 	ComposeTarget          string            `json:"compose_target"`
 	VersionTarget          string            `json:"version_target,omitempty"`
+	UpgradePlanTarget      string            `json:"upgrade_plan_target,omitempty"`
 }
 
 func validateReleaseProgression(oldTargets *metadata.Metadata[metadata.TargetsType], publishedTargetsDir string, sourceTargetsDir string) error {
@@ -166,8 +168,8 @@ func validateReleaseProgression(oldTargets *metadata.Metadata[metadata.TargetsTy
 	if err != nil {
 		return fmt.Errorf("validate release manifest target: %w", err)
 	}
-	if newManifest.SchemaVersion != 2 || newManifest.MinimumUpdaterProtocol != managed.UpdaterProtocolVersion {
-		return errors.New("new releases must use the Phase C manifest and current updater protocol")
+	if newManifest.SchemaVersion != 3 || newManifest.MinimumUpdaterProtocol < 3 || newManifest.MinimumUpdaterProtocol > managed.UpdaterProtocolVersion {
+		return errors.New("new releases must use manifest schema 3 and a supported planned updater protocol")
 	}
 	composeContents, err := os.ReadFile(filepath.Join(sourceTargetsDir, filepath.FromSlash(newManifest.ComposeTarget)))
 	if err != nil {
@@ -177,19 +179,12 @@ func validateReleaseProgression(oldTargets *metadata.Metadata[metadata.TargetsTy
 	if err != nil {
 		return fmt.Errorf("read signed version target: %w", err)
 	}
-	if err := (managed.Release{
-		Sequence:               newManifest.ReleaseSequence,
-		MinimumUpdaterProtocol: newManifest.MinimumUpdaterProtocol,
-		Version:                newManifest.Version,
-		SourceCommit:           newManifest.SourceCommit,
-		AppImage:               newManifest.AppImage,
-		WebImage:               newManifest.WebImage,
-		PostgresImages:         newManifest.PostgresImages,
-		RedisImages:            newManifest.RedisImages,
-		ComposeTemplate:        composeContents,
-		VersionDocument:        versionContents,
-	}).Validate(); err != nil {
-		return fmt.Errorf("validate managed release target: %w", err)
+	planContents, err := os.ReadFile(filepath.Join(sourceTargetsDir, filepath.FromSlash(newManifest.UpgradePlanTarget)))
+	if err != nil {
+		return fmt.Errorf("read signed upgrade plan target: %w", err)
+	}
+	if _, err := tufclient.DecodeReleaseBundle(newContents, composeContents, versionContents, planContents); err != nil {
+		return fmt.Errorf("validate managed release bundle: %w", err)
 	}
 
 	oldInfo, exists := oldTargets.Signed.Targets["releases/current.json"]
@@ -233,7 +228,7 @@ func decodePublicationManifest(contents []byte) (publicationManifest, error) {
 		}
 		return publicationManifest{}, err
 	}
-	if manifest.SchemaVersion != 1 && manifest.SchemaVersion != 2 {
+	if manifest.SchemaVersion != 1 && manifest.SchemaVersion != 2 && manifest.SchemaVersion != 3 {
 		return publicationManifest{}, errors.New("release manifest schema is invalid")
 	}
 	if manifest.SchemaVersion == 1 && manifest.MinimumUpdaterProtocol != 0 {
@@ -242,8 +237,14 @@ func decodePublicationManifest(contents []byte) (publicationManifest, error) {
 	if manifest.SchemaVersion == 2 && manifest.MinimumUpdaterProtocol < 2 {
 		return publicationManifest{}, errors.New("Phase C release manifest requires updater protocol 2")
 	}
-	if manifest.SchemaVersion == 2 && (!publicationSourceCommitPattern.MatchString(manifest.SourceCommit) || manifest.VersionTarget != "releases/"+manifest.Version+"/version.json") {
+	if manifest.SchemaVersion >= 2 && (!publicationSourceCommitPattern.MatchString(manifest.SourceCommit) || manifest.VersionTarget != "releases/"+manifest.Version+"/version.json") {
 		return publicationManifest{}, errors.New("Phase C release manifest source commit or version target is invalid")
+	}
+	if manifest.SchemaVersion == 3 && (manifest.MinimumUpdaterProtocol < 3 || manifest.UpgradePlanTarget != "releases/"+manifest.Version+"/upgrade-plan.json") {
+		return publicationManifest{}, errors.New("planned release manifest protocol or upgrade plan target is invalid")
+	}
+	if manifest.SchemaVersion < 3 && manifest.UpgradePlanTarget != "" {
+		return publicationManifest{}, errors.New("legacy release manifest cannot declare an upgrade plan")
 	}
 	if manifest.SourceCommit != "" && !publicationSourceCommitPattern.MatchString(manifest.SourceCommit) {
 		return publicationManifest{}, errors.New("release manifest source commit is invalid")

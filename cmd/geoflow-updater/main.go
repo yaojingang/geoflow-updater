@@ -52,12 +52,14 @@ func main() {
 		TrustedRoot: trust.TrustedRoot,
 	}
 	diagnostics := doctor.Service{StateDir: stateDir}
+	enroller := enrollment.Service{StateDir: stateDir, Releases: releases, ControlGroupID: updaterGroupID}
 	deployments := &deployment.Service{
-		StateDir:   stateDir,
-		Releases:   releases,
-		Doctor:     diagnostics,
-		Runner:     deployment.RealRunner{},
-		Recoveries: recovery.Store{BackupRoot: "/var/backups/geoflow-updater", Keep: 5},
+		StateDir:    stateDir,
+		Provisioner: enroller,
+		Releases:    releases,
+		Doctor:      diagnostics,
+		Runner:      deployment.RealRunner{},
+		Recoveries:  recovery.Store{BackupRoot: "/var/backups/geoflow-updater", Keep: 5},
 	}
 	operations := &operation.Manager{
 		StateDir:   stateDir,
@@ -68,14 +70,11 @@ func main() {
 	mutationAuthorization := authorization.Service{StateDir: stateDir}
 	server := agent.Server{StateDir: stateDir, Version: version, Status: diagnostics, Operations: operations, Authorization: mutationAuthorization}
 	application := cli.App{
-		Stdout:  os.Stdout,
-		Stderr:  os.Stderr,
-		Version: version,
-		Enroller: enrollment.Service{
-			StateDir:       stateDir,
-			Releases:       releases,
-			ControlGroupID: updaterGroupID,
-		},
+		Stdout:        os.Stdout,
+		Stderr:        os.Stderr,
+		Version:       version,
+		Enroller:      enroller,
+		Installer:     deployments,
 		Doctor:        diagnostics,
 		Operations:    operations,
 		Authorization: mutationAuthorization,

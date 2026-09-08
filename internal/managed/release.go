@@ -16,7 +16,7 @@ var (
 	versionPattern       = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
 )
 
-const UpdaterProtocolVersion uint64 = 2
+const UpdaterProtocolVersion uint64 = 4
 
 type Release struct {
 	Sequence               uint64
@@ -29,6 +29,7 @@ type Release struct {
 	RedisImages            map[string]string
 	ComposeTemplate        []byte
 	VersionDocument        []byte
+	UpgradePlan            []byte
 }
 
 func (release Release) Validate() error {
@@ -37,6 +38,21 @@ func (release Release) Validate() error {
 	}
 	if release.MinimumUpdaterProtocol > UpdaterProtocolVersion {
 		return errors.New("release requires a newer updater protocol")
+	}
+	if len(release.UpgradePlan) > 0 {
+		plan, err := release.Plan()
+		if err != nil {
+			return err
+		}
+		minimum := uint64(3)
+		if plan.Strategy == StrategyOnline {
+			minimum = 4
+		}
+		if release.MinimumUpdaterProtocol < minimum {
+			return errors.New("upgrade plan requires a newer minimum updater protocol")
+		}
+	} else if release.MinimumUpdaterProtocol >= 3 {
+		return errors.New("release is missing its signed upgrade plan")
 	}
 	if !versionPattern.MatchString(release.Version) {
 		return errors.New("release version must be semantic")

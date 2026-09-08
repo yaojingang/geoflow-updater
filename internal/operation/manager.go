@@ -82,6 +82,7 @@ type Manager struct {
 	Now              func() time.Time
 	Random           io.Reader
 	OperationTimeout time.Duration
+	PreviewTimeout   time.Duration
 	RecoveryTimeout  time.Duration
 	mu               sync.Mutex
 	active           map[string]string
@@ -89,8 +90,13 @@ type Manager struct {
 }
 
 func (manager *Manager) StartUpdate(instanceID string) (Operation, error) {
+	return manager.StartUpdateWithOptions(instanceID, update.Options{LegacyRequest: true})
+}
+
+func (manager *Manager) StartUpdateWithOptions(instanceID string, options update.Options) (Operation, error) {
 	return manager.start(instanceID, KindUpdate, "", func(ctx context.Context, operation *Operation, save func() error) {
-		result := manager.Engine.Run(ctx, instanceID, func(stage update.Stage) error {
+		options.OperationID = operation.ID
+		result := manager.Engine.RunWithOptions(ctx, instanceID, options, func(stage update.Stage) error {
 			if stage.Name == "backup" && stage.Status == "succeeded" && stage.Message != "" {
 				operation.RecoveryPointID = stage.Message
 			}
@@ -102,6 +108,8 @@ func (manager *Manager) StartUpdate(instanceID string) (Operation, error) {
 		switch result.Status {
 		case update.StatusSucceeded:
 			operation.Status = StatusSucceeded
+		case update.StatusRecoveryRequired:
+			operation.Status = StatusRecoveryRequired
 		case update.StatusRolledBack:
 			operation.Status = StatusRolledBack
 		default:
@@ -161,8 +169,8 @@ func (manager *Manager) StartRollback(instanceID string, recoveryPointID string)
 		}) {
 			return
 		}
-		if !manager.step(ctx, operation, save, "quiesce", func() error { return manager.Deployment.Quiesce(ctx, instanceID) }) {
-			manager.resumeAfterFailure(ctx, instanceID, operation)
+		if !manager.step(ctx, operation, save, "quiesce", func() error { return manager.Deployment.QuiesceForRecovery(ctx, instanceID, recoveryPointID) }) {
+			operation.Status = StatusRecoveryRequired
 			return
 		}
 		if !manager.step(ctx, operation, save, "rollback", func() error { return manager.Deployment.Rollback(ctx, instanceID, recoveryPointID) }) {
@@ -305,6 +313,27 @@ func (manager *Manager) Reconcile(instanceID string) error {
 }
 
 func (manager *Manager) reconcileOperation(ctx context.Context, operation *Operation) (Status, error) {
+	if reconciler, ok := manager.Deployment.(interface {
+		ReconcileRelease(context.Context, string, string) (update.Result, bool)
+	}); ok && (operation.Kind == KindUpdate || operation.Kind == KindSwitchBack) {
+		result, handled := reconciler.ReconcileRelease(ctx, operation.InstanceID, operation.ID)
+		if handled {
+			if result.Status == update.StatusSucceeded {
+				return StatusSucceeded, nil
+			}
+			if result.Status == update.StatusRolledBack {
+				if operation.Kind == KindSwitchBack {
+					return StatusSucceeded, nil
+				}
+				return StatusRolledBack, nil
+			}
+			if result.Status == update.StatusFailed {
+				return StatusFailed, nil
+			}
+			return StatusFailed, errors.New(result.Error)
+		}
+	}
+
 	resumeAndVerify := func() error {
 		if err := manager.Deployment.Resume(ctx, operation.InstanceID); err != nil {
 			return fmt.Errorf("resume after interrupted operation: %w", err)
@@ -368,6 +397,12 @@ func (manager *Manager) reconcileOperation(ctx context.Context, operation *Opera
 				return StatusSucceeded, nil
 			}
 		}
+
+		for _, stage := range operation.Stages {
+			if stage.Name == "resume" || stage.Name == "verify" || stage.Name == "succeeded" {
+				return StatusFailed, errors.New("traffic may have resumed; full data restoration requires a separate authorized recovery")
+			}
+		}
 		if operation.RecoveryPointID == "" {
 			if err := resumeAndVerify(); err != nil {
 				return StatusFailed, err
@@ -408,7 +443,7 @@ func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID stri
 		return Operation{}, ErrActive
 	}
 	current, currentErr := manager.Current(instanceID)
-	if currentErr == nil && (current.Status == StatusQueued || current.Status == StatusRunning || current.Status == StatusRecoveryRequired) {
+	if currentErr == nil && (current.Status == StatusQueued || current.Status == StatusRunning || (current.Status == StatusRecoveryRequired && kind != KindRollback)) {
 		manager.mu.Unlock()
 		return Operation{}, ErrActive
 	}

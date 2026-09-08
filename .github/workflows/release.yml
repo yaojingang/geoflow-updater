@@ -112,23 +112,43 @@ jobs:
           snapshot_version="$(jq -er '.signed.meta["snapshot.json"].version' tuf/repository/metadata/timestamp.json)"
           targets_version="$(jq -er '.signed.meta["targets.json"].version' "tuf/repository/metadata/${snapshot_version}.snapshot.json")"
           targets_metadata="tuf/repository/metadata/${targets_version}.targets.json"
+          verified_target_path() {
+            local target="$1" digest length path
+            digest="$(jq -er --arg target "$target" '.signed.targets[$target].hashes.sha256' "$targets_metadata")" || return 1
+            length="$(jq -er --arg target "$target" '.signed.targets[$target].length' "$targets_metadata")" || return 1
+            [[ "$digest" =~ ^[a-f0-9]{64}$ && "$length" =~ ^[0-9]+$ ]] || return 1
+            path="tuf/repository/targets/${target%/*}/${digest}.${target##*/}"
+            test -f "$path" && test ! -L "$path" || return 1
+            test "$(sha256sum "$path" | cut -d ' ' -f 1)" = "$digest" || return 1
+            test "$(wc -c < "$path")" -eq "$length" || return 1
+            printf '%s\n' "$path"
+          }
           current_sequence=0
           current_version=""
           manifest=""
           if jq -e '.signed.targets["releases/current.json"] != null' "$targets_metadata" >/dev/null; then
-            manifest_hash="$(jq -er '.signed.targets["releases/current.json"].hashes.sha256' "$targets_metadata")"
-            manifest="tuf/repository/targets/releases/${manifest_hash}.current.json"
+            manifest="$(verified_target_path releases/current.json)"
             current_sequence="$(jq -er '.release_sequence' "$manifest")"
             current_version="$(jq -er '.version' "$manifest")"
           fi
           resume=false
           if [ "$current_sequence" = "$RELEASE_SEQUENCE" ] && [ "$current_version" = "$GEOFLOW_VERSION" ]; then
-            test "$(jq -er '.schema_version' "$manifest")" = "2"
-            test "$(jq -er '.minimum_updater_protocol' "$manifest")" = "2"
+            test "$(jq -er '.schema_version' "$manifest")" = "3"
+            plan_target="$(jq -er '.upgrade_plan_target' "$manifest")"
+            test "$plan_target" = "releases/$GEOFLOW_VERSION/upgrade-plan.json"
+            plan="$(verified_target_path "$plan_target")"
+            test "$(jq -er '.schema_version' "$plan")" = "1"
+            case "$(jq -er '.strategy' "$plan")" in
+              maintenance) minimum_protocol=3 ;;
+              online) minimum_protocol=4 ;;
+              *) echo "Signed upgrade plan strategy is unsupported." >&2; exit 1 ;;
+            esac
+            test "$(jq -er '.minimum_updater_protocol' "$manifest")" = "$minimum_protocol"
             test "$(jq -er '.source_commit' "$manifest")" = "$GEOFLOW_SOURCE_COMMIT"
             version_target="$(jq -er '.version_target' "$manifest")"
             test "$version_target" = "releases/$GEOFLOW_VERSION/version.json"
-            jq -e --arg target "$version_target" '.signed.targets[$target] != null' "tuf/repository/metadata/${targets_version}.targets.json" >/dev/null
+            version_document="$(verified_target_path "$version_target")"
+            test "$(jq -er '.version' "$version_document")" = "$GEOFLOW_VERSION"
             for target in \
               "updater/$UPDATER_VERSION/geoflow-updater_${UPDATER_VERSION}_linux_amd64.tar.gz" \
               "updater/$UPDATER_VERSION/geoflow-updater_${UPDATER_VERSION}_linux_arm64.tar.gz" \
@@ -226,8 +246,13 @@ jobs:
           test "$(sha256sum candidate/targets-source/releases/current.json | cut -d ' ' -f 1)" = "$(jq -er '.targets.release_manifest_sha256' candidate/candidate.json)"
           test "$(sha256sum candidate/targets-source/deploy/docker-compose.managed.yml | cut -d ' ' -f 1)" = "$(jq -er '.targets.compose_sha256' candidate/candidate.json)"
           test "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json" | cut -d ' ' -f 1)" = "$(jq -er '.targets.version_document_sha256' candidate/candidate.json)"
-          test "$(jq -er '.schema_version' candidate/targets-source/releases/current.json)" = "2"
-          test "$(jq -er '.minimum_updater_protocol' candidate/targets-source/releases/current.json)" = "2"
+          test "$(jq -er '.schema_version' candidate/targets-source/releases/current.json)" = "3"
+          expected_protocol=3
+          if test "$(jq -er '.strategy' "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json")" = online; then expected_protocol=4; fi
+          test "$(jq -er '.minimum_updater_protocol' candidate/targets-source/releases/current.json)" = "$expected_protocol"
+          test "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json" | cut -d ' ' -f 1)" = "$(jq -er '.targets.upgrade_plan_sha256' candidate/candidate.json)"
+          python3 geoflow/deployment/generate-upgrade-plan.py --check
+          test "$(sha256sum geoflow/deployment/upgrade-plan.json | cut -d ' ' -f 1)" = "$(jq -er '.targets.upgrade_plan_sha256' candidate/candidate.json)"
           test "$(jq -er '.source_commit' candidate/targets-source/releases/current.json)" = "$GEOFLOW_SOURCE_COMMIT"
           test "$(sha256sum assets/docker-compose.managed.yml | cut -d ' ' -f 1)" = "$(jq -er '.targets.compose_sha256' candidate/candidate.json)"
           test "$(sha256sum geoflow/version.json | cut -d ' ' -f 1)" = "$(jq -er '.targets.version_document_sha256' candidate/candidate.json)"
@@ -279,6 +304,7 @@ jobs:
             jq -e --slurpfile candidate candidate/candidate.json '
               .schema_version == 1 and
               .candidate == $candidate[0] and
+              .verification_scope == "planned-container-contract-and-ingress" and
               .architectures["linux-amd64"].result == "pass" and
               (.architectures["linux-amd64"].evidence_link | length > 0) and
               .architectures["linux-arm64"].result == "pass" and

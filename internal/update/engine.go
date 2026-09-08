@@ -53,6 +53,10 @@ type Engine struct {
 type Observer func(Stage) error
 
 func (engine Engine) Run(ctx context.Context, instanceID string, observe Observer) Result {
+	return engine.RunWithOptions(ctx, instanceID, Options{AllowMaintenance: true}, observe)
+}
+
+func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, options Options, observe Observer) Result {
 	if engine.Deployment == nil {
 		return Result{Status: StatusFailed, Error: "deployment service is unavailable"}
 	}
@@ -81,6 +85,15 @@ func (engine Engine) Run(ctx context.Context, instanceID string, observe Observe
 	}
 	if err := emit("resolve", "succeeded", ""); err != nil {
 		return persistenceFailure("resolve", err)
+	}
+	if len(target.UpgradePlan) > 0 {
+		if planned, ok := engine.Deployment.(PlannedDeployment); ok {
+			return planned.ExecuteRelease(ctx, instanceID, target, options, observe)
+		}
+		return fail("preflight", errors.New("deployment does not support signed upgrade plans"))
+	}
+	if (!options.AllowMaintenance && !options.LegacyRequest) || options.ExpectedPlanSHA256 != "" {
+		return fail("preflight", errors.New("legacy release requires an explicit maintenance update without a plan hash"))
 	}
 
 	for _, step := range []struct {
@@ -146,21 +159,30 @@ func (engine Engine) Run(ctx context.Context, instanceID string, observe Observe
 	}
 	for _, step := range protectedSteps {
 		if err := emit(step.name, "running", ""); err != nil {
+			if step.name == "verify" {
+				return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: err.Error()}
+			}
 			return engine.rollback(ctx, instanceID, recoveryPointID, target, fmt.Errorf("persist %s stage: %w", step.name, err), emit)
 		}
 		if err := step.run(); err != nil {
 			if observeErr := emit(step.name, "failed", err.Error()); observeErr != nil {
 				err = errors.Join(err, fmt.Errorf("persist %s failure: %w", step.name, observeErr))
 			}
+			if step.name == "resume" || step.name == "verify" {
+				return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: err.Error()}
+			}
 			return engine.rollback(ctx, instanceID, recoveryPointID, target, err, emit)
 		}
 		if err := emit(step.name, "succeeded", ""); err != nil {
+			if step.name == "resume" || step.name == "verify" {
+				return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: err.Error()}
+			}
 			return engine.rollback(ctx, instanceID, recoveryPointID, target, fmt.Errorf("persist %s completion: %w", step.name, err), emit)
 		}
 	}
 
 	if err := emit("succeeded", "succeeded", ""); err != nil {
-		return engine.rollback(ctx, instanceID, recoveryPointID, target, fmt.Errorf("persist update completion: %w", err), emit)
+		return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: fmt.Sprintf("persist update completion: %v", err)}
 	}
 	return Result{Status: StatusSucceeded, Target: target, RecoveryPointID: recoveryPointID}
 }
@@ -177,7 +199,15 @@ func (engine Engine) rollback(
 	defer cancel()
 
 	observeErr := emit("rollback", "running", "")
-	if err := engine.Deployment.Quiesce(recoveryCtx, instanceID); err != nil {
+	quiesce := func() error {
+		if recoverer, ok := engine.Deployment.(interface {
+			QuiesceForRecovery(context.Context, string, string) error
+		}); ok {
+			return recoverer.QuiesceForRecovery(recoveryCtx, instanceID, recoveryPointID)
+		}
+		return engine.Deployment.Quiesce(recoveryCtx, instanceID)
+	}
+	if err := quiesce(); err != nil {
 		combined := errors.Join(cause, observeErr, fmt.Errorf("quiesce before automatic rollback: %w", err))
 		_ = emit("rollback", "failed", combined.Error())
 		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}

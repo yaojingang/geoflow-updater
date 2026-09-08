@@ -5,7 +5,7 @@ GEOFlow Updater is the privileged host-side control plane for signed GEOFlow rel
 The current implementation provides:
 
 - static Linux binaries for amd64 and arm64;
-- `enroll` for registering an existing single-host Docker Compose deployment;
+- `install` for a fresh signed deployment, and `enroll` for an existing single-host Docker Compose deployment;
 - `doctor` for machine-readable host and deployment diagnostics;
 - a systemd service and local installer package;
 - a go-tuf v2 client with an embedded two-of-three offline root of trust;
@@ -13,7 +13,8 @@ The current implementation provides:
 - a signed bootstrap manifest for the GEOFlow administrator bridge;
 - transaction stages for resolve, preflight, pull, quiesce, backup, migrate, activate, resume, and verify;
 - PostgreSQL custom-format dumps, compressed site storage and persistent Redis data, deployment state, and configuration recovery points;
-- automatic rollback after protected-stage failures and startup reconciliation after interrupted operations;
+- signed upgrade plans with automatic migrations, business backfills, readiness checks, and blue/green traffic switching;
+- application switch-back preserving current data for online failures; complete checkpoint recovery before maintenance traffic reopens, and startup reconciliation after interrupted operations;
 - authenticated typed operations for update, backup, verification, recovery-point listing, and rollback;
 - administrator-held six-digit mutation authorization with replay protection for website-triggered update, backup, and rollback requests;
 - direct CLI operations and administrator update-center controls.
@@ -27,9 +28,11 @@ The Laravel update executor is retired. Its database records remain available as
 - Single host
 - One managed instance named `primary`
 - GEOFlow deployment with bundled PostgreSQL
-- Existing deployment root containing `.env.prod` and `storage/`
+- Fresh empty deployment root for `install`, or an existing root containing `.env.prod` and `storage/` for `enroll`
 
 Enrollment requires the installed `version.json` to match the signed managed release. The first handover therefore attaches the updater to an already matching release. Later releases use the transactional update path.
+
+For planned installation, maintenance conversion, online updates and recovery commands, see the [blue/green deployment guide](docs/blue-green-deployment.md).
 
 ## Install and enroll
 

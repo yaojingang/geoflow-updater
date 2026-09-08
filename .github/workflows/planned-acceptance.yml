@@ -1,4 +1,4 @@
-name: Rehearse Phase C candidate on native Linux hosts
+name: Accept planned candidate application and ingress contracts
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: phase-c-rehearsal-${{ inputs.candidate_run_id }}
+  group: planned-acceptance-${{ inputs.candidate_run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -43,13 +43,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Check out the immutable Phase B bridge source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: yaojingang/GEOFlow
-          ref: 0381ba595473d2020ca2cdb641614d22b0f731c2
-          path: rehearsal/geoflow-phase-b
-          persist-credentials: false
       - name: Authenticate to the candidate image registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -93,25 +86,27 @@ jobs:
           expected_sha="$(jq -er --arg platform "$PLATFORM" '.updater.archives[$platform]' rehearsal/candidate/candidate.json)"
           test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$expected_sha"
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
-      - name: Require a historical schema 2 candidate
-        run: test "$(jq -er '.schema_version' rehearsal/candidate/targets-source/releases/current.json)" = 2
-      - name: Run the isolated Phase C rehearsal
+      - name: Exercise the candidate app and real ingress
         env:
-          ARCHIVE_ARCH: ${{ matrix.archive_arch }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           PLATFORM: ${{ matrix.platform }}
+          KERNEL_ARCH: ${{ matrix.kernel_arch }}
         run: |
-          install -d -m 0700 "$GITHUB_WORKSPACE/rehearsal/evidence"
-          sudo --preserve-env=ARCHIVE_ARCH,CANDIDATE_RUN_ID,PLATFORM \
-            bash scripts/phase-c-rehearsal.sh \
-              --candidate-dir "$GITHUB_WORKSPACE/rehearsal/candidate" \
-              --phase-b-root "$GITHUB_WORKSPACE/rehearsal/geoflow-phase-b" \
-              --evidence-dir "$GITHUB_WORKSPACE/rehearsal/evidence/$PLATFORM"
+          set -Eeuo pipefail
+          install -d -m 0700 "$GITHUB_WORKSPACE/rehearsal/evidence/$PLATFORM"
+          docker pull nginx:1.31.1-alpine
+          docker pull python:3.12-alpine
+          go test -race ./...
+          GEOFLOW_DOCKER_TEST=1 go test ./internal/deployment -run TestDockerIngress -v > "rehearsal/evidence/$PLATFORM/ingress.txt"
+          bash scripts/planned-candidate-acceptance.sh rehearsal/candidate "rehearsal/evidence/$PLATFORM"
+          jq -n --arg platform "$PLATFORM" --arg kernel_arch "$KERNEL_ARCH" --arg candidate_run_id "$CANDIDATE_RUN_ID" \
+            '{schema_version:1,platform:$platform,kernel_arch:$kernel_arch,candidate_run_id:$candidate_run_id,result:"pass",verification_scope:"planned-container-contract-and-ingress",checks:["signed-image-identity","fresh-migrations","first-install","backfills","cache-compilation","standalone-readiness","install-idempotency","real-ingress-switch-and-stream"]}' \
+            > "rehearsal/evidence/$PLATFORM/result.json"
       - name: Upload architecture evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: phase-c-rehearsal-${{ matrix.platform }}
+          name: planned-acceptance-${{ matrix.platform }}
           path: rehearsal/evidence/${{ matrix.platform }}
           if-no-files-found: error
           retention-days: 30
@@ -128,7 +123,7 @@ jobs:
       - name: Download architecture evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: phase-c-rehearsal-linux-*
+          pattern: planned-acceptance-linux-*
           path: evidence/architectures
       - name: Download the exact candidate identity
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -146,22 +141,24 @@ jobs:
           set -Eeuo pipefail
           run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           for platform in linux-amd64 linux-arm64; do
-            test -f "evidence/architectures/phase-c-rehearsal-$platform/result.json"
-            test "$(jq -er '.platform' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = "$platform"
-            test "$(jq -er '.candidate_run_id' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = "$CANDIDATE_RUN_ID"
-            test "$(jq -er '.result' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = pass
-            test "$(jq -r '.checks | length >= 18' "evidence/architectures/phase-c-rehearsal-$platform/result.json")" = true
+            test -f "evidence/architectures/planned-acceptance-$platform/result.json"
+            test "$(jq -er '.platform' "evidence/architectures/planned-acceptance-$platform/result.json")" = "$platform"
+            test "$(jq -er '.candidate_run_id' "evidence/architectures/planned-acceptance-$platform/result.json")" = "$CANDIDATE_RUN_ID"
+            test "$(jq -er '.result' "evidence/architectures/planned-acceptance-$platform/result.json")" = pass
+            test "$(jq -r '.checks | length >= 8' "evidence/architectures/planned-acceptance-$platform/result.json")" = true
           done
-          test "$(jq -er '.kernel_arch' evidence/architectures/phase-c-rehearsal-linux-amd64/result.json)" = x86_64
-          test "$(jq -er '.kernel_arch' evidence/architectures/phase-c-rehearsal-linux-arm64/result.json)" = aarch64
+          test "$(jq -er '.kernel_arch' evidence/architectures/planned-acceptance-linux-amd64/result.json)" = x86_64
+          test "$(jq -er '.kernel_arch' evidence/architectures/planned-acceptance-linux-arm64/result.json)" = aarch64
           mkdir -p evidence/publication
           jq -n \
             --slurpfile candidate evidence/candidate/candidate.json \
             --arg run_url "$run_url" \
-            --slurpfile amd64 evidence/architectures/phase-c-rehearsal-linux-amd64/result.json \
-            --slurpfile arm64 evidence/architectures/phase-c-rehearsal-linux-arm64/result.json \
+            --slurpfile amd64 evidence/architectures/planned-acceptance-linux-amd64/result.json \
+            --slurpfile arm64 evidence/architectures/planned-acceptance-linux-arm64/result.json \
             '{
               schema_version: 1,
+              verification_scope: "planned-container-contract-and-ingress",
+              limitations: ["Full installed-host upgrade, backup restoration, and crash recovery require separate rehearsal."],
               candidate: $candidate[0],
               architectures: {
                 "linux-amd64": {result: $amd64[0].result, evidence_link: $run_url},
@@ -180,7 +177,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: phase-c-rehearsal-${{ github.run_id }}
+          name: planned-acceptance-${{ github.run_id }}
           path: evidence/publication
           if-no-files-found: error
           retention-days: 30

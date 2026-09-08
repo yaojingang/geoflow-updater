@@ -12,11 +12,23 @@ import (
 	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/authorization"
+	"github.com/yaojingang/geoflow-updater/internal/deployment"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
 	"github.com/yaojingang/geoflow-updater/internal/operation"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
+	"github.com/yaojingang/geoflow-updater/internal/update"
 )
+
+type Installer interface {
+	Install(context.Context, deployment.InstallRequest) (deployment.InstallResult, error)
+}
+
+type PlannedOperations interface {
+	Preview(context.Context, string) (update.PlanSummary, error)
+	StartUpdateWithOptions(string, update.Options) (operation.Operation, error)
+	StartSwitchBack(string) (operation.Operation, error)
+}
 
 type Enroller interface {
 	Enroll(context.Context, enrollment.Request) (enrollment.Result, error)
@@ -45,6 +57,7 @@ type App struct {
 	Stderr        io.Writer
 	Version       string
 	Enroller      Enroller
+	Installer     Installer
 	Doctor        Diagnostician
 	Operations    OperationController
 	Authorization AuthorizationProvisioner
@@ -66,13 +79,15 @@ func (app App) Run(ctx context.Context, arguments []string) int {
 	}
 
 	switch arguments[0] {
+	case "install":
+		return app.install(ctx, arguments[1:], stdout, stderr)
 	case "enroll":
 		return app.enroll(ctx, arguments[1:], stdout, stderr)
 	case "doctor":
 		return app.doctor(ctx, arguments[1:], stdout, stderr)
 	case "serve":
 		return app.serve(ctx, arguments[1:], stderr)
-	case "update", "backup", "rollback", "verify":
+	case "update", "backup", "rollback", "switch-back", "verify":
 		return app.operation(ctx, arguments[0], arguments[1:], stdout, stderr)
 	case "recovery-points":
 		return app.recoveryPoints(arguments[1:], stdout, stderr)
@@ -130,10 +145,13 @@ func (app App) operation(ctx context.Context, command string, arguments []string
 	instanceID := flags.String("instance", "primary", "managed instance identifier")
 	recoveryPointID := flags.String("recovery-point", "", "recovery point identifier")
 	jsonOutput := flags.Bool("json", false, "emit stable JSON")
+	dryRun := flags.Bool("dry-run", false, "preview the verified upgrade plan without applying changes")
+	allowMaintenance := flags.Bool("allow-maintenance", false, "allow the confirmed maintenance window")
+	planSHA256 := flags.String("plan-sha256", "", "require this preview plan SHA-256")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
-	if flags.NArg() != 0 || (command == "rollback" && *recoveryPointID == "") || (command != "rollback" && *recoveryPointID != "") {
+	if (command != "update" && (*dryRun || *allowMaintenance || *planSHA256 != "")) || (*planSHA256 != "" && !validPlanHash(*planSHA256)) || (*dryRun && (*allowMaintenance || *planSHA256 != "")) || flags.NArg() != 0 || (command == "rollback" && *recoveryPointID == "") || (command != "rollback" && *recoveryPointID != "") {
 		fmt.Fprintf(stderr, "%s arguments are invalid\n", command)
 		return 2
 	}
@@ -141,11 +159,44 @@ func (app App) operation(ctx context.Context, command string, arguments []string
 		fmt.Fprintln(stderr, "updater operations are unavailable")
 		return 1
 	}
+	if *dryRun {
+		planned, ok := app.Operations.(PlannedOperations)
+		if !ok {
+			fmt.Fprintln(stderr, "upgrade preview is unavailable")
+			return 1
+		}
+		preview, err := planned.Preview(ctx, *instanceID)
+		if err != nil {
+			fmt.Fprintf(stderr, "upgrade preview failed: %v\n", err)
+			return 1
+		}
+		if *jsonOutput {
+			if err := json.NewEncoder(stdout).Encode(preview); err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+		} else {
+			fmt.Fprintf(stdout, "Upgrade %s: %s; layout change: %t; pending migrations: %d\nPlan SHA-256: %s\n", preview.TargetVersion, preview.Strategy, preview.LayoutChange, len(preview.PendingMigrations), preview.PlanSHA256)
+		}
+		return 0
+	}
 	var started operation.Operation
 	var err error
 	switch command {
 	case "update":
-		started, err = app.Operations.StartUpdate(*instanceID)
+		if planned, ok := app.Operations.(PlannedOperations); ok {
+			started, err = planned.StartUpdateWithOptions(*instanceID, update.Options{AllowMaintenance: *allowMaintenance, ExpectedPlanSHA256: *planSHA256})
+		} else if *allowMaintenance || *planSHA256 != "" {
+			err = errors.New("planned updates are unavailable")
+		} else {
+			started, err = app.Operations.StartUpdate(*instanceID)
+		}
+	case "switch-back":
+		if planned, ok := app.Operations.(PlannedOperations); ok {
+			started, err = planned.StartSwitchBack(*instanceID)
+		} else {
+			err = errors.New("code switch-back is unavailable")
+		}
 	case "backup":
 		started, err = app.Operations.StartBackup(*instanceID)
 	case "rollback":
@@ -331,5 +382,43 @@ func (app App) serve(ctx context.Context, arguments []string, stderr io.Writer) 
 }
 
 func (app App) usage(writer io.Writer) {
-	fmt.Fprintln(writer, "Usage: geoflow-updater <enroll|doctor|authorization-uri|update|backup|rollback|verify|recovery-points|serve|version>")
+	fmt.Fprintln(writer, "Usage: geoflow-updater <install|enroll|doctor|authorization-uri|update|backup|rollback|switch-back|verify|recovery-points|serve|version>")
+}
+
+func validPlanHash(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, c := range value {
+		if !((c >= 'a' && c <= 'f') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func (app App) install(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("install", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	id := flags.String("instance", "primary", "managed instance identifier")
+	root := flags.String("root", "", "absolute deployment root")
+	url := flags.String("url", "", "public HTTPS application URL")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*root) == "" || strings.TrimSpace(*url) == "" {
+		fmt.Fprintln(stderr, "install requires --root and --url")
+		return 2
+	}
+	if app.Installer == nil {
+		fmt.Fprintln(stderr, "installation service is unavailable")
+		return 1
+	}
+	result, err := app.Installer.Install(ctx, deployment.InstallRequest{InstanceID: *id, Root: *root, URL: *url})
+	if err != nil {
+		fmt.Fprintf(stderr, "installation failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Installed GEOFlow instance %s at %s. Credentials are stored in %s.\n", result.Instance.ID, result.Instance.Root, result.CredentialsFile)
+	return 0
 }

@@ -44,6 +44,7 @@ type FileRecord struct {
 }
 
 type Point struct {
+	Deployment      *instance.Config      `json:"deployment,omitempty"`
 	SchemaVersion   int                   `json:"schema_version"`
 	ID              string                `json:"id"`
 	InstanceID      string                `json:"instance_id"`
@@ -133,13 +134,7 @@ func (store Store) Create(ctx context.Context, config instance.Config, reason st
 		return Point{}, err
 	}
 
-	artifacts := map[string]string{
-		"site.env":                   filepath.Join(config.Root, ".env.prod"),
-		"version.json":               filepath.Join(config.Root, "version.json"),
-		"managed/instance.yml":       filepath.Join(filepath.Dir(config.ComposeFile), "instance.yml"),
-		"managed/release.env":        config.EnvironmentFile,
-		"managed/docker-compose.yml": config.ComposeFile,
-	}
+	artifacts := deploymentArtifacts(config)
 	keys := make([]string, 0, len(artifacts))
 	for name := range artifacts {
 		keys = append(keys, name)
@@ -156,6 +151,7 @@ func (store Store) Create(ctx context.Context, config instance.Config, reason st
 	}
 
 	point := Point{
+		Deployment:      &config,
 		SchemaVersion:   1,
 		ID:              id,
 		InstanceID:      config.ID,
@@ -217,16 +213,15 @@ func (store Store) validate(config instance.Config, id string) (string, Point, e
 	if point.Root != config.Root {
 		return "", Point{}, errors.New("recovery point belongs to a different instance root")
 	}
-	expectedFiles := []string{
-		"database.dump",
-		"managed/docker-compose.yml",
-		"managed/instance.yml",
-		"managed/release.env",
-		"redis.tar.gz",
-		"site.env",
-		"storage.tar.gz",
-		"version.json",
+	source, err := recoveryConfiguration(config, point)
+	if err != nil {
+		return "", Point{}, err
 	}
+	expectedFiles := []string{"database.dump", "redis.tar.gz", "storage.tar.gz"}
+	for name := range deploymentArtifacts(source) {
+		expectedFiles = append(expectedFiles, name)
+	}
+
 	if len(point.Files) != len(expectedFiles) {
 		return "", Point{}, errors.New("recovery point file set is incomplete")
 	}
@@ -244,16 +239,16 @@ func (store Store) validate(config instance.Config, id string) (string, Point, e
 }
 
 func (store Store) restoreValidated(ctx context.Context, config instance.Config, id string, pointPath string, point Point, database Database) error {
-	expectedFiles := []string{
-		"database.dump",
-		"managed/docker-compose.yml",
-		"managed/instance.yml",
-		"managed/release.env",
-		"redis.tar.gz",
-		"site.env",
-		"storage.tar.gz",
-		"version.json",
+	source, err := recoveryConfiguration(config, point)
+	if err != nil {
+		return err
 	}
+	destinations := deploymentArtifacts(source)
+	expectedFiles := make([]string, 0, len(destinations))
+	for name := range destinations {
+		expectedFiles = append(expectedFiles, name)
+	}
+	sort.Strings(expectedFiles)
 
 	storageStageRoot, err := os.MkdirTemp(config.Root, ".geoflow-updater-restore-")
 	if err != nil {
@@ -281,13 +276,6 @@ func (store Store) restoreValidated(ctx context.Context, config instance.Config,
 		return err
 	}
 
-	destinations := map[string]string{
-		"site.env":                   filepath.Join(config.Root, ".env.prod"),
-		"version.json":               filepath.Join(config.Root, "version.json"),
-		"managed/instance.yml":       filepath.Join(filepath.Dir(config.ComposeFile), "instance.yml"),
-		"managed/release.env":        config.EnvironmentFile,
-		"managed/docker-compose.yml": config.ComposeFile,
-	}
 	for _, name := range expectedFiles {
 		destination, ok := destinations[name]
 		if !ok {
@@ -929,4 +917,48 @@ func (store Store) now() time.Time {
 		return store.Now()
 	}
 	return time.Now()
+}
+
+func deploymentArtifacts(config instance.Config) map[string]string {
+	files := map[string]string{
+		"site.env": filepath.Join(config.Root, ".env.prod"), "version.json": filepath.Join(config.Root, "version.json"),
+		"managed/instance.yml": filepath.Join(config.StateDirectory(), "instance.yml"),
+		"managed/release.env":  config.EnvironmentFile, "managed/docker-compose.yml": config.ComposeFile,
+	}
+	if config.Layout == "blue-green" {
+		files["managed/infra-compose.yml"] = config.InfraComposeFile
+		files["managed/infra.env"] = config.InfraEnvironmentFile
+		files["managed/nginx.conf"] = filepath.Join(filepath.Dir(config.InfraComposeFile), "traffic", "nginx.conf")
+		files["managed/upgrade-plan.json"] = filepath.Join(filepath.Dir(config.ComposeFile), "upgrade-plan.json")
+		files["managed/slot-version.json"] = filepath.Join(filepath.Dir(config.ComposeFile), "version.json")
+	}
+	return files
+}
+func recoveryConfiguration(current instance.Config, point Point) (instance.Config, error) {
+	if point.Deployment == nil {
+		if current.Layout != "" {
+			return instance.Config{}, errors.New("legacy recovery point requires its original deployment layout")
+		}
+		return current, nil
+	}
+	source := *point.Deployment
+	if source.ID != current.ID || source.Root != current.Root || source.StateDirectory() != current.StateDirectory() || source.Version != point.Version || source.ReleaseSequence != point.ReleaseSequence {
+		return instance.Config{}, errors.New("recovery deployment identity mismatch")
+	}
+	if source.Layout != "" && source.Layout != "blue-green" {
+		return instance.Config{}, errors.New("unsupported recovery layout")
+	}
+	if source.Layout == "blue-green" && source.ActiveSlot != "blue" && source.ActiveSlot != "green" {
+		return instance.Config{}, errors.New("invalid recovery slot")
+	}
+	for name, path := range deploymentArtifacts(source) {
+		if name == "site.env" || name == "version.json" {
+			continue
+		}
+		relative, err := filepath.Rel(current.StateDirectory(), path)
+		if err != nil || !filepath.IsAbs(path) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return instance.Config{}, errors.New("recovery file escapes instance state")
+		}
+	}
+	return source, nil
 }

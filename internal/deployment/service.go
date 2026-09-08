@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/instance"
@@ -49,12 +50,15 @@ type RecoveryStore interface {
 }
 
 type Service struct {
-	StateDir    string
-	Releases    ReleaseResolver
-	Doctor      Diagnostician
-	Runner      CommandRunner
-	Recoveries  RecoveryStore
-	candidateMu sync.Mutex
+	Provisioner         freshProvisioner
+	ObservationDuration time.Duration
+	Chown               func(string, int, int) error
+	StateDir            string
+	Releases            ReleaseResolver
+	Doctor              Diagnostician
+	Runner              CommandRunner
+	Recoveries          RecoveryStore
+	candidateMu         sync.Mutex
 }
 
 func (service *Service) Resolve(ctx context.Context, instanceID string) (managed.Release, error) {
@@ -140,7 +144,7 @@ func (service *Service) Quiesce(ctx context.Context, instanceID string) error {
 		return err
 	}
 
-	return service.quiesce(ctx, instanceID, config)
+	return service.quiesce(ctx, instanceID, config, true)
 }
 
 func (service *Service) QuiesceForRecovery(ctx context.Context, instanceID string, recoveryPointID string) error {
@@ -152,20 +156,67 @@ func (service *Service) QuiesceForRecovery(ctx context.Context, instanceID strin
 		return err
 	}
 
-	return service.quiesce(ctx, instanceID, config)
+	return service.quiesce(ctx, instanceID, config, false)
 }
 
-func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config) error {
-	arguments := composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile)
-	_ = service.runner().Run(ctx, nil, io.Discard, "docker", append(arguments, "exec", "-T", "app", "php", "artisan", "down", "--retry=60")...)
-	if err := service.runner().Run(ctx, nil, io.Discard, "docker", "stop", "--time", "900", "geoflow-system-update-queue-prod"); err != nil && !strings.Contains(err.Error(), "No such container") {
-		resumeErr := service.Resume(ctx, instanceID)
-		return errors.Join(fmt.Errorf("stop retired application update executor: %w", err), resumeErr)
+func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config, resumeOnFailure bool) error {
+	drainCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer cancel()
+	// A stopped application is a normal state during recovery. Enter maintenance
+	// through the fixed one-off image without starting persistent writers.
+	if info, err := os.Lstat(filepath.Join(config.Root, "storage")); err == nil && info.IsDir() {
+		if err := service.command(drainCtx, config, "run", "--rm", "--no-deps", "--entrypoint", "php", "-e", "AUTO_MIGRATE=false", "-e", "AUTO_INSTALL_ONCE=false", "init", "artisan", "down", "--retry=60"); err != nil {
+			return fmt.Errorf("enter maintenance: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return errors.New("maintenance storage is unavailable")
 	}
-	services := []string{"queue", "knowledge-queue", "scheduler", "reverb", "web", "app", "redis"}
-	if err := service.runner().Run(ctx, nil, io.Discard, "docker", append(append(arguments, "stop"), services...)...); err != nil {
-		resumeErr := service.Resume(ctx, instanceID)
-		return errors.Join(fmt.Errorf("stop application services: %w", err), resumeErr)
+
+	fail := func(err error) error {
+		if !resumeOnFailure {
+			return err
+		}
+		resumeCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 4*time.Minute)
+		defer stop()
+		return errors.Join(err, service.Resume(resumeCtx, instanceID))
+	}
+	if err := service.drainRetiredWorker(drainCtx); err != nil {
+		return fail(err)
+	}
+	if tx, err := service.readTransaction(instanceID); err == nil {
+		if err := service.waitUpgradeContainers(drainCtx, tx.OperationID); err != nil {
+			return fail(err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fail(err)
+	}
+	configs := []instance.Config{config}
+	if config.Layout == LayoutBlueGreen {
+		other := config
+		other.ActiveSlot = otherSlot(config.ActiveSlot)
+		other.ComposeFile = filepath.Join(service.instanceDirectory(instanceID), "slots", other.ActiveSlot, "docker-compose.yml")
+		other.EnvironmentFile = filepath.Join(filepath.Dir(other.ComposeFile), "release.env")
+		if err := regularFile(other.ComposeFile); err == nil {
+			if err := regularFile(other.EnvironmentFile); err != nil {
+				return fail(err)
+			}
+			configs = append(configs, other)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fail(err)
+		}
+	}
+	for _, slot := range configs {
+		if err := service.drainBackground(drainCtx, slot); err != nil {
+			return fail(err)
+		}
+		if err := service.drainServices(drainCtx, slot, "reverb", "web", "app"); err != nil {
+			return fail(err)
+		}
+	}
+
+	// Redis is stopped gracefully before its files enter a maintenance checkpoint.
+	if err := service.drainServices(drainCtx, infrastructureConfig(config), "redis"); err != nil {
+		return fail(err)
 	}
 	return nil
 }
@@ -224,7 +275,7 @@ func (service *Service) Activate(_ context.Context, instanceID string, release m
 	if err != nil {
 		return err
 	}
-	if err := replaceContents(filepath.Join(filepath.Dir(config.ComposeFile), "instance.yml"), encodedConfig, 0o640); err != nil {
+	if err := replaceContents(filepath.Join(service.instanceDirectory(instanceID), "instance.yml"), encodedConfig, 0o640); err != nil {
 		return fmt.Errorf("activate instance configuration: %w", err)
 	}
 	if err := replaceContents(filepath.Join(config.Root, "version.json"), release.VersionDocument, 0o640); err != nil {
@@ -244,7 +295,38 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, recover
 	if service.Recoveries == nil {
 		return errors.New("recovery point store is unavailable")
 	}
-	return service.Recoveries.Restore(ctx, config, recoveryPointID, postgresDatabase{config: config, runner: service.runner()})
+	points, err := service.Recoveries.List(instanceID)
+	if err != nil {
+		return err
+	}
+	source := config
+	for _, point := range points {
+		if point.ID == recoveryPointID && point.Deployment != nil {
+			source = *point.Deployment
+			break
+		}
+	}
+	if err := service.Recoveries.Validate(config, recoveryPointID); err != nil {
+		return err
+	}
+	if config.Layout == LayoutBlueGreen && source.Layout != LayoutBlueGreen {
+		if err := service.command(ctx, infrastructureConfig(config), "down", "--remove-orphans"); err != nil {
+			return err
+		}
+	}
+	if err := service.Recoveries.Restore(ctx, config, recoveryPointID, postgresDatabase{config: source, runner: service.runner()}); err != nil {
+		return err
+	}
+	if tx, err := service.readTransaction(instanceID); err == nil {
+		tx.Status = "rolled_back"
+		tx.Error = ""
+		if err := service.saveTransaction(&tx); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func (service *Service) ValidateRecoveryPoint(instanceID string, recoveryPointID string) error {
@@ -267,6 +349,28 @@ func (service *Service) Resume(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return err
 	}
+	if config.Layout == LayoutBlueGreen {
+		if err := service.startServices(ctx, infrastructureConfig(config), "postgres", "redis"); err != nil {
+			return err
+		}
+		if err := service.command(ctx, infrastructureConfig(config), "up", "-d", "--wait", "postgres", "redis"); err != nil {
+			return err
+		}
+		if err := service.command(ctx, config, "run", "--rm", "--no-deps", "--entrypoint", "php", "-e", "AUTO_MIGRATE=false", "-e", "AUTO_INSTALL_ONCE=false", "init", "artisan", "up"); err != nil {
+			return err
+		}
+		services, err := applicationServices(config.ComposeFile)
+		if err != nil {
+			return err
+		}
+		if err := service.startServices(ctx, config, services...); err != nil {
+			return err
+		}
+		if _, err := service.switchIngress(ctx, config, config.ReleaseSequence, true); err != nil {
+			return err
+		}
+		return service.waitHTTP(ctx, config)
+	}
 	managedServices, err := resumeServices(config.ComposeFile)
 	if err != nil {
 		return fmt.Errorf("select managed services: %w", err)
@@ -277,6 +381,23 @@ func (service *Service) Resume(ctx context.Context, instanceID string) error {
 	}
 	if err := service.runner().Run(ctx, nil, io.Discard, "docker", "rm", "-f", "geoflow-system-update-queue-prod"); err != nil && !strings.Contains(err.Error(), "No such container") {
 		return fmt.Errorf("remove retired application update executor: %w", err)
+	}
+	// Compose reuses stopped containers without undoing the drain's restart=no.
+	// Restore persistent services before resuming; init must remain a one-off.
+	persistent := make([]string, 0, len(managedServices))
+	for _, name := range managedServices {
+		if name != "init" {
+			persistent = append(persistent, name)
+		}
+	}
+	ids, err := service.containerIDs(ctx, config, persistent...)
+	if err != nil {
+		return err
+	}
+	if len(ids) > 0 {
+		if err := service.runner().Run(ctx, nil, io.Discard, "docker", append([]string{"update", "--restart=unless-stopped"}, ids...)...); err != nil {
+			return fmt.Errorf("restore managed restart policies: %w", err)
+		}
 	}
 	startArguments := append(arguments, "up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "180")
 	startArguments = append(startArguments, managedServices...)
@@ -462,10 +583,30 @@ func (service *Service) loadConfigForRecovery(instanceID string, recoveryPointID
 	if err != nil || resolvedRoot != root {
 		return instance.Config{}, errors.New("managed instance root no longer matches its enrolled path")
 	}
-	for _, ownedPath := range []string{config.ComposeFile, config.EnvironmentFile, config.ControlToken} {
+	ownedPaths := []string{config.ComposeFile, config.EnvironmentFile, config.ControlToken}
+	if config.Layout != "" && config.Layout != LayoutBlueGreen {
+		return instance.Config{}, errors.New("unsupported managed layout")
+	}
+	if config.Layout == LayoutBlueGreen {
+		if !validSlot(config.ActiveSlot) {
+			return instance.Config{}, errors.New("invalid active slot")
+		}
+		if filepath.Dir(config.ComposeFile) != filepath.Join(instanceDir, "slots", config.ActiveSlot) {
+			return instance.Config{}, errors.New("active slot path mismatch")
+		}
+		ownedPaths = append(ownedPaths, config.InfraComposeFile, config.InfraEnvironmentFile)
+	}
+	resolvedInstanceDir, err := filepath.EvalSymlinks(instanceDir)
+	if err != nil {
+		return instance.Config{}, err
+	}
+	for _, ownedPath := range ownedPaths {
 		relative, err := filepath.Rel(instanceDir, filepath.Clean(ownedPath))
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			return instance.Config{}, errors.New("managed instance path escapes its state directory")
+		}
+		if resolved, err := filepath.EvalSymlinks(ownedPath); err != nil || resolved != filepath.Join(resolvedInstanceDir, relative) {
+			return instance.Config{}, errors.New("managed instance path contains a symbolic link")
 		}
 		if err := regularFile(ownedPath); err != nil {
 			return instance.Config{}, errors.New("managed instance file is unavailable or unsafe")
@@ -511,13 +652,15 @@ type postgresDatabase struct {
 }
 
 func (database postgresDatabase) Dump(ctx context.Context, writer io.Writer) error {
-	arguments := composeArguments(database.config.Root, database.config.EnvironmentFile, database.config.ComposeFile)
+	config := infrastructureConfig(database.config)
+	arguments := composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile)
 	arguments = append(arguments, "exec", "-T", "postgres", "sh", "-eu", "-c", `exec pg_dump --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --format=custom --create`)
 	return database.runner.Run(ctx, nil, writer, "docker", arguments...)
 }
 
 func (database postgresDatabase) Restore(ctx context.Context, reader io.Reader) error {
-	arguments := composeArguments(database.config.Root, database.config.EnvironmentFile, database.config.ComposeFile)
+	config := infrastructureConfig(database.config)
+	arguments := composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile)
 	if err := database.runner.Run(ctx, nil, io.Discard, "docker", append(arguments, "up", "-d", "--wait", "postgres")...); err != nil {
 		return fmt.Errorf("start database services for restore: %w", err)
 	}

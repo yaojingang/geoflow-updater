@@ -327,16 +327,15 @@ func TestRollbackLoadsInstanceWhenStorageSwapWasInterrupted(t *testing.T) {
 	if err := service.QuiesceForRecovery(context.Background(), "primary", recoveryPointID); err != nil {
 		t.Fatalf("QuiesceForRecovery() error = %v", err)
 	}
-	if len(runner.commands) != 3 {
-		t.Fatalf("QuiesceForRecovery() commands = %#v", runner.commands)
+	for _, call := range runner.commands {
+		if len(call.arguments) > 0 && call.arguments[0] == "stop" {
+			t.Fatal("drain must not use Docker timed stop/SIGKILL")
+		}
 	}
-	if !reflect.DeepEqual(runner.commands[1].arguments, []string{"stop", "--time", "900", "geoflow-system-update-queue-prod"}) {
-		t.Fatalf("legacy queue stop command = %#v", runner.commands[1])
+	if len(runner.commands) < 4 {
+		t.Fatal("missing graceful drain inspections")
 	}
-	wantServices := []string{"queue", "knowledge-queue", "scheduler", "reverb", "web", "app", "redis"}
-	if !reflect.DeepEqual(runner.commands[2].arguments[len(runner.commands[2].arguments)-len(wantServices):], wantServices) {
-		t.Fatalf("managed service stop command = %#v", runner.commands[2])
-	}
+
 	if err := service.Rollback(context.Background(), "primary", recoveryPointID); err != nil {
 		t.Fatalf("Rollback() error = %v", err)
 	}
@@ -406,18 +405,23 @@ func TestResumeDoesNotRestartTheRetiredPhaseBUpdateWorker(t *testing.T) {
 	if err := service.Resume(context.Background(), "primary"); err != nil {
 		t.Fatalf("Resume() error = %v", err)
 	}
-	if len(runner.commands) != 3 {
+	if len(runner.commands) != 4 {
 		t.Fatalf("Resume() commands = %#v", runner.commands)
 	}
 	if !reflect.DeepEqual(runner.commands[1].arguments, []string{"rm", "-f", "geoflow-system-update-queue-prod"}) {
 		t.Fatalf("retired worker removal command = %#v", runner.commands[1])
 	}
 	wantServices := []string{"app", "future-worker", "init", "knowledge-queue", "postgres", "queue", "redis", "reverb", "scheduler", "web"}
-	start := runner.commands[2].arguments
+	for _, name := range runner.commands[2].arguments {
+		if name == "init" || name == "system-update-queue" {
+			t.Fatalf("one-off or retired worker included in persistent restart reset: %#v", runner.commands[2])
+		}
+	}
+	start := runner.commands[3].arguments
 	if len(start) < len(wantServices) || !reflect.DeepEqual(start[len(start)-len(wantServices):], wantServices) {
-		t.Fatalf("managed service start command = %#v", runner.commands[2])
+		t.Fatalf("managed service start command = %#v", runner.commands[3])
 	}
 	if strings.Contains(strings.Join(start, " "), "system-update-queue") {
-		t.Fatalf("retired worker was included in managed service start: %#v", runner.commands[2])
+		t.Fatalf("retired worker was included in managed service start: %#v", runner.commands[3])
 	}
 }

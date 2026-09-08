@@ -156,10 +156,45 @@ services:
       redis:
         condition: service_healthy
 
+  ai-quality-queue:
+    <<: *app-base
+    command: ["php", "-d", "memory_limit=256M", "artisan", "geoflow:work-ai-quality", "front"]
+    mem_limit: ${AI_QUALITY_QUEUE_CONTAINER_MEMORY_LIMIT:-384m}
+    stop_grace_period: 260s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: ${AI_QUALITY_QUEUE_REPLICAS:-2}
+
+  ai-quality-backfill-queue:
+    <<: *app-base
+    command: ["php", "-d", "memory_limit=192M", "artisan", "geoflow:work-ai-quality", "backfill"]
+    mem_limit: ${AI_QUALITY_BACKFILL_QUEUE_CONTAINER_MEMORY_LIMIT:-256m}
+    stop_grace_period: 260s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  ai-optimization-queue:
+    <<: *app-base
+    command: ["php", "-d", "memory_limit=256M", "artisan", "geoflow:work-ai-optimization"]
+    mem_limit: ${AI_OPTIMIZATION_QUEUE_CONTAINER_MEMORY_LIMIT:-384m}
+    stop_grace_period: 910s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
   scheduler:
     <<: *app-base
     container_name: geoflow-scheduler-prod
-    command: ["php", "artisan", "schedule:work"]
+    command: ["php", "artisan", "geoflow:schedule-work"]
     depends_on:
       init:
         condition: service_completed_successfully
