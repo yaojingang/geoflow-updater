@@ -36,6 +36,37 @@ class EvidenceTests(unittest.TestCase):
     def test_complete_same_candidate(self):
         gate.validate(*complete(), approved=True)
 
+    def test_same_version_enrollment_cannot_be_omitted(self):
+        for platform in ['linux-amd64', 'linux-arm64']:
+            with self.subTest(platform=platform):
+                evidence, candidate = complete()
+                evidence['architectures'][platform]['hosts'].pop('enrollment', None)
+                with self.assertRaises((ValueError, KeyError)):
+                    gate.validate(evidence, candidate, approved=True)
+
+    def test_enrollment_requires_the_complete_restored_identity_lifecycle(self):
+        required = ['native-candidate-install', 'unmanaged-candidate-site', 'legacy-enrollment', 'session-login',
+                    'same-sequence-enrollment', 'same-sequence-layout-conversion', 'restored-enrollment-legacy',
+                    'same-sequence-enrollment-retry', 'session-after-enrollment-retry', 'enrollment-repeat-rejected']
+        for platform in ['linux-amd64', 'linux-arm64']:
+            for missing in required:
+                with self.subTest(platform=platform, missing=missing):
+                    evidence, candidate = complete()
+                    enrollment = evidence['architectures'][platform]['hosts']['enrollment']
+                    enrollment['checks'] = [check for check in enrollment['checks'] if check['id'] != missing]
+                    with self.assertRaisesRegex(ValueError, 'Required host checks missing'):
+                        gate.validate(evidence, candidate, approved=True)
+
+    def test_enrollment_identity_and_native_execution_are_bound(self):
+        for platform, other in [('linux-amd64', 'linux-arm64'), ('linux-arm64', 'linux-amd64')]:
+            for key, wrong in [('platform', other), ('kernel_arch', gate.PLATFORMS[other]),
+                               ('candidate_run_id', '122'), ('mode', 'upgrade'), ('result', 'fail')]:
+                with self.subTest(platform=platform, key=key):
+                    evidence, candidate = complete()
+                    evidence['architectures'][platform]['hosts']['enrollment'][key] = wrong
+                    with self.assertRaisesRegex(ValueError, 'Host identity differs'):
+                        gate.validate(evidence, candidate, approved=True)
+
     def test_cli_requires_production_pair_acceptance_for_online_plans(self):
         evidence, candidate = complete()
         with tempfile.TemporaryDirectory() as directory:

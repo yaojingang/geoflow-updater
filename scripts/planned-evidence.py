@@ -5,11 +5,14 @@ import json
 from pathlib import Path
 
 PLATFORMS = {'linux-amd64': 'x86_64', 'linux-arm64': 'aarch64'}
-SCOPE = 'maintenance-upgrade-restore-stage-interruption-install-retry-and-online-fixture'
+SCOPE = 'maintenance-upgrade-restore-stage-interruption-install-retry-same-version-enrollment-and-online-fixture'
 CONTAINER_CHECKS = {'signed-image-identity', 'fresh-migrations', 'first-install', 'backfills',
                     'cache-compilation', 'standalone-readiness', 'install-idempotency',
                     'real-ingress-switch-and-stream'}
 HOST_CHECKS = {
+    'enrollment': {'native-candidate-install', 'unmanaged-candidate-site', 'legacy-enrollment', 'session-login',
+                   'same-sequence-enrollment', 'same-sequence-layout-conversion', 'restored-enrollment-legacy',
+                   'same-sequence-enrollment-retry', 'session-after-enrollment-retry', 'enrollment-repeat-rejected'},
     'online': {'native-candidate-install', 'session-login', 'fresh-install-retry',
                'online-upgrade', 'online-http-session', 'online-queue-handover',
                'online-reverb-cross-slot', 'online-reverb-reconnect', 'online-switch-back-preserves-data'},

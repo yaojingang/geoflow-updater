@@ -32,9 +32,25 @@ func main() {
 		signBootstrap()
 	case "verify-bootstrap":
 		verifyBootstrap()
+	case "verify-repository":
+		verifyRepository()
 	default:
 		usage()
 		os.Exit(2)
+	}
+}
+
+func verifyRepository() {
+	flags := flag.NewFlagSet("verify-repository", flag.ExitOnError)
+	repositoryDir := flags.String("repository-dir", "", "committed public TUF repository")
+	targetsDir := flags.String("targets-dir", "", "exact approved candidate targets")
+	if err := flags.Parse(os.Args[2:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := tufrepo.VerifyRepository(*repositoryDir, *targetsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "verify repository: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -215,4 +231,5 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  geoflow-tuf refresh-online --repository-dir PATH --snapshot-key PATH --timestamp-key PATH")
 	fmt.Fprintln(os.Stderr, "  geoflow-tuf sign-bootstrap --manifest PATH --targets-key PATH --output PATH")
 	fmt.Fprintln(os.Stderr, "  geoflow-tuf verify-bootstrap --manifest PATH --trusted-root PATH --updater-version VERSION")
+	fmt.Fprintln(os.Stderr, "  geoflow-tuf verify-repository --repository-dir PATH --targets-dir PATH")
 }

@@ -32,6 +32,8 @@ The Laravel update executor is retired. Its database records remain available as
 
 Enrollment requires the installed `version.json` to match the signed managed release. The first handover therefore attaches the updater to an already matching release. Later releases use the transactional update path.
 
+Updater `0.4.0` is paired with GEOFlow `3.1.0`. Once the signed source points to 3.1.0, unenrolled 3.0.0 sites must first upgrade Core during maintenance, then enroll. Existing enrolled 3.0.0 sites upgrade the updater first and confirm the first maintenance plan through the host CLI; the older admin UI cannot send that confirmation. Follow the [3.1 upgrade instructions](https://github.com/yaojingang/GEOFlow/blob/main/docs/deployment/GEOFLOW_V3_1_UPGRADE_en.md).
+
 For planned installation, maintenance conversion, online updates and recovery commands, see the [blue/green deployment guide](docs/blue-green-deployment.md).
 
 ## Install and enroll
@@ -70,7 +72,9 @@ The installer does not support a remote `curl | sudo sh` flow. Review the extrac
 The administrator update center uses the authenticated Unix-socket API. `authorization-uri` creates three authenticator entries scoped to update, backup, and rollback. Each website mutation requires the instance control token and a fresh code from the matching entry. Accepted counters are persisted separately and consumed once. Five consecutive invalid guesses within one scope or across all scopes start a persistent 15-minute lockout; later invalid guesses double the delay up to 24 hours. A successful authorization clears the accepted scope while failures from other scopes remain in the aggregate anti-spray budget. Status, recovery-point listing, and verification remain control-token operations. Website rollback is fixed to the newest pre-update checkpoint. Root can select any verified recovery point through the host CLI:
 
 ```bash
-sudo geoflow-updater update --instance primary
+sudo geoflow-updater update --instance primary --dry-run --json
+# Replace PLAN_SHA256 with the reviewed preview digest for a maintenance plan.
+sudo geoflow-updater update --instance primary --plan-sha256 PLAN_SHA256 --allow-maintenance
 sudo geoflow-updater backup --instance primary
 sudo geoflow-updater verify --instance primary
 sudo geoflow-updater recovery-points --instance primary

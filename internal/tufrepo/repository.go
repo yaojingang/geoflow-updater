@@ -99,6 +99,74 @@ func loadTrustedRepositoryState(metadataDir string) (trustedRepositoryState, err
 	return trustedRepositoryState{root: root, timestamp: timestamp, snapshot: snapshot, targets: targets}, nil
 }
 
+// VerifyRepository checks a committed repository against the exact candidate
+// targets without signing, refreshing, or writing any publication state.
+func VerifyRepository(repositoryDir, targetsDir string) error {
+	if repositoryDir == "" || targetsDir == "" {
+		return errors.New("repository and candidate targets directories are required")
+	}
+	metadataDir := filepath.Join(repositoryDir, "metadata")
+	state, err := loadTrustedRepositoryState(metadataDir)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for role, expiry := range map[string]time.Time{
+		"root": state.root.Signed.Expires, "timestamp": state.timestamp.Signed.Expires,
+		"snapshot": state.snapshot.Signed.Expires, "targets": state.targets.Signed.Expires,
+	} {
+		if !expiry.After(now) {
+			return fmt.Errorf("%s metadata has expired", role)
+		}
+	}
+	if !state.root.Signed.ConsistentSnapshot || state.root.Signed.Version < 1 || state.timestamp.Signed.Version < 1 ||
+		state.timestamp.Signed.Meta["snapshot.json"].Version != state.snapshot.Signed.Version ||
+		state.snapshot.Signed.Meta["targets.json"].Version != state.targets.Signed.Version {
+		return errors.New("metadata versions or consistent-snapshot binding differ")
+	}
+	for _, name := range []string{"root.json", "timestamp.json",
+		fmt.Sprintf("%d.snapshot.json", state.snapshot.Signed.Version), fmt.Sprintf("%d.targets.json", state.targets.Signed.Version)} {
+		info, err := os.Lstat(filepath.Join(metadataDir, name))
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("metadata must be a regular file: %s", name)
+		}
+	}
+	paths, err := listTargetFiles(targetsDir)
+	if err != nil {
+		return err
+	}
+	if len(paths) == 0 || len(paths) != len(state.targets.Signed.Targets) {
+		return errors.New("signed target set differs from candidate")
+	}
+	for _, target := range paths {
+		info, ok := state.targets.Signed.Targets[target]
+		if !ok || info == nil || len(info.Hashes["sha256"]) != sha256.Size {
+			return fmt.Errorf("signed candidate target is missing: %s", target)
+		}
+		candidateBytes, err := os.ReadFile(filepath.Join(targetsDir, filepath.FromSlash(target)))
+		if err != nil {
+			return fmt.Errorf("read candidate target %s: %w", target, err)
+		}
+		if err := info.VerifyLengthHashes(candidateBytes); err != nil {
+			return fmt.Errorf("signed target differs from candidate %s: %w", target, err)
+		}
+		published := filepath.Join(repositoryDir, "targets", filepath.Dir(filepath.FromSlash(target)),
+			hex.EncodeToString(info.Hashes["sha256"])+"."+filepath.Base(filepath.FromSlash(target)))
+		file, err := os.Lstat(published)
+		if err != nil || !file.Mode().IsRegular() {
+			return fmt.Errorf("published target must be a regular file: %s", target)
+		}
+		contents, err := os.ReadFile(published)
+		if err != nil {
+			return fmt.Errorf("read published target %s: %w", target, err)
+		}
+		if err := info.VerifyLengthHashes(contents); err != nil {
+			return fmt.Errorf("published target differs from signed metadata %s: %w", target, err)
+		}
+	}
+	return nil
+}
+
 func Initialize(options InitializeOptions) error {
 	if options.KeysDir == "" || options.RepositoryDir == "" || options.TargetsDir == "" {
 		return errors.New("keys, repository, and target directories are required")

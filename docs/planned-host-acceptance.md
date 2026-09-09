@@ -25,6 +25,7 @@ Candidate builds push run-specific images and sign an isolated TUF repository. P
 | Native execution | Linux amd64 on an amd64 VM; Linux arm64 on an arm64 VM; verified archive hashes and candidate identity |
 | Application contract | Fresh migrations, initial administrator setup, backfills, readiness, caches, repeated installation, real ingress switch and streaming |
 | Existing managed site | Enroll an initialized stable database, run the signed maintenance upgrade, convert to two application slots, preserve the administrator session |
+| Current-version enrollment | Start a healthy unmanaged site with the exact signed candidate images and initialized database, enroll it, preview and execute a maintenance layout conversion at the same release sequence, restore the legacy layout and enrollment identity, restart the agent, and convert again |
 | Complete restoration | Change protected data after backup, restore PostgreSQL, Redis, storage, environment, version, instance, release and Compose files, and compare migration history |
 | Interrupted upgrade | Kill the installed updater at retain-assets, quiesce, scheduler freeze, backup, upgrade, layout, candidate, switch, workers and observe; verify the appropriate recovery policy and a second restart |
 | Failed recovery | Fail PostgreSQL restoration, retain the recovery identity and retry state, block ordinary mutations, remove the fault and complete an authorized restoration |
@@ -34,6 +35,14 @@ Candidate builds push run-specific images and sign an isolated TUF repository. P
 The queue fixture stops the old test consumer before enqueueing twenty jobs for each transition. It records the destination worker's slot and sequence and requires each job to write exactly once. This covers pending-job handover. Production traffic volume, long-running business jobs, browser reconnection behavior, and infrastructure outages need workload-specific testing.
 
 The legacy scheduler test waits for active scheduled children to finish before stopping the idle parent. A durable freeze record lets startup recovery resume the same frozen process after an updater interruption. Native container tests also check the actual process signals and child completion.
+
+## Current-version enrollment scope
+
+The `enrollment` host mode uses the main schema-3 candidate's signed legacy Compose topology and immutable image digests. It removes the updater control bridge from the initial application container, initializes PostgreSQL and the administrator, starts the real services, and verifies public HTTP health before any updater instance exists. It then stops the site for maintenance and invokes the installed updater's public `enroll` command. The initialized migration history must remain unchanged.
+
+The signed plan must describe a maintenance layout change with identical source and target sequences and no pending migrations. The rehearsal verifies the persisted `enrolled_release_sha256`, converts to the blue-green layout, and confirms that the full recovery point contains the legacy layout and identity. It changes PostgreSQL, Redis, storage and configuration, performs an authorized complete restoration, and compares data markers, configuration hashes and migration history with the enrolled baseline. After restarting the installed agent, the restored identity must authorize another same-sequence conversion, the administrator session must work, and the converted site must reject a further same-sequence plan.
+
+This covers enrollment of the currently signed application version. The separate `upgrade` mode continues to cover an older managed release upgrading to the candidate. Unmanaged older versions and customized Compose deployments require their documented preparation before enrollment.
 
 ## Online fixture scope
 
@@ -45,10 +54,10 @@ The release workflow publishes only the main candidate's `targets-source` and ap
 
 ## Review and publication
 
-Download `planned-acceptance-<run-id>/evidence-template.json`. It includes both container results and all six installed-host results. The release gate checks the required case IDs and candidate identity, so a shortened checklist cannot pass.
+Download `planned-acceptance-<run-id>/evidence-template.json`. It includes both container results and all eight installed-host results: upgrade, install, online and enrollment on each architecture. Together with evidence assembly, the workflow has eleven required jobs. The release gate checks every mode's required case IDs and candidate identity, so a shortened checklist cannot pass. Previous acceptance without enrollment results is incomplete for this gate.
 
 The template leaves release operator, security reviewer, and product owner approvals pending. Reviewers fill their own decisions after examining the artifacts. Store the approved evidence in the protected signing environment as described in [the release runbook](release-runbook.md).
 
-Publication requires the same updater commit that built the candidate. A PR merge or runtime fix invalidates an older build for publication. Build and accept the replacement before publishing. Acceptance completion and production publication are separate actions.
+First publication requires the same updater commit that built the candidate. Runtime, template, dependency, trust-root or publication-code changes require a newly built and accepted candidate. A partially completed publication may resume from a verified metadata-only successor under the [release runbook's recovery gate](release-runbook.md); the candidate identity and its complete signed targets remain fixed. Acceptance completion and production publication are separate actions.
 
 For site administrators, follow the [Chinese deployment tutorial](https://github.com/yaojingang/GEOFlow/blob/main/docs/blue-green-deployment-usage.md) or [English deployment tutorial](https://github.com/yaojingang/GEOFlow/blob/main/docs/blue-green-deployment-usage_en.md). Site-level backups and restoration drills should use the site's actual data size and retention policy.

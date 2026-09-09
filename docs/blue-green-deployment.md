@@ -22,7 +22,9 @@ geoflow-updater switch-back --instance primary
 geoflow-updater rollback --instance primary --recovery-point <point_id>
 ```
 
-现有未受管站点先运行 `enroll --instance-id primary --instance-root /opt/geoflow`。初次从单套布局转换为蓝绿需要维护窗口。首次安装生成的管理员凭据仅写入站点 `install-credentials.txt`；相同安装参数可在中断后重试，保留原密钥与已有数据。
+Updater `0.4.0` 配套 GEOFlow `3.1.0`。现有未受管站点先按 [3.1 升级说明](https://github.com/yaojingang/GEOFlow/blob/main/docs/deployment/GEOFLOW_V3_1_UPGRADE.md)维护升级至当前签名发布匹配的 Core 版本，再运行 `enroll --instance-id primary --instance-root /opt/geoflow`。已受管的 3.0.0 首次升级使用宿主机 CLI 预检并传入 `--plan-sha256` 和 `--allow-maintenance`，升级完成后再使用新版后台。
+
+初次从单套布局转换为蓝绿需要维护窗口；同序列转换只接受新接管时记录的完整相同签名发布身份。首次安装生成的管理员凭据仅写入站点 `install-credentials.txt`；相同安装参数可在中断后重试，保留原密钥与已有数据。
 
 稳定的 PostgreSQL、Redis 与入口由 infra Compose 管理，blue/green 拥有各自的 web、PHP、Reverb、全部队列和调度器。槽位间共享业务存储与会话身份，编译视图和应用网络分别隔离。旧请求、队列和调度子进程通过优雅排空交接；排空未完成时保留旧槽位并报告恢复待处理。
 
@@ -32,4 +34,4 @@ geoflow-updater rollback --instance primary --recovery-point <point_id>
 
 宿主机预检最多 25 分钟；管理后台通过实例 token、分操作授权码和预检摘要调用受限 socket API。网站的应用回切与数据恢复使用不同授权范围。
 
-发布采用 schema 3 并签名 `releases/<version>/upgrade-plan.json`。维护计划要求协议 3，在线计划要求协议 4。候选工作流校验 GEOFlow 的迁移文件清单；新 `planned-acceptance.yml` 验证两种原生架构的候选应用和真实入口契约。完整已安装主机的升级、数据库还原和崩溃恢复，以及登录、任务和 Reverb 行为，应随对应候选另行演练。上线前根据新旧应用并存峰值核实主机容量。
+发布采用 schema 3 并签名 `releases/<version>/upgrade-plan.json`。维护计划要求协议 3，在线计划要求协议 4。候选工作流校验 GEOFlow 的迁移文件清单；`planned-acceptance.yml` 在两种原生架构执行容器检查及完整安装、升级恢复和在线机制演练，覆盖数据库还原、中断恢复、登录、任务交接和 Reverb 行为。每个正式候选需要自己的完整验收及发布审批，见[主机验收说明](planned-host-acceptance.md)。上线前根据新旧应用并存峰值核实主机容量。
