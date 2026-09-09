@@ -141,6 +141,12 @@ jobs:
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
             mode: online
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+            mode: enrollment
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            mode: enrollment
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:

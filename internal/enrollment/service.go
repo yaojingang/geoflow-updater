@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -133,6 +134,10 @@ func (service Service) ProvisionFresh(request Request, release managed.Release) 
 }
 
 func (service Service) register(root string, infrastructure infrastructureConfig, release managed.Release, fresh bool) (Result, error) {
+	releaseIdentity, err := json.Marshal(release)
+	if err != nil {
+		return Result{}, fmt.Errorf("encode enrolled release identity: %w", err)
+	}
 	request := Request{InstanceID: "primary", Root: root}
 	postgresImage, redisImage, err := release.InfrastructureImages(infrastructure.PostgresMajor, infrastructure.RedisMajor)
 	if err != nil {
@@ -170,19 +175,20 @@ func (service Service) register(root string, infrastructure infrastructureConfig
 	}()
 
 	config := instance.Config{
-		SchemaVersion:   1,
-		ID:              request.InstanceID,
-		Root:            root,
-		ComposeFile:     filepath.Join(instanceDir, "docker-compose.managed.yml"),
-		EnvironmentFile: filepath.Join(instanceDir, "release.env"),
-		ControlToken:    filepath.Join(instanceDir, "control.token"),
-		ReleaseSequence: release.Sequence,
-		Version:         release.Version,
-		PostgresMajor:   infrastructure.PostgresMajor,
-		PostgresDataDir: infrastructure.PostgresDataDir,
-		PostgresMount:   infrastructure.PostgresContainerDataDir,
-		RedisMajor:      infrastructure.RedisMajor,
-		EnrolledAt:      service.now().UTC(),
+		SchemaVersion:         1,
+		ID:                    request.InstanceID,
+		Root:                  root,
+		ComposeFile:           filepath.Join(instanceDir, "docker-compose.managed.yml"),
+		EnvironmentFile:       filepath.Join(instanceDir, "release.env"),
+		ControlToken:          filepath.Join(instanceDir, "control.token"),
+		ReleaseSequence:       release.Sequence,
+		EnrolledReleaseSHA256: fmt.Sprintf("%x", sha256.Sum256(releaseIdentity)),
+		Version:               release.Version,
+		PostgresMajor:         infrastructure.PostgresMajor,
+		PostgresDataDir:       infrastructure.PostgresDataDir,
+		PostgresMount:         infrastructure.PostgresContainerDataDir,
+		RedisMajor:            infrastructure.RedisMajor,
+		EnrolledAt:            service.now().UTC(),
 	}
 
 	token, err := service.controlToken()

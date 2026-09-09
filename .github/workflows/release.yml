@@ -199,14 +199,39 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Download the approved candidate
+      - id: candidate-source
+        name: Download the approved candidate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          PUBLICATION_RESUME: ${{ needs.preflight.outputs.resume }}
         run: |
           [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.conclusion')" = "success"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.head_sha')" = "$GITHUB_SHA"
+          candidate_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.head_sha')"
+          [[ "$candidate_sha" =~ ^[a-f0-9]{40}$|^[a-f0-9]{64}$ ]]
+          if [ "$PUBLICATION_RESUME" = true ]; then
+            git merge-base --is-ancestor "$candidate_sha" "$GITHUB_SHA"
+            # A committed publication can be resumed after its metadata-only commit.
+            # Existing immutable metadata/targets, source, and trust roots stay fixed.
+            git diff --no-renames --name-only -z "$candidate_sha" "$GITHUB_SHA" > "$RUNNER_TEMP/publication-paths"
+            while IFS= read -r -d '' path; do
+              if ! [[ "$path" =~ ^tuf/repository/metadata/([1-9][0-9]*\.(snapshot|targets)\.json|timestamp\.json)$ || "$path" == tuf/repository/targets/* ]]; then
+                echo "Resume requires unchanged candidate source and trust: $path" >&2
+                exit 1
+              fi
+              test "$(git ls-tree "$GITHUB_SHA" -- "$path" | cut -d ' ' -f 1)" = 100644
+              if [ "$path" != tuf/repository/metadata/timestamp.json ]; then
+                if git cat-file -e "$candidate_sha:$path" 2>/dev/null; then
+                  echo "Resume cannot replace an existing immutable publication file: $path" >&2
+                  exit 1
+                fi
+              fi
+            done < "$RUNNER_TEMP/publication-paths"
+          else
+            test "$PUBLICATION_RESUME" = false
+            test "$candidate_sha" = "$GITHUB_SHA"
+          fi
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.name')" = "Build Phase C release candidate"
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.path')" = ".github/workflows/release-candidate.yml"
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.event')" = "workflow_dispatch"
@@ -214,10 +239,12 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name "phase-c-candidate-$CANDIDATE_RUN_ID" \
             --dir candidate
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
       - name: Validate candidate identity and publication authorization
         env:
           APPROVED_EVIDENCE_B64: ${{ secrets.PHASE_C_REHEARSAL_EVIDENCE_B64 }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_SOURCE_SHA: ${{ steps.candidate-source.outputs.candidate_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PHASE_C_EVIDENCE_SHA256: ${{ inputs.phase_c_evidence_sha256 }}
           SUPERADMIN_RISK_WAIVER: ${{ inputs.superadmin_risk_waiver }}
@@ -234,7 +261,7 @@ jobs:
           test "$(jq -er '.schema_version' candidate/candidate.json)" = "1"
           test "$(jq -er '.candidate_run_id' candidate/candidate.json)" = "$CANDIDATE_RUN_ID"
           test "$(jq -er '.updater.version' candidate/candidate.json)" = "$UPDATER_VERSION"
-          test "$(jq -er '.updater.commit' candidate/candidate.json)" = "$GITHUB_SHA"
+          test "$(jq -er '.updater.commit' candidate/candidate.json)" = "$CANDIDATE_SOURCE_SHA"
           test "$(jq -er '.geoflow.version' candidate/candidate.json)" = "$GEOFLOW_VERSION"
           test "$(jq -er '.geoflow.commit' candidate/candidate.json)" = "$GEOFLOW_SOURCE_COMMIT"
           test "$(jq -er '.geoflow.release_sequence' candidate/candidate.json)" = "$RELEASE_SEQUENCE"
@@ -317,18 +344,18 @@ jobs:
               }' > "$authorization"
           fi
           test "$(jq -er '.candidate' "$authorization" | jq -S .)" = "$(jq -S . candidate/candidate.json)"
-          if [ "${{ needs.preflight.outputs.resume }}" = "true" ]; then
-            snapshot_version="$(jq -er '.signed.meta["snapshot.json"].version' tuf/repository/metadata/timestamp.json)"
-            targets_version="$(jq -er '.signed.meta["targets.json"].version' "tuf/repository/metadata/${snapshot_version}.snapshot.json")"
-            manifest_hash="$(jq -er '.signed.targets["releases/current.json"].hashes.sha256' "tuf/repository/metadata/${targets_version}.targets.json")"
-            test "$manifest_hash" = "$(jq -er '.targets.release_manifest_sha256' candidate/candidate.json)"
-          fi
           for archive in candidate/dist/geoflow-updater_*.tar.gz; do
             gh attestation verify "$archive" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
-              --source-digest "$GITHUB_SHA"
+              --source-digest "$CANDIDATE_SOURCE_SHA"
           done
+      - name: Verify committed candidate targets before publication resumes
+        if: needs.preflight.outputs.resume == 'true'
+        run: |
+          go run ./cmd/geoflow-tuf verify-repository \
+            --repository-dir tuf/repository \
+            --targets-dir candidate/targets-source
       - name: Attest publication authorization
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

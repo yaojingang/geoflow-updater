@@ -2,8 +2,10 @@ package tufrepo_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,276 @@ import (
 	"github.com/yaojingang/geoflow-updater/internal/tufrepo"
 	"gopkg.in/yaml.v3"
 )
+
+func releaseWorkflowStep(t *testing.T, job, name string) string {
+	t.Helper()
+	contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct{ Steps []struct{ Name, Run string } }
+	}
+	if err := yaml.Unmarshal(contents, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range workflow.Jobs[job].Steps {
+		if step.Name == name {
+			return step.Run
+		}
+	}
+	t.Fatalf("workflow step %s/%s is missing", job, name)
+	return ""
+}
+
+func TestPublicationCandidateSourceIdentityOnResume(t *testing.T) {
+	script := releaseWorkflowStep(t, "publish", "Download the approved candidate")
+	for _, scenario := range []struct {
+		name, changedPath, resume string
+		wantPass                  bool
+	}{
+		{"first-publication-exact-source", "", "false", true},
+		{"resume-after-metadata-commit", "tuf/repository/metadata/timestamp.json", "true", true},
+		{"first-publication-rejects-metadata-descendant", "tuf/repository/metadata/timestamp.json", "false", false},
+		{"resume-after-snapshot-refresh", "tuf/repository/metadata/20.snapshot.json", "true", true},
+		{"resume-after-targets-publication", "tuf/repository/targets/releases/new.current.json", "true", true},
+		{"resume-rejects-runtime", "cmd/geoflow-updater/main.go", "true", false},
+		{"resume-rejects-runtime-library", "internal/deployment/executor.go", "true", false},
+		{"resume-rejects-compose", "assets/docker-compose.managed.yml", "true", false},
+		{"resume-rejects-installer", "packaging/scripts/install.sh", "true", false},
+		{"resume-rejects-dependencies", "go.sum", "true", false},
+		{"resume-rejects-embedded-trust", "tuf/trust.go", "true", false},
+		{"resume-rejects-root", "tuf/repository/metadata/root.json", "true", false},
+		{"resume-rejects-versioned-root", "tuf/repository/metadata/2.root.json", "true", false},
+		{"resume-rejects-release-workflow", ".github/workflows/release.yml", "true", false},
+		{"resume-rejects-evidence-code", "scripts/planned-evidence.py", "true", false},
+		{"resume-rejects-replaced-metadata", "tuf/repository/metadata/1.targets.json", "true", false},
+		{"resume-rejects-replaced-target", "tuf/repository/targets/releases/old.current.json", "true", false},
+		{"resume-rejects-deleted-target", "tuf/repository/targets/releases/old.current.json", "true", false},
+		{"resume-rejects-target-symlink", "tuf/repository/targets/releases/new.current.json", "true", false},
+		{"resume-rejects-renamed-source", "tuf/repository/targets/releases/source.txt", "true", false},
+		{"resume-rejects-unrelated-source", "tuf/repository/metadata/timestamp.json", "true", false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			root := t.TempDir()
+			git := func(args ...string) string {
+				t.Helper()
+				command := exec.Command("git", args...)
+				command.Dir = root
+				command.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+				output, err := command.CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, output)
+				}
+				return strings.TrimSpace(string(output))
+			}
+			git("init", "--quiet")
+			git("config", "user.name", "Release test")
+			git("config", "user.email", "release-test@example.invalid")
+			mustWrite(t, filepath.Join(root, "source.txt"), []byte("approved source\n"))
+			mustWrite(t, filepath.Join(root, "tuf/repository/metadata/1.targets.json"), []byte("immutable metadata\n"))
+			mustWrite(t, filepath.Join(root, "tuf/repository/targets/releases/old.current.json"), []byte("immutable target\n"))
+			git("add", ".")
+			git("commit", "--quiet", "-m", "candidate source")
+			candidateSHA := git("rev-parse", "HEAD")
+			if scenario.changedPath != "" {
+				mustWrite(t, filepath.Join(root, filepath.FromSlash(scenario.changedPath)), []byte("publication change\n"))
+				switch scenario.name {
+				case "resume-rejects-deleted-target":
+					if err := os.Remove(filepath.Join(root, scenario.changedPath)); err != nil {
+						t.Fatal(err)
+					}
+				case "resume-rejects-target-symlink":
+					path := filepath.Join(root, scenario.changedPath)
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink("../../../source.txt", path); err != nil {
+						t.Fatal(err)
+					}
+				case "resume-rejects-renamed-source":
+					if err := os.Rename(filepath.Join(root, "source.txt"), filepath.Join(root, scenario.changedPath)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				git("add", ".")
+				git("commit", "--quiet", "-m", "publication metadata")
+			}
+			publicationSHA := git("rev-parse", "HEAD")
+			if scenario.name == "resume-rejects-unrelated-source" {
+				candidateSHA = git("commit-tree", "HEAD^{tree}", "-m", "unrelated candidate")
+			}
+			bin := filepath.Join(root, "bin")
+			mustWrite(t, filepath.Join(bin, "gh"), []byte(`#!/bin/sh
+if [ "$1 $2" = 'run download' ]; then exit 0; fi
+case "$4" in
+  .conclusion) echo success ;;
+  .head_sha) echo "$TEST_CANDIDATE_SHA" ;;
+  .name) echo 'Build Phase C release candidate' ;;
+  .path) echo '.github/workflows/release-candidate.yml' ;;
+  .event) echo workflow_dispatch ;;
+  *) exit 3 ;;
+esac
+`))
+			if err := os.Chmod(filepath.Join(bin, "gh"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			outputPath := filepath.Join(root, "outputs")
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "bash", "-euo", "pipefail", "-c", script)
+			command.Dir = root
+			command.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"GITHUB_REPOSITORY=yaojingang/geoflow-updater", "CANDIDATE_RUN_ID=42", "GITHUB_SHA="+publicationSHA,
+				"TEST_CANDIDATE_SHA="+candidateSHA, "PUBLICATION_RESUME="+scenario.resume, "GITHUB_OUTPUT="+outputPath,
+				"RUNNER_TEMP="+root)
+			output, err := command.CombinedOutput()
+			if scenario.wantPass && err != nil {
+				t.Fatalf("candidate publication source rejected: %v\n%s", err, output)
+			}
+			if !scenario.wantPass && err == nil {
+				t.Fatalf("changed source authorized publication: %s", output)
+			}
+			if scenario.wantPass && scenario.resume == "true" {
+				outputs, err := os.ReadFile(outputPath)
+				if err != nil || !strings.Contains(string(outputs), fmt.Sprintf("candidate_sha=%s\n", candidateSHA)) {
+					t.Fatalf("resume lost candidate provenance: %v, outputs=%s", err, outputs)
+				}
+			}
+		})
+	}
+}
+
+func TestPublicationResumeRequiresEveryCandidateTarget(t *testing.T) {
+	script := releaseWorkflowStep(t, "publish", "Verify committed candidate targets before publication resumes")
+	bin := t.TempDir()
+	verifier := filepath.Join(bin, "geoflow-tuf")
+	build := exec.Command("go", "build", "-o", verifier, "./cmd/geoflow-tuf")
+	build.Dir = filepath.Join("..", "..")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build repository verifier: %v\n%s", err, output)
+	}
+	// Execute the workflow's CLI with a real compiled verifier in an isolated
+	// repository fixture. Only the Go compiler invocation is substituted.
+	mustWrite(t, filepath.Join(bin, "go"), []byte(`#!/bin/sh
+test "$1 $2" = 'run ./cmd/geoflow-tuf' || exit 3
+shift 2
+exec "$TEST_TUF_VERIFIER" "$@"
+`))
+	if err := os.Chmod(filepath.Join(bin, "go"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []struct {
+		name, changedTarget string
+		wantPass            bool
+	}{
+		{"same-candidate", "", true},
+		{"different-compose", "deploy/docker-compose.managed.yml", false},
+		{"different-version-document", "releases/3.1.0/version.json", false},
+		{"different-upgrade-plan", "releases/3.1.0/upgrade-plan.json", false},
+		{"different-updater-archive", "updater/0.4.0/geoflow-updater_0.4.0_linux_arm64.tar.gz", false},
+		{"different-checksums", "updater/0.4.0/checksums.txt", false},
+		{"extra-signed-online-target", "", false},
+		{"missing-signed-target", "", false},
+		{"bad-root-signature", "", false},
+		{"bad-timestamp-signature", "", false},
+		{"bad-snapshot-signature", "", false},
+		{"bad-targets-signature", "", false},
+		{"expired-metadata", "", false},
+		{"published-target-tampered", "", false},
+		{"published-target-missing", "", false},
+		{"published-target-symlink", "", false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			root := t.TempDir()
+			source := filepath.Join(root, "source")
+			candidate := filepath.Join(root, "candidate", "targets-source")
+			for _, target := range []string{"releases/current.json", "deploy/docker-compose.managed.yml",
+				"releases/3.1.0/version.json", "releases/3.1.0/upgrade-plan.json",
+				"updater/0.4.0/geoflow-updater_0.4.0_linux_amd64.tar.gz",
+				"updater/0.4.0/geoflow-updater_0.4.0_linux_arm64.tar.gz", "updater/0.4.0/checksums.txt"} {
+				contents := []byte("approved candidate " + target)
+				mustWrite(t, filepath.Join(candidate, filepath.FromSlash(target)), contents)
+				if target == scenario.changedTarget {
+					contents = []byte("another candidate " + target)
+				}
+				mustWrite(t, filepath.Join(source, filepath.FromSlash(target)), contents)
+			}
+			manifestHash := sha256.Sum256([]byte("approved candidate releases/current.json"))
+			mustWrite(t, filepath.Join(root, "candidate/candidate.json"), []byte(fmt.Sprintf(
+				`{"targets":{"release_manifest_sha256":"%x"}}`, manifestHash)))
+			if scenario.name == "extra-signed-online-target" {
+				mustWrite(t, filepath.Join(source, "online-fixture/release.json"), []byte("unapproved online fixture"))
+			}
+			if scenario.name == "missing-signed-target" {
+				if err := os.Remove(filepath.Join(source, "releases/3.1.0/upgrade-plan.json")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			now := time.Now().UTC()
+			if scenario.name == "expired-metadata" {
+				now = now.Add(-8 * 24 * time.Hour)
+			}
+			repository := filepath.Join(root, "tuf", "repository")
+			if err := tufrepo.Initialize(tufrepo.InitializeOptions{KeysDir: filepath.Join(root, "keys"),
+				RepositoryDir: repository, TargetsDir: source, Now: func() time.Time { return now }}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(scenario.name, "bad-") {
+				role := strings.TrimSuffix(strings.TrimPrefix(scenario.name, "bad-"), "-signature")
+				name := role + ".json"
+				if role == "snapshot" || role == "targets" {
+					name = "1." + name
+				}
+				path := filepath.Join(repository, "metadata", name)
+				contents, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var envelope map[string]any
+				if err := json.Unmarshal(contents, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range envelope["signatures"].([]any) {
+					entry.(map[string]any)["sig"] = strings.Repeat("0", 128)
+				}
+				contents, err = json.Marshal(envelope)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mustWrite(t, path, contents)
+			}
+			if strings.HasPrefix(scenario.name, "published-target-") {
+				path := filepath.Join(repository, "targets/releases", fmt.Sprintf("%x.current.json", manifestHash))
+				switch scenario.name {
+				case "published-target-tampered":
+					mustWrite(t, path, []byte("damaged target bytes"))
+				case "published-target-missing", "published-target-symlink":
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if scenario.name == "published-target-symlink" {
+						if err := os.Symlink(filepath.Join(candidate, "releases/current.json"), path); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "bash", "-euo", "pipefail", "-c", script)
+			command.Dir = root
+			command.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "TEST_TUF_VERIFIER="+verifier)
+			output, err := command.CombinedOutput()
+			if scenario.wantPass && err != nil {
+				t.Fatalf("same published candidate rejected: %v\n%s", err, output)
+			}
+			if !scenario.wantPass && err == nil {
+				t.Fatalf("different committed target accepted on resume: %s", output)
+			}
+		})
+	}
+}
 
 func TestPublicationResumeExecutesVerifiedSchemaThreePlanPreflight(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))

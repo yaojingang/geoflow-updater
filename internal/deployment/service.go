@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -80,8 +82,13 @@ func (service *Service) Preflight(ctx context.Context, instanceID string, releas
 	if err != nil {
 		return err
 	}
-	if release.Sequence <= config.ReleaseSequence {
+	if release.Sequence < config.ReleaseSequence {
 		return fmt.Errorf("signed release sequence %d does not exceed installed sequence %d", release.Sequence, config.ReleaseSequence)
+	}
+	if release.Sequence == config.ReleaseSequence {
+		if err := service.validateEnrolledConversion(config, release); err != nil {
+			return fmt.Errorf("same-release layout conversion is unavailable: %w", err)
+		}
 	}
 	if len(release.VersionDocument) == 0 {
 		return errors.New("signed release is missing its version document")
@@ -95,6 +102,60 @@ func (service *Service) Preflight(ctx context.Context, instanceID string, releas
 	report := service.Doctor.Run(ctx, instanceID)
 	if !updatePreflightReportAllowed(report) {
 		return fmt.Errorf("current deployment diagnostics returned %s", report.Status)
+	}
+	return nil
+}
+
+func (service *Service) validateEnrolledConversion(config instance.Config, release managed.Release) error {
+	directory := service.instanceDirectory(config.ID)
+	if config.Layout != "" || config.ActiveSlot != "" || config.InfraComposeFile != "" || config.InfraEnvironmentFile != "" ||
+		config.ComposeFile != filepath.Join(directory, "docker-compose.managed.yml") || config.EnvironmentFile != filepath.Join(directory, "release.env") {
+		return errors.New("only the enrolled legacy layout can be converted")
+	}
+	if err := release.Validate(); err != nil {
+		return err
+	}
+	plan, err := release.Plan()
+	if err != nil || plan.Strategy != managed.StrategyMaintenance || !plan.AllowsSource(config.ReleaseSequence) {
+		return errors.New("the enrolled release requires a signed maintenance plan permitting its source")
+	}
+	if config.Version != release.Version || !regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`).MatchString(release.SourceCommit) {
+		return errors.New("the enrolled release version or source identity does not match")
+	}
+	identity, err := json.Marshal(release)
+	if err != nil || config.EnrolledReleaseSHA256 != fmt.Sprintf("%x", sha256.Sum256(identity)) {
+		return errors.New("the current signed release differs from the complete enrolled release identity")
+	}
+	for path, expected := range map[string][]byte{
+		config.ComposeFile:                         release.ComposeTemplate,
+		filepath.Join(config.Root, "version.json"): release.VersionDocument,
+	} {
+		if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(expected)) {
+			return errors.New("the installed deployment content differs from its signed release")
+		}
+		actual, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(actual, expected) {
+			return errors.New("the installed deployment content differs from its signed release")
+		}
+	}
+	if info, err := os.Lstat(config.EnvironmentFile); err != nil || !info.Mode().IsRegular() || info.Size() > 1024*1024 {
+		return errors.New("the installed release environment is not a bounded regular file")
+	}
+	environment, err := os.ReadFile(config.EnvironmentFile)
+	if err != nil {
+		return err
+	}
+	postgres, redis, err := release.InfrastructureImages(config.PostgresMajor, config.RedisMajor)
+	if err != nil {
+		return err
+	}
+	expected, err := replaceEnvironmentValues(environment, map[string]string{
+		"GEOFLOW_RELEASE_SEQUENCE": strconv.FormatUint(release.Sequence, 10), "GEOFLOW_VERSION": release.Version,
+		"GEOFLOW_APP_IMAGE": release.AppImage, "GEOFLOW_WEB_IMAGE": release.WebImage,
+		"GEOFLOW_POSTGRES_IMAGE": postgres, "GEOFLOW_REDIS_IMAGE": redis,
+	})
+	if err != nil || !bytes.Equal(environment, expected) {
+		return errors.New("the installed image pins differ from its signed release")
 	}
 	return nil
 }

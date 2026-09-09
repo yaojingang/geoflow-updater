@@ -60,6 +60,31 @@ def target(repository, name):
     return path
 
 
+def unmanaged_compose(compose, baseline):
+    # YAML loading expanded the legacy anchor; its unused image variable would
+    # otherwise still require managed release.env during Compose interpolation.
+    compose.pop('x-app-base', None)
+    app = compose['services']['app']
+    app['command'] = ['php-fpm', '-F']
+    app.pop('group_add', None)
+    app['environment'] = {key: value for key, value in app['environment'].items() if not key.startswith('GEOFLOW_UPDATER_')}
+    app['volumes'] = [volume for volume in app['volumes'] if '/run/geoflow-updater' not in volume and
+                      '/run/secrets/geoflow-updater-control-token' not in volume]
+    for name, service in compose['services'].items():
+        service.pop('build', None)
+        if name == 'postgres':
+            service['image'] = baseline['postgres_images']['18']
+        elif name == 'redis':
+            service['image'] = baseline['redis_images']['8']
+            service['volumes'] = ['./docker-data/prod/redis:/data']
+        elif name == 'web':
+            service['image'] = baseline['web_image']
+        else:
+            service['image'] = baseline['app_image']
+            service.setdefault('environment', {}).update(AUTO_MIGRATE='false', AUTO_INSTALL_ONCE='false')
+    return compose
+
+
 class UnixConnection(http.client.HTTPConnection):
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -327,10 +352,14 @@ class Rehearsal:
         require(len(set(self.factors.values())) == 3, 'Expected three distinct authorization factors')
         require((INSTANCE / 'mutation.secret').stat().st_mode & 0o777 == 0o600, 'Master secret permissions changed')
 
-    def legacy(self):
-        repository = REPO / 'tuf/repository'
+    def legacy(self, same_candidate=False):
+        repository = (self.candidate if same_candidate else REPO) / 'tuf/repository'
         baseline = read_json(target(repository, 'releases/current.json'))
-        require(baseline['schema_version'] == 2 and baseline['release_sequence'] < self.manifest['release_sequence'], 'Expected an older stable baseline')
+        if same_candidate:
+            require(baseline == self.manifest and baseline['schema_version'] == 3,
+                    'Same-version enrollment must use the exact signed candidate')
+        else:
+            require(baseline['schema_version'] == 2 and baseline['release_sequence'] < self.manifest['release_sequence'], 'Expected an older stable baseline')
         self.repository(repository)
         ROOT.mkdir(mode=0o755)
         for relative in ['storage/app/public', 'storage/app/private', 'storage/framework/cache/data',
@@ -372,16 +401,106 @@ class Rehearsal:
         self.wait(initialized, 'initialized existing PostgreSQL database over TCP', 120)
         self.run('/usr/bin/docker', 'stop', 'geoflow-rehearsal-bootstrap-postgres')
         self.run('/usr/bin/docker', 'rm', 'geoflow-rehearsal-bootstrap-postgres')
+        if same_candidate:
+            self.unmanaged_candidate(baseline)
         self.run('geoflow-updater', 'enroll', '--instance-root', ROOT)
         self.compose('up', '-d', '--wait', 'postgres', 'redis')
-        self.compose('run', '--rm', '--no-deps', '-e', 'GEOFLOW_SECURITY_FRESH_INSTALL_CONFIRMED=true', 'init', 'php', 'artisan', 'migrate', '--force')
-        self.compose('run', '--rm', '--no-deps', 'init', 'php', 'artisan', 'geoflow:install', '--no-interaction')
+        if not same_candidate:
+            self.compose('run', '--rm', '--no-deps', '-e', 'GEOFLOW_SECURITY_FRESH_INSTALL_CONFIRMED=true', 'init', 'php', 'artisan', 'migrate', '--force')
+            self.compose('run', '--rm', '--no-deps', 'init', 'php', 'artisan', 'geoflow:install', '--no-interaction')
+        else:
+            require(self.query("SELECT migration || ':' || batch FROM migrations ORDER BY migration;") == self.unmanaged_migrations,
+                    'Enrollment changed the initialized migration history')
+            self.compose('run', '--rm', '--no-deps', 'init', 'php', 'artisan', 'up')
         self.compose('up', '-d', '--wait', '--wait-timeout', '600')
         self.authorize()
         self.healthy('legacy')
         self.login(values['GEOFLOW_ADMIN_PASSWORD'])
         self.baseline = baseline
-        self.record('legacy-enrollment', 'Existing signed stable deployment enrolled and started on PostgreSQL 18 / Redis 8')
+        self.record('legacy-enrollment', 'Existing deployment enrolled and started with signed images on PostgreSQL 18 / Redis 8')
+
+    def unmanaged_candidate(self, baseline):
+        require(not INSTANCE.exists(), 'Unmanaged fixture already has an updater instance')
+        # The signed legacy topology runs the real application before enrollment.
+        # Remove its updater bridge so the initial site has no control capability.
+        compose = yaml.safe_load(target(self.candidate / 'tuf/repository', baseline['compose_target']).read_text())
+        compose = unmanaged_compose(compose, baseline)
+        path = ROOT / 'docker-compose.unmanaged.yml'
+        path.write_text(yaml.safe_dump(compose, sort_keys=False))
+        environment = ROOT / 'unmanaged.env'
+        environment.write_text(f'GEOFLOW_INSTANCE_ROOT={ROOT}\nGEOFLOW_POSTGRES_DATA_DIR={ROOT}/docker-data/prod/postgres\n'
+                               'GEOFLOW_POSTGRES_CONTAINER_DATA_DIR=/var/lib/postgresql\n')
+        command = ['/usr/bin/docker', 'compose', '--env-file', ROOT / '.env.prod', '--env-file', environment, '-f', path]
+        self.run(*command, 'up', '-d', '--wait', 'postgres', 'redis')
+        self.run(*command, 'run', '--rm', '--no-deps', '-e', 'GEOFLOW_SECURITY_FRESH_INSTALL_CONFIRMED=true',
+                 'init', 'php', 'artisan', 'migrate', '--force')
+        self.run(*command, 'run', '--rm', '--no-deps', 'init', 'php', 'artisan', 'geoflow:install', '--no-interaction')
+        self.run(*command, 'up', '-d', '--no-build', '--wait', '--wait-timeout', '600')
+        with urllib.request.urlopen('http://localhost:18080/up', timeout=15) as response:
+            require(response.status == 200, 'Unmanaged candidate did not become healthy')
+        require(self.query("SELECT count(*) FROM admins WHERE username='admin';") == '1', 'Unmanaged administrator was not initialized')
+        require(not INSTANCE.exists(), 'The unmanaged site unexpectedly acquired updater state')
+        self.unmanaged_migrations = self.query("SELECT migration || ':' || batch FROM migrations ORDER BY migration;")
+        self.save('unmanaged-candidate.json', {'app_image': baseline['app_image'], 'web_image': baseline['web_image'],
+            'version': baseline['version'], 'sequence': baseline['release_sequence'],
+            'migration_history': self.unmanaged_migrations})
+        self.record('unmanaged-candidate-site', 'Signed legacy topology without the updater bridge initialized a healthy real site and administrator before enrollment')
+        self.run(*command, 'exec', '-T', 'app', 'php', 'artisan', 'down')
+        self.run(*command, 'down', '--timeout', '960')
+
+    def enrollment(self):
+        self.current = 'same-sequence-enrollment'
+        self.legacy(same_candidate=True)
+        enrolled = self.config()
+        proof = enrolled.get('enrolled_release_sha256', '')
+        sequence = self.manifest['release_sequence']
+        require(not enrolled.get('layout') and enrolled['release_sequence'] == sequence and
+                enrolled['version'] == self.manifest['version'] and re.fullmatch(r'[a-f0-9]{64}', proof),
+                'Enrollment did not persist the candidate identity in the legacy layout')
+        self.save('enrollment-identity.json', {'release_sequence': sequence, 'enrolled_release_sha256': proof})
+        self.fixture()
+
+        def conversion_plan(label):
+            plan = self.api('GET', 'plan')
+            require(plan['strategy'] == 'maintenance' and plan['layout_change'] and
+                    plan['source_sequence'] == sequence and plan['target_sequence'] == sequence and
+                    not plan['pending_migrations'], 'Expected a same-sequence maintenance layout conversion')
+            self.save('plan-' + label + '.json', plan)
+            return {'allow_maintenance': True, 'expected_plan_sha256': plan['plan_sha256']}
+
+        def converted(label):
+            config = self.config()
+            require(config.get('layout') == 'blue-green' and config.get('active_slot') in ['blue', 'green'] and
+                    config['release_sequence'] == sequence and config.get('enrolled_release_sha256') == proof,
+                    'Conversion lost its same-sequence enrollment identity')
+            self.healthy(label)
+
+        payload = conversion_plan('enrollment')
+        self.record('same-sequence-enrollment', 'Real enrollment persisted the signed identity and previewed maintenance conversion without changing sequence')
+        self.current = 'same-sequence-layout-conversion'
+        operation = self.mutate('updates', 'update', payload, 'enrollment-conversion')
+        converted('enrollment-conversion')
+        checkpoint = operation['recovery_point_id']
+        saved = yaml.safe_load((Path('/var/backups/geoflow-updater/primary') / checkpoint / 'managed/instance.yml').read_text())
+        require(not saved.get('layout') and saved.get('enrolled_release_sha256') == proof,
+                'The recovery point omitted the legacy enrollment identity')
+        self.record('same-sequence-layout-conversion', 'Same-version maintenance conversion completed and backed up the legacy layout and enrolled identity')
+        self.current = 'restored-enrollment-legacy'
+        self.corrupt('enrollment-restore', config=True)
+        self.mutate('rollbacks', 'rollback', {'recovery_point_id': checkpoint}, 'enrollment-restore')
+        self.restored('enrollment-legacy')
+        require(not self.config().get('layout') and self.config().get('enrolled_release_sha256') == proof,
+                'Full restoration did not restore the legacy enrollment identity')
+        self.run('systemctl', 'restart', 'geoflow-updater')
+        self.wait_for_agent()
+        self.current = 'same-sequence-enrollment-retry'
+        self.mutate('updates', 'update', conversion_plan('enrollment-retry'), 'enrollment-retry')
+        converted('enrollment-retry')
+        self.session('after-enrollment-retry')
+        self.record('same-sequence-enrollment-retry', 'After full restoration and agent restart, the restored identity authorized another same-sequence conversion')
+        rejection = self.api('GET', 'plan', expected=503)
+        require(rejection.get('error') == 'plan_failed', 'The already converted same-sequence release was not rejected')
+        self.record('enrollment-repeat-rejected', 'A healthy converted deployment rejects another same-sequence conversion preview')
 
     def fixture(self):
         self.query('CREATE TABLE IF NOT EXISTS geoflow_rehearsal_markers (id integer PRIMARY KEY, value text NOT NULL);'
@@ -570,7 +689,7 @@ def main():
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--evidence', required=True)
     parser.add_argument('--platform', required=True, choices=['linux-amd64', 'linux-arm64'])
-    parser.add_argument('--mode', required=True, choices=['upgrade', 'install', 'online'])
+    parser.add_argument('--mode', required=True, choices=['upgrade', 'install', 'online', 'enrollment'])
     rehearsal = Rehearsal(parser.parse_args())
     success = False
     try:
