@@ -360,7 +360,9 @@ func (service *Service) startServices(ctx context.Context, config instance.Confi
 			return err
 		}
 	}
-	return service.command(ctx, config, append([]string{"up", "-d", "--no-deps"}, names...)...)
+	// Readiness checks must see healthy containers after startup. HTTP can respond
+	// before Docker completes its first health check, including during recovery.
+	return service.command(ctx, config, append([]string{"up", "-d", "--no-deps", "--wait", "--wait-timeout", "180"}, names...)...)
 }
 
 func (service *Service) copyAssets(ctx context.Context, config instance.Config) error {
