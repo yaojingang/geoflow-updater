@@ -156,10 +156,14 @@ func (service *Service) QuiesceForRecovery(ctx context.Context, instanceID strin
 		return err
 	}
 
-	return service.quiesce(ctx, instanceID, config, false)
+	topologies, err := service.recoveryTopologies(config)
+	if err != nil {
+		return err
+	}
+	return service.quiesce(ctx, instanceID, config, false, topologies[1:]...)
 }
 
-func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config, resumeOnFailure bool) error {
+func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config, resumeOnFailure bool, additional ...instance.Config) error {
 	drainCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
 	// A stopped application is a normal state during recovery. Enter maintenance
@@ -190,10 +194,13 @@ func (service *Service) quiesce(ctx context.Context, instanceID string, config i
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fail(err)
 	}
-	configs := []instance.Config{config}
-	if config.Layout == LayoutBlueGreen {
-		other := config
-		other.ActiveSlot = otherSlot(config.ActiveSlot)
+	configs := append([]instance.Config{config}, additional...)
+	for _, topology := range append([]instance.Config(nil), configs...) {
+		if topology.Layout != LayoutBlueGreen {
+			continue
+		}
+		other := topology
+		other.ActiveSlot = otherSlot(topology.ActiveSlot)
 		other.ComposeFile = filepath.Join(service.instanceDirectory(instanceID), "slots", other.ActiveSlot, "docker-compose.yml")
 		other.EnvironmentFile = filepath.Join(filepath.Dir(other.ComposeFile), "release.env")
 		if err := regularFile(other.ComposeFile); err == nil {
@@ -205,7 +212,12 @@ func (service *Service) quiesce(ctx context.Context, instanceID string, config i
 			return fail(err)
 		}
 	}
+	seen := map[string]bool{}
 	for _, slot := range configs {
+		if seen[slot.ComposeFile] {
+			continue
+		}
+		seen[slot.ComposeFile] = true
 		if err := service.drainBackground(drainCtx, slot); err != nil {
 			return fail(err)
 		}
@@ -215,8 +227,16 @@ func (service *Service) quiesce(ctx context.Context, instanceID string, config i
 	}
 
 	// Redis is stopped gracefully before its files enter a maintenance checkpoint.
-	if err := service.drainServices(drainCtx, infrastructureConfig(config), "redis"); err != nil {
-		return fail(err)
+	seen = map[string]bool{}
+	for _, topology := range configs {
+		infra := infrastructureConfig(topology)
+		if seen[infra.ComposeFile] {
+			continue
+		}
+		seen[infra.ComposeFile] = true
+		if err := service.drainServices(drainCtx, infra, "redis"); err != nil {
+			return fail(err)
+		}
 	}
 	return nil
 }
@@ -292,6 +312,10 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, recover
 	if err != nil {
 		return err
 	}
+	topologies, err := service.recoveryTopologies(config)
+	if err != nil {
+		return err
+	}
 	if service.Recoveries == nil {
 		return errors.New("recovery point store is unavailable")
 	}
@@ -309,8 +333,15 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, recover
 	if err := service.Recoveries.Validate(config, recoveryPointID); err != nil {
 		return err
 	}
-	if config.Layout == LayoutBlueGreen && source.Layout != LayoutBlueGreen {
-		if err := service.command(ctx, infrastructureConfig(config), "down", "--remove-orphans"); err != nil {
+	destination := infrastructureConfig(source)
+	seen := map[string]bool{}
+	for _, topology := range topologies {
+		infra := infrastructureConfig(topology)
+		if infra.ComposeFile == destination.ComposeFile || seen[infra.ComposeFile] {
+			continue
+		}
+		seen[infra.ComposeFile] = true
+		if err := service.command(ctx, infra, "down", "--remove-orphans"); err != nil {
 			return err
 		}
 	}
