@@ -135,6 +135,12 @@ jobs:
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
             mode: install
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+            mode: online
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            mode: online
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:
@@ -142,7 +148,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install rehearsal parser
-        run: sudo apt-get update -qq && sudo apt-get install -y python3-yaml
+        run: sudo apt-get update -qq && sudo apt-get install -y python3-yaml python3-websocket
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io

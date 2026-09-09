@@ -5,11 +5,14 @@ import json
 from pathlib import Path
 
 PLATFORMS = {'linux-amd64': 'x86_64', 'linux-arm64': 'aarch64'}
-SCOPE = 'maintenance-upgrade-restore-stage-interruption-and-install-retry'
+SCOPE = 'maintenance-upgrade-restore-stage-interruption-install-retry-and-online-fixture'
 CONTAINER_CHECKS = {'signed-image-identity', 'fresh-migrations', 'first-install', 'backfills',
                     'cache-compilation', 'standalone-readiness', 'install-idempotency',
                     'real-ingress-switch-and-stream'}
 HOST_CHECKS = {
+    'online': {'native-candidate-install', 'session-login', 'fresh-install-retry',
+               'online-upgrade', 'online-http-session', 'online-queue-handover',
+               'online-reverb-cross-slot', 'online-reverb-reconnect', 'online-switch-back-preserves-data'},
     'install': {'native-candidate-install', 'session-login', 'fresh-install-retry'},
     'upgrade': {'native-candidate-install', 'legacy-enrollment', 'session-login',
                 'session-after-upgrade', 'signed-upgrade', 'complete-backup-restore',
@@ -61,7 +64,7 @@ def assemble(root, run_url):
     evidence = {
         'schema_version': 1, 'candidate': candidate,
         'verification_scope': 'planned-container-contract-and-ingress', 'installed_host_scope': SCOPE,
-        'limitations': ['Online-compatible application switch-back and live business continuity require an online signed candidate.'],
+        'limitations': ['Online fixture uses identical application code with no pending migrations. Each production online source/target pair requires its own compatibility approval.'],
         'architectures': {},
         'approvals': {role: {'name': '', 'decision': 'pending'} for role in
                       ['release_operator', 'security_reviewer', 'product_owner']},
@@ -87,12 +90,15 @@ def main():
     check.add_argument('--candidate', type=Path, required=True)
     check.add_argument('--evidence', type=Path, required=True)
     check.add_argument('--approved', action='store_true')
+    check.add_argument('--plan', type=Path, required=True)
     args = parser.parse_args()
     if args.command == 'assemble':
         evidence = assemble(args.root, args.run_url)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(evidence, indent=2) + '\n')
     else:
+        require(read(args.plan)['strategy'] == 'maintenance',
+                'Production online plans require source-to-target compatibility acceptance; the same-application fixture is insufficient.')
         validate(read(args.evidence), read(args.candidate), args.approved)
 
 

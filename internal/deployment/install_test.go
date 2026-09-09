@@ -37,11 +37,17 @@ func testInstallRetry(t *testing.T, fault string) {
 	root := filepath.Join(installSiteParent(t), "site")
 	release := testRelease(t, false)
 	var calls []string
-	adminSeeded, knowledgeSynced := false, false
+	adminSeeded, knowledgeSynced, edgeNetworkReady := false, false, false
 	runner := functionRunner(func(ctx context.Context, in io.Reader, out io.Writer, name string, args ...string) error {
 		cmd := strings.Join(args, " ")
 		calls = append(calls, cmd)
 		switch {
+		case strings.HasPrefix(cmd, "network create "):
+			edgeNetworkReady = true
+		case strings.Contains(cmd, "up -d --no-deps") && strings.HasSuffix(cmd, "app reverb web"):
+			if !edgeNetworkReady {
+				return errors.New("network geoflow-primary-edge declared as external, but could not be found")
+			}
 		case strings.Contains(cmd, "artisan geoflow:install"):
 			if fault == "seed-admin" && !adminSeeded {
 				adminSeeded = true
@@ -254,6 +260,23 @@ func TestNewSiteEnvironmentUsesIndependentRandomSecrets(t *testing.T) {
 	}
 	if !strings.Contains(string(first), "GEOFLOW_NGINX_PUBLIC_PORT=8443") {
 		t.Fatal("public port not preserved")
+	}
+}
+
+func TestNewSiteEnvironmentRoutesReverbThroughTheManagedEntrance(t *testing.T) {
+	origin, _ := url.Parse("https://site.test:8443")
+	environment, _, err := newSiteEnvironment(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, expected := range map[string]string{
+		"REVERB_HOST": "site.test", "REVERB_PORT": "8443", "REVERB_SCHEME": "https",
+		"REVERB_SERVER_PATH": "/reverb", "REVERB_BROADCAST_HOST": "reverb",
+		"REVERB_BROADCAST_PORT": "18080", "REVERB_BROADCAST_SCHEME": "http",
+	} {
+		if value, err := environmentValue(environment, key); err != nil || value != expected {
+			t.Errorf("%s = %q, %v; want %q", key, value, err, expected)
+		}
 	}
 }
 

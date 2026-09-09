@@ -217,13 +217,14 @@ class Rehearsal:
             self.mask(cookie.value)
         self.session('login')
 
-    def session(self, label):
+    def session(self, label, record=True):
         with self.browser.open('http://localhost:18080/geo_admin/system-updates', timeout=30) as response:
             require(response.status == 200 and '/system-updates' in response.url, 'Authenticated session unavailable: ' + label)
             require('name="current_admin_password"' in response.read().decode(), 'Update authorization controls missing')
         for cookie in self.cookies:
             self.mask(cookie.value)
-        self.record('session-' + label, 'Real administrator HTTP session reaches the protected update center')
+        if record:
+            self.record('session-' + label, 'Real administrator HTTP session reaches the protected update center')
 
     def setup(self):
         require(os.geteuid() == 0, 'Run through sudo on a disposable GitHub runner')
@@ -326,6 +327,8 @@ class Rehearsal:
             'CACHE_STORE': 'redis', 'SESSION_DRIVER': 'database', 'QUEUE_CONNECTION': 'redis', 'BROADCAST_CONNECTION': 'reverb',
             'REVERB_APP_ID': 'rehearsal', 'REVERB_APP_KEY': 'rehearsal', 'REVERB_APP_SECRET': self.mask(secrets.token_hex(24)),
             'REVERB_HOST': 'localhost', 'REVERB_PORT': '18080', 'REVERB_SCHEME': 'http',
+            'REVERB_SERVER_PATH': '/reverb', 'REVERB_BROADCAST_HOST': 'reverb',
+            'REVERB_BROADCAST_PORT': '18080', 'REVERB_BROADCAST_SCHEME': 'http',
             'GEOFLOW_ADMIN_USERNAME': 'admin', 'GEOFLOW_ADMIN_EMAIL': 'rehearsal@example.invalid',
             'GEOFLOW_ADMIN_PASSWORD': self.mask(secrets.token_hex(24)), 'GEOFLOW_INITIAL_ADMIN_HINT_ENABLED': 'false',
             'GEOFLOW_TELEMETRY_ENABLED': 'false', 'GEOFLOW_UPDATE_CHECK_ENABLED': 'false',
@@ -371,7 +374,7 @@ class Rehearsal:
         self.migrations = self.query('SELECT migration || \':\' || batch FROM migrations ORDER BY migration;')
 
     def corrupt(self, label, config=False):
-        self.query("UPDATE geoflow_rehearsal_markers SET value='changed';")
+        self.query("UPDATE geoflow_rehearsal_markers SET value='changed' WHERE id=1;")
         self.redis('SET', 'geoflow:planned-rehearsal:marker', 'changed')
         (ROOT / 'storage/app/rehearsal.txt').write_text('changed')
         if config:
@@ -499,6 +502,10 @@ class Rehearsal:
         self.login(self.mask(password[1]))
         self.record('fresh-install-retry', 'Killed installer after real administrator initialization; repeated install preserved credentials and completed readiness')
 
+    def online(self):
+        from planned_online import run_online
+        run_online(self, ROOT, INSTANCE, FAULT, MARKER, require, sha)
+
     def finish(self, success):
         if not self.owns_evidence:
             return
@@ -534,7 +541,7 @@ def main():
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--evidence', required=True)
     parser.add_argument('--platform', required=True, choices=['linux-amd64', 'linux-arm64'])
-    parser.add_argument('--mode', required=True, choices=['upgrade', 'install'])
+    parser.add_argument('--mode', required=True, choices=['upgrade', 'install', 'online'])
     rehearsal = Rehearsal(parser.parse_args())
     success = False
     try:

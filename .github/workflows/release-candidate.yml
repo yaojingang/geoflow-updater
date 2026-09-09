@@ -217,6 +217,8 @@ jobs:
             '{schema_version:1,candidate_run_id:$candidate_run_id,updater:{version:$updater_version,commit:$updater_commit,archives:{"linux-amd64":$amd64_sha256,"linux-arm64":$arm64_sha256}},geoflow:{version:$geoflow_version,commit:$geoflow_commit,release_sequence:$release_sequence,app_digest:$app_digest,web_digest:$web_digest},targets:{release_manifest_sha256:$release_manifest_sha256,compose_sha256:$compose_sha256,version_document_sha256:$version_document_sha256,upgrade_plan_sha256:$upgrade_plan_sha256}}' \
             > candidate/candidate.json
           jq . candidate/candidate.json
+      - name: Build and sign the isolated online rehearsal fixture
+        run: python3 scripts/build-online-rehearsal.py
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: candidate/dist/geoflow-updater_*.tar.gz

@@ -302,7 +302,8 @@ jobs:
             printf '%s' "$APPROVED_EVIDENCE_B64" | base64 --decode > "$evidence"
             test "$(sha256sum "$evidence" | cut -d ' ' -f 1)" = "$PHASE_C_EVIDENCE_SHA256"
             python3 scripts/planned-evidence.py validate --candidate candidate/candidate.json \
-              --evidence "$evidence" --approved
+              --evidence "$evidence" --approved \
+              --plan "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json"
             jq -S -n \
               --slurpfile candidate candidate/candidate.json \
               --arg evidence_sha256 "$PHASE_C_EVIDENCE_SHA256" \

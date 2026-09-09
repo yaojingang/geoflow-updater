@@ -1,7 +1,11 @@
 """Reject incomplete or mixed-candidate publication evidence."""
 import copy
 import importlib.util
+import json
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location('planned_evidence', Path(__file__).with_name('planned-evidence.py'))
@@ -31,6 +35,21 @@ def complete():
 class EvidenceTests(unittest.TestCase):
     def test_complete_same_candidate(self):
         gate.validate(*complete(), approved=True)
+
+    def test_cli_requires_production_pair_acceptance_for_online_plans(self):
+        evidence, candidate = complete()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'candidate.json').write_text(json.dumps(candidate))
+            (root / 'evidence.json').write_text(json.dumps(evidence))
+            for strategy, expected in [('maintenance', 0), ('online', 1)]:
+                (root / 'plan.json').write_text(json.dumps({'strategy': strategy}))
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name('planned-evidence.py')),
+                    'validate', '--candidate', str(root / 'candidate.json'), '--evidence', str(root / 'evidence.json'),
+                    '--plan', str(root / 'plan.json'), '--approved'], capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if strategy == 'online':
+                    self.assertIn('source-to-target compatibility acceptance', result.stderr)
 
     def test_fail_closed(self):
         mutations = {
