@@ -23,6 +23,10 @@ jobs:
         run: go vet ./...
       - name: Test with race detector
         run: go test -race ./...
+      - name: Test candidate evidence and host readiness
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y python3-yaml
+          /usr/bin/python3 -m unittest discover -s scripts -p 'test_planned*.py' -v
       - name: Verify real ingress switching and open streams
         run: |
           docker pull nginx:1.31.1-alpine

@@ -44,6 +44,7 @@ class ReverbConnection:
 
 def run_online(rehearsal, root, instance, fault, marker, require, sha):
     rehearsal.install()
+    rehearsal.current = 'online-fixture-setup'
     identity = rehearsal.identity['online_fixture']
     fixture = rehearsal.candidate / 'online-fixture'
     manifest = fixture / 'targets-source/releases/current.json'
