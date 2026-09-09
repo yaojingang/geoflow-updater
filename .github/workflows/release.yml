@@ -155,10 +155,8 @@ jobs:
               "updater/$UPDATER_VERSION/checksums.txt"; do
               jq -e --arg target "$target" '.signed.targets[$target] != null' "tuf/repository/metadata/${targets_version}.targets.json" >/dev/null
             done
-            if ! gh release view "v$UPDATER_VERSION" --repo yaojingang/geoflow-updater >/dev/null 2>&1; then
-              echo "Signed metadata already contains this GEOFlow release, but its updater release is missing." >&2
-              exit 1
-            fi
+            # Read-only preflight cannot see draft releases. The protected
+            # publish job checks their existence with its existing write token.
             resume=true
           elif [ "$RELEASE_SEQUENCE" -le "$current_sequence" ]; then
             echo "Release sequence $RELEASE_SEQUENCE must exceed signed sequence $current_sequence." >&2
@@ -199,6 +197,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify existing release for publication resume
+        if: needs.preflight.outputs.resume == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATER_VERSION: ${{ inputs.updater_version }}
+        run: |
+          if ! gh release view "v$UPDATER_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null; then
+            echo "Cannot read the updater release required by committed metadata; check the draft and publication credentials." >&2
+            exit 1
+          fi
       - id: candidate-source
         name: Download the approved candidate
         env:
