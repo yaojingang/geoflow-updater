@@ -314,6 +314,7 @@ func TestPublicationResumeExecutesVerifiedSchemaThreePlanPreflight(t *testing.T)
 		wantResume     bool
 	}{
 		{"maintenance-protocol-three", "maintenance", 3, true},
+		{"draft-hidden-from-read-only-preflight", "maintenance", 3, true},
 		{"online-protocol-four", "online", 4, true},
 		{"online-protocol-too-low", "online", 3, false},
 		{"maintenance-legacy-protocol", "maintenance", 2, false},
@@ -400,7 +401,11 @@ func TestPublicationResumeExecutesVerifiedSchemaThreePlanPreflight(t *testing.T)
 				}
 			}
 			bin := filepath.Join(root, "bin")
-			mustWrite(t, filepath.Join(bin, "gh"), []byte("#!/bin/sh\nexit 0\n"))
+			ghScript := "#!/bin/sh\nexit 0\n"
+			if scenario.name == "draft-hidden-from-read-only-preflight" {
+				ghScript = "#!/bin/sh\necho 'HTTP 404: draft requires push access' >&2\nexit 1\n"
+			}
+			mustWrite(t, filepath.Join(bin, "gh"), []byte(ghScript))
 			if err := os.Chmod(filepath.Join(bin, "gh"), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -418,6 +423,63 @@ func TestPublicationResumeExecutesVerifiedSchemaThreePlanPreflight(t *testing.T)
 				}
 			} else if runErr == nil || strings.Contains(string(resultBytes), "resume=true") {
 				t.Fatalf("invalid plan authorized resume: err=%v output=%s result=%q", runErr, output, resultBytes)
+			}
+		})
+	}
+}
+
+func TestPublicationResumeChecksReleaseInProtectedJob(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Permissions map[string]string
+		Jobs        map[string]struct {
+			Environment string
+			Permissions map[string]string
+			Steps       []struct {
+				Name, If, Run string
+				Env           map[string]string
+			}
+		}
+	}
+	if err := yaml.Unmarshal(contents, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	publish := workflow.Jobs["publish"]
+	if workflow.Jobs["preflight"].Permissions["contents"] != "read" || publish.Environment != "release-signing" || workflow.Permissions["contents"] != "write" || len(publish.Permissions) != 0 {
+		t.Fatal("draft access must use the protected publisher's existing write permission")
+	}
+	var script string
+	for _, step := range publish.Steps {
+		if step.Name == "Verify existing release for publication resume" {
+			if step.If != "needs.preflight.outputs.resume == 'true'" || step.Env["GH_TOKEN"] != "${{ secrets.GITHUB_TOKEN }}" {
+				t.Fatal("release visibility check must authenticate only on resume")
+			}
+			script = step.Run
+		}
+	}
+	if script == "" {
+		t.Fatal("protected draft check is missing")
+	}
+	for _, state := range []string{"draft", "published", "missing"} {
+		t.Run(state, func(t *testing.T) {
+			root := t.TempDir()
+			gh := filepath.Join(root, "gh")
+			mustWrite(t, gh, []byte("#!/bin/sh\ntest \"$*\" = 'release view v0.4.0 --repo yaojingang/geoflow-updater' || exit 3\necho checked > \"$TEST_TRACE\"\ntest \"$TEST_RELEASE_STATE\" != missing\n"))
+			if err := os.Chmod(gh, 0700); err != nil {
+				t.Fatal(err)
+			}
+			trace := filepath.Join(root, "trace")
+			command := exec.Command("bash", "-euo", "pipefail", "-c", script)
+			command.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"), "UPDATER_VERSION=0.4.0", "GITHUB_REPOSITORY=yaojingang/geoflow-updater", "TEST_TRACE="+trace, "TEST_RELEASE_STATE="+state)
+			output, err := command.CombinedOutput()
+			if (err == nil) != (state != "missing") {
+				t.Fatalf("release state %s: %v, %s", state, err, output)
+			}
+			if data, err := os.ReadFile(trace); err != nil || string(data) != "checked\n" {
+				t.Fatalf("release check did not execute: %v, %s", err, data)
 			}
 		})
 	}
