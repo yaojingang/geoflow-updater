@@ -182,7 +182,7 @@ func (service *Service) installInfrastructure(ctx context.Context, source, candi
 	}
 	// Every application writer is already drained and a verified recovery point exists.
 	if len(fresh) == 0 || !fresh[0] {
-		if err := service.command(ctx, infrastructureConfig(source), "down", "--remove-orphans"); err != nil {
+		if err := service.downInfrastructure(ctx, source); err != nil {
 			return err
 		}
 	}
@@ -268,7 +268,7 @@ func (service *Service) restoreBeforeTraffic(ctx context.Context, tx *releaseTra
 		if err := service.drainServices(ctx, tx.Candidate, names...); err != nil {
 			return err
 		}
-		if err := service.command(ctx, infrastructureConfig(tx.Candidate), "down", "--remove-orphans"); err != nil {
+		if err := service.downInfrastructure(ctx, tx.Candidate); err != nil {
 			return err
 		}
 	} else if tx.Source.Layout == LayoutBlueGreen {
