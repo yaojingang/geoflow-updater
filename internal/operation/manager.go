@@ -318,6 +318,14 @@ func (manager *Manager) reconcileOperation(ctx context.Context, operation *Opera
 	}); ok && (operation.Kind == KindUpdate || operation.Kind == KindSwitchBack) {
 		result, handled := reconciler.ReconcileRelease(ctx, operation.InstanceID, operation.ID)
 		if handled {
+			// The durable deployment journal can outlive the operation observer.
+			// Preserve its recovery identity before persisting any reconciled state.
+			if result.RecoveryPointID != "" {
+				operation.RecoveryPointID = result.RecoveryPointID
+			}
+			if result.Target.Version != "" {
+				operation.TargetVersion = result.Target.Version
+			}
 			if result.Status == update.StatusSucceeded {
 				return StatusSucceeded, nil
 			}

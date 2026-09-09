@@ -300,7 +300,7 @@ func (service *Service) drainContainersSignal(ctx context.Context, ids []string,
 				running = true
 				continue
 			}
-			if parts[0] != "false" || (parts[1] != "0" && parts[1] != "143") {
+			if parts[0] != "false" || (parts[1] != "0" && parts[1] != "143" && !(signal == "KILL" && parts[1] == "137")) {
 				return fmt.Errorf("worker did not drain cleanly (exit %s)", parts[1])
 			}
 		}

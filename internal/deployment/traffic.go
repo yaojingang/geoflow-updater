@@ -189,8 +189,38 @@ func (service *Service) installInfrastructure(ctx context.Context, source, candi
 	if err := service.command(ctx, infrastructureConfig(candidate), "up", "-d", "--wait", "--wait-timeout", "180", "postgres", "redis"); err != nil {
 		return err
 	}
+	// PostgreSQL and Redis create only the data network. Application slots need
+	// the external edge network before ingress can be started with a ready slot.
+	if err := service.ensureEdgeNetwork(ctx, candidate.ID); err != nil {
+		return err
+	}
 	if source.Layout == LayoutBlueGreen {
 		return service.command(ctx, infrastructureConfig(candidate), "up", "-d", "--no-deps", "--wait", "edge")
+	}
+	return nil
+}
+
+func (service *Service) ensureEdgeNetwork(ctx context.Context, id string) error {
+	if !instanceIDPattern.MatchString(id) {
+		return errors.New("invalid instance for edge network")
+	}
+	name := "geoflow-" + id + "-edge"
+	project := "geoflow-" + id + "-infra"
+	var existing limitedBuffer
+	if err := service.runner().Run(ctx, nil, &existing, "docker", "network", "ls", "--filter", "name=^"+name+"$", "--format", "{{.ID}}"); err != nil {
+		return fmt.Errorf("find edge network: %w", err)
+	}
+	if strings.TrimSpace(existing.String()) == "" {
+		return service.runner().Run(ctx, nil, io.Discard, "docker", "network", "create",
+			"--label", "com.docker.compose.project="+project, "--label", "com.docker.compose.network=edge", name)
+	}
+	var owner limitedBuffer
+	if err := service.runner().Run(ctx, nil, &owner, "docker", "network", "inspect", "--format",
+		`{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.network"}}`, name); err != nil {
+		return fmt.Errorf("inspect edge network ownership: %w", err)
+	}
+	if strings.TrimSpace(owner.String()) != project+"|edge" {
+		return errors.New("edge network belongs to another deployment")
 	}
 	return nil
 }
@@ -263,66 +293,6 @@ func (service *Service) restoreBeforeTraffic(ctx context.Context, tx *releaseTra
 	}
 	return service.Resume(ctx, tx.Source.ID)
 }
-
-// The legacy scheduler does not wait for schedule:run children. Freeze its spawner
-// while existing children finish, then deliver TERM before allowing the parent to run.
-func (service *Service) drainScheduler(ctx context.Context, config instance.Config) error {
-	ids, err := service.containerIDs(ctx, config, "scheduler")
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		var command limitedBuffer
-		if err := service.runner().Run(ctx, nil, &command, "docker", "inspect", "--format={{json .Config.Cmd}}", id); err != nil {
-			return err
-		}
-		if !strings.Contains(command.String(), `"schedule:work"`) {
-			continue
-		}
-		var running limitedBuffer
-		if err := service.runner().Run(ctx, nil, &running, "docker", "inspect", "--format={{.State.Running}}", id); err != nil {
-			return err
-		}
-		if strings.TrimSpace(running.String()) != "true" {
-			continue
-		}
-		if err := service.runner().Run(ctx, nil, io.Discard, "docker", "update", "--restart=no", id); err != nil {
-			return err
-		}
-		if err := service.runner().Run(ctx, nil, io.Discard, "docker", "kill", "--signal=STOP", id); err != nil {
-			return err
-		}
-		err := func() error {
-			defer func() {
-				recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-				defer cancel()
-				_ = service.runner().Run(recovery, nil, io.Discard, "docker", "kill", "--signal=CONT", id)
-			}()
-			for {
-				var processes limitedBuffer
-				if err := service.runner().Run(ctx, nil, &processes, "docker", "top", id, "-eo", "pid"); err != nil {
-					return err
-				}
-				lines := strings.Fields(processes.String())
-				if len(lines) < 2 {
-					return errors.New("cannot establish legacy scheduler process state")
-				}
-				if len(lines) == 2 {
-					break
-				}
-				if err := waitContext(ctx, time.Second); err != nil {
-					return fmt.Errorf("legacy scheduler still has child tasks: %w", err)
-				}
-			}
-			return service.runner().Run(ctx, nil, io.Discard, "docker", "kill", "--signal=TERM", id)
-		}()
-		if err != nil {
-			return err
-		}
-	}
-	return service.drainServices(ctx, config, "scheduler")
-}
-
 func (service *Service) runningServices(ctx context.Context, config instance.Config) error {
 	expected, err := applicationServices(config.ComposeFile)
 	if err != nil {
