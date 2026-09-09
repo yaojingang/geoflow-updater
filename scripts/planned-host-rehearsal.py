@@ -417,10 +417,10 @@ class Rehearsal:
         self.wait(boundary, 'durable stage ' + stage)
         transaction = read_json(INSTANCE / 'release-transaction.json')
         require(transaction['stage'] == stage and transaction['operation_id'] == operation['id'], 'Fault hit a different transaction')
-        self.save('interrupted-' + stage + '.json', {'stage': stage, 'operation_id': operation['id'],
+        self.save('interrupted-' + label + '.json', {'stage': stage, 'operation_id': operation['id'],
                   'traffic_opened': transaction['traffic_opened'], 'recovery_point_id': transaction.get('recovery_point_id')})
         if transaction.get('recovery_point_id'):
-            self.corrupt(stage)
+            self.corrupt(label)
         if block_restore:
             RESTORE_FAULT.touch(mode=0o600)
         self.run('systemctl', 'kill', '--signal=SIGKILL', '--kill-whom=all', 'geoflow-updater')
@@ -441,7 +441,7 @@ class Rehearsal:
         if expected == 'recovery_required':
             if transaction['traffic_opened']:
                 require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Post-traffic data was rewound automatically')
-            self.mutate('rollbacks', 'rollback', {'recovery_point_id': result['recovery_point_id']}, 'recover-' + stage)
+            self.mutate('rollbacks', 'rollback', {'recovery_point_id': result['recovery_point_id']}, 'recover-' + label)
         self.restored(label)
         current_hash = sha(INSTANCE / 'operations/current.json')
         self.run('systemctl', 'restart', 'geoflow-updater')
