@@ -442,7 +442,7 @@ func TestPlannedAcceptanceBindsSignedPlanAndReportsItsActualScope(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"ubuntu-24.04-arm", "scripts/planned-candidate-acceptance.sh", "GEOFLOW_DOCKER_TEST=1", "TestDockerIngress", "planned-container-contract-and-ingress", "Full installed-host upgrade, backup restoration, and crash recovery require separate rehearsal.", "gh attestation verify"} {
+	for _, required := range []string{"ubuntu-24.04-arm", "scripts/planned-candidate-acceptance.sh", "scripts/planned-host-rehearsal.py", "GEOFLOW_DOCKER_TEST=1", "TestDockerIngress", "planned-container-contract-and-ingress", "maintenance-upgrade-restore-stage-interruption-and-install-retry", "Online-compatible application switch-back and live business continuity require an online signed candidate.", "gh attestation verify", "tuf/repository/metadata/root.json"} {
 		if !strings.Contains(string(data), required) {
 			t.Errorf("missing planned acceptance contract %s", required)
 		}
