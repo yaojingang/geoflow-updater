@@ -1,6 +1,7 @@
 package deployment
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,6 +9,27 @@ import (
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/update"
 )
+
+// Application containers retain external network IDs while stopped. Remove the
+// drained slots before deleting infrastructure networks so later starts recreate
+// their endpoints. Persistent volumes and managed files remain available.
+func (service *Service) downInfrastructure(ctx context.Context, config instance.Config) error {
+	if config.Layout == LayoutBlueGreen {
+		if err := service.validateRecoveryTopology(config, config); err != nil {
+			return err
+		}
+		slots, err := service.recoverySlots(config, []instance.Config{config})
+		if err != nil {
+			return err
+		}
+		for _, slot := range slots {
+			if err := service.command(ctx, slot, "down", "--remove-orphans"); err != nil {
+				return err
+			}
+		}
+	}
+	return service.command(ctx, infrastructureConfig(config), "down", "--remove-orphans")
+}
 
 // instance.yml can still name the source after the candidate infrastructure has
 // started. Keep both recorded deployments in authorized recovery until it ends.

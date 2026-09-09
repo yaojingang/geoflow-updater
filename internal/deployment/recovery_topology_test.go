@@ -83,7 +83,7 @@ func TestRecoveryStopsPendingLayoutBeforeRestoringAnyCheckpoint(t *testing.T) {
 			attempts := 0
 			store.restore = func() error {
 				joined := strings.Join(calls, "\n")
-				for _, expected := range []string{candidate.ComposeFile + " ps --all --quiet scheduler", candidate.ComposeFile + " ps --all --quiet reverb", candidate.ComposeFile + " ps --all --quiet web", candidate.ComposeFile + " ps --all --quiet app", candidate.InfraComposeFile + " ps --all --quiet redis", candidate.InfraComposeFile + " down --remove-orphans"} {
+				for _, expected := range []string{candidate.ComposeFile + " ps --all --quiet scheduler", candidate.ComposeFile + " ps --all --quiet reverb", candidate.ComposeFile + " ps --all --quiet web", candidate.ComposeFile + " ps --all --quiet app", candidate.InfraComposeFile + " ps --all --quiet redis", candidate.ComposeFile + " down --remove-orphans", candidate.InfraComposeFile + " down --remove-orphans"} {
 					if !strings.Contains(joined, expected) {
 						t.Errorf("restoring data before stopping pending topology: missing %s", expected)
 					}
@@ -185,11 +185,76 @@ func TestRecoveryClosesOnlyInfrastructureDifferentFromDestination(t *testing.T) 
 				if strings.Contains(joined, candidate.InfraComposeFile+" down --remove-orphans") {
 					t.Error("stopped the destination infrastructure")
 				}
+				if strings.Contains(joined, candidate.ComposeFile+" down --remove-orphans") {
+					t.Error("removed the destination slot")
+				}
 				return nil
 			}
 			if err := service.Rollback(context.Background(), legacy.ID, tx.RecoveryPointID); err != nil {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestInfrastructureReplacementRemovesBothSlotsBeforeNetworks(t *testing.T) {
+	for _, path := range []string{"rollback", "before-traffic", "maintenance-upgrade"} {
+		for _, failedSlot := range []string{"", "blue", "green"} {
+			t.Run(path+"/failed-slot="+failedSlot, func(t *testing.T) {
+				service, legacy, candidate, tx := recoveryTopologyFixture(t)
+				other := candidate
+				other.ActiveSlot = "green"
+				other.ComposeFile = filepath.Join(service.instanceDirectory(legacy.ID), "slots", "green", "docker-compose.yml")
+				other.EnvironmentFile = filepath.Join(filepath.Dir(other.ComposeFile), "release.env")
+				data, err := os.ReadFile(candidate.ComposeFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeTest(t, other.ComposeFile, data)
+				writeTest(t, other.EnvironmentFile, []byte("VERSION=3.0.0\n"))
+				var removed []string
+				boundary := errors.New("teardown boundary")
+				service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+					if !strings.Contains(strings.Join(args, " "), " down --remove-orphans") {
+						return nil
+					}
+					for i, arg := range args {
+						if arg == "-f" {
+							file := args[i+1]
+							removed = append(removed, file)
+							if file == candidate.InfraComposeFile || (failedSlot != "" && file == filepath.Join(service.instanceDirectory(legacy.ID), "slots", failedSlot, "docker-compose.yml")) {
+								return boundary
+							}
+						}
+					}
+					return nil
+				})
+				service.Recoveries = &topologyRecoveryStore{point: recovery.Point{ID: tx.RecoveryPointID, Deployment: &legacy}, restore: func() error {
+					t.Fatal("restoration started after teardown failure")
+					return nil
+				}}
+				switch path {
+				case "rollback":
+					err = service.Rollback(context.Background(), legacy.ID, tx.RecoveryPointID)
+				case "before-traffic":
+					err = service.restoreBeforeTraffic(context.Background(), &tx)
+				case "maintenance-upgrade":
+					err = service.installInfrastructure(context.Background(), candidate, other, tx.Target)
+				}
+				if !errors.Is(err, boundary) {
+					t.Fatalf("teardown failure not returned: %v", err)
+				}
+				want := []string{candidate.ComposeFile}
+				if failedSlot != "blue" {
+					want = append(want, other.ComposeFile)
+				}
+				if failedSlot == "" {
+					want = append(want, candidate.InfraComposeFile)
+				}
+				if strings.Join(removed, "\n") != strings.Join(want, "\n") {
+					t.Fatalf("teardown order: got %v, want %v", removed, want)
+				}
+			})
+		}
 	}
 }

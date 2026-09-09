@@ -341,7 +341,7 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, recover
 			continue
 		}
 		seen[infra.ComposeFile] = true
-		if err := service.command(ctx, infra, "down", "--remove-orphans"); err != nil {
+		if err := service.downInfrastructure(ctx, topology); err != nil {
 			return err
 		}
 	}
