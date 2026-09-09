@@ -1,0 +1,2 @@
+4ae01c79e561d37217f54c711cb15ea0f5a85864e5eb2e2fa9a48f5768ee6c0b  geoflow-updater_0.4.0_linux_amd64.tar.gz
+2f850268464f5bf3e8c060e8b6ff786e26c78a6f185297763f753ffdd2e2f882  geoflow-updater_0.4.0_linux_arm64.tar.gz

@@ -1,0 +1,20 @@
+{
+  "schema_version": 3,
+  "minimum_updater_protocol": 3,
+  "release_sequence": 3,
+  "version": "3.1.0",
+  "source_commit": "6c963783bbf49f0b5ec9d0121a924ee54005b60d",
+  "app_image": "ghcr.io/yaojingang/geoflow-app@sha256:94c01bfd52941cf48ad9693fce30fc571c29353189fb5e128d0e0752daa36448",
+  "web_image": "ghcr.io/yaojingang/geoflow-web@sha256:feaf783cb30500ac51f8d465fcdaadfe7f087b1d713c4b1411b7976b06057f41",
+  "postgres_images": {
+    "16": "pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b",
+    "18": "pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a"
+  },
+  "redis_images": {
+    "7": "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
+    "8": "redis@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576"
+  },
+  "compose_target": "deploy/docker-compose.managed.yml",
+  "version_target": "releases/3.1.0/version.json",
+  "upgrade_plan_target": "releases/3.1.0/upgrade-plan.json"
+}
