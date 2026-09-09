@@ -369,6 +369,9 @@ func (service *Service) Resume(ctx context.Context, instanceID string) error {
 		if _, err := service.switchIngress(ctx, config, config.ReleaseSequence, true); err != nil {
 			return err
 		}
+		if err := service.resumeFrozenSchedulers(ctx, config); err != nil {
+			return err
+		}
 		return service.waitHTTP(ctx, config)
 	}
 	managedServices, err := resumeServices(config.ComposeFile)
@@ -404,7 +407,7 @@ func (service *Service) Resume(ctx context.Context, instanceID string) error {
 	if err := service.runner().Run(ctx, nil, io.Discard, "docker", startArguments...); err != nil {
 		return fmt.Errorf("start managed deployment: %w", err)
 	}
-	return nil
+	return service.resumeFrozenSchedulers(ctx, config)
 }
 
 func resumeServices(composePath string) ([]string, error) {

@@ -102,7 +102,7 @@ jobs:
           docker pull nginx:1.31.1-alpine
           docker pull python:3.12-alpine
           go test -race ./...
-          GEOFLOW_DOCKER_TEST=1 go test ./internal/deployment -run TestDockerIngress -v > "rehearsal/evidence/$PLATFORM/ingress.txt"
+          GEOFLOW_DOCKER_TEST=1 go test ./internal/deployment -run 'TestDockerIngress|TestDockerLegacyScheduler' -v > "rehearsal/evidence/$PLATFORM/ingress.txt"
           bash scripts/planned-candidate-acceptance.sh rehearsal/candidate "rehearsal/evidence/$PLATFORM"
           jq -n --arg platform "$PLATFORM" --arg kernel_arch "$KERNEL_ARCH" --arg candidate_run_id "$CANDIDATE_RUN_ID" \
             '{schema_version:1,platform:$platform,kernel_arch:$kernel_arch,candidate_run_id:$candidate_run_id,result:"pass",verification_scope:"planned-container-contract-and-ingress",checks:["signed-image-identity","fresh-migrations","first-install","backfills","cache-compilation","standalone-readiness","install-idempotency","real-ingress-switch-and-stream"]}' \

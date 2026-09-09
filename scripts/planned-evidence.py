@@ -18,7 +18,7 @@ HOST_CHECKS = {
                 'session-after-upgrade', 'signed-upgrade', 'complete-backup-restore',
                 'restored-manual-rollback'} | {
                     prefix + stage for prefix in ['crash-', 'restored-'] for stage in
-                    ['retain-assets', 'quiesce', 'backup', 'upgrade', 'layout', 'candidate',
+                    ['retain-assets', 'quiesce', 'scheduler-freeze', 'backup', 'upgrade', 'layout', 'candidate',
                      'switch', 'workers', 'observe', 'recovery-backoff']},
 }
 

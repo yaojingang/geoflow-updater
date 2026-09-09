@@ -16,6 +16,8 @@ MARKER = STATE / 'planned-rehearsal-hit.json'
 def matches(fault, transaction, arguments):
     if fault['stage'] == 'fresh-install':
         return 'geoflow:install' in arguments and 'artisan' in arguments
+    if fault['stage'] == 'scheduler-freeze':
+        return transaction.get('status') == 'running' and transaction.get('stage') == 'quiesce' and arguments[:2] == ['kill', '--signal=STOP']
     return transaction.get('status') == 'running' and transaction.get('stage') == fault['stage']
 
 

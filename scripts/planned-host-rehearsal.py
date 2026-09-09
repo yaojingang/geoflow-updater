@@ -407,7 +407,7 @@ class Rehearsal:
         self.fixture()
         payload = self.preview()
         MARKER.unlink(missing_ok=True)
-        FAULT.write_text(json.dumps({'stage': stage, 'after': stage == 'upgrade'}))
+        FAULT.write_text(json.dumps({'stage': stage, 'after': stage in ['upgrade', 'scheduler-freeze']}))
         FAULT.chmod(0o600)
         operation = self.api('POST', 'updates', payload, 'update', expected=202)
         def boundary():
@@ -419,7 +419,14 @@ class Rehearsal:
             return False
         self.wait(boundary, 'durable stage ' + stage)
         transaction = read_json(INSTANCE / 'release-transaction.json')
-        require(transaction['stage'] == stage and transaction['operation_id'] == operation['id'], 'Fault hit a different transaction')
+        expected_stage = 'quiesce' if stage == 'scheduler-freeze' else stage
+        require(transaction['stage'] == expected_stage and transaction['operation_id'] == operation['id'], 'Fault hit a different transaction')
+        scheduler = None
+        if stage == 'scheduler-freeze':
+            scheduler = self.container('scheduler')
+            parent = self.run('/usr/bin/docker', 'inspect', '--format', '{{.State.Pid}}', scheduler)
+            processes = self.run('/usr/bin/docker', 'top', scheduler, '-eo', 'pid,stat')
+            require(any(parts[0] == parent and parts[1].startswith('T') for line in processes.splitlines()[1:] if len(parts := line.split()) == 2), 'Scheduler spawner was not frozen at interruption')
         self.save('interrupted-' + label + '.json', {'stage': stage, 'operation_id': operation['id'],
                   'traffic_opened': transaction['traffic_opened'], 'recovery_point_id': transaction.get('recovery_point_id')})
         if transaction.get('recovery_point_id'):
@@ -446,6 +453,9 @@ class Rehearsal:
                 require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Post-traffic data was rewound automatically')
             self.mutate('rollbacks', 'rollback', {'recovery_point_id': result['recovery_point_id']}, 'recover-' + label)
         self.restored(label)
+        if scheduler:
+            processes = self.run('/usr/bin/docker', 'top', scheduler, '-eo', 'pid,stat')
+            require(any(parts[0] == parent and not parts[1].startswith('T') for line in processes.splitlines()[1:] if len(parts := line.split()) == 2), 'Scheduler remained frozen after startup reconciliation')
         current_hash = sha(INSTANCE / 'operations/current.json')
         self.run('systemctl', 'restart', 'geoflow-updater')
         time.sleep(3)
@@ -455,7 +465,7 @@ class Rehearsal:
     def upgrade(self):
         self.legacy()
         self.repository(self.candidate / 'tuf/repository')
-        for stage in ['retain-assets', 'quiesce', 'backup', 'upgrade', 'layout', 'candidate', 'switch', 'workers', 'observe']:
+        for stage in ['retain-assets', 'quiesce', 'scheduler-freeze', 'backup', 'upgrade', 'layout', 'candidate', 'switch', 'workers', 'observe']:
             self.crash(stage)
         self.crash('upgrade', block_restore=True)
         self.current = 'successful-upgrade'

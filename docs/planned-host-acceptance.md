@@ -26,12 +26,14 @@ Candidate builds push run-specific images and sign an isolated TUF repository. P
 | Application contract | Fresh migrations, initial administrator setup, backfills, readiness, caches, repeated installation, real ingress switch and streaming |
 | Existing managed site | Enroll an initialized stable database, run the signed maintenance upgrade, convert to two application slots, preserve the administrator session |
 | Complete restoration | Change protected data after backup, restore PostgreSQL, Redis, storage, environment, version, instance, release and Compose files, and compare migration history |
-| Interrupted upgrade | Kill the installed updater at retain-assets, quiesce, backup, upgrade, layout, candidate, switch, workers and observe; verify the appropriate recovery policy and a second restart |
+| Interrupted upgrade | Kill the installed updater at retain-assets, quiesce, scheduler freeze, backup, upgrade, layout, candidate, switch, workers and observe; verify the appropriate recovery policy and a second restart |
 | Failed recovery | Fail PostgreSQL restoration, retain the recovery identity and retry state, block ordinary mutations, remove the fault and complete an authorized restoration |
 | First-install retry | Interrupt after administrator initialization, retry and repeat installation, retain generated credentials, pass readiness and real login |
 | Online fixture | Continue public and authenticated HTTP requests, consume pending jobs on the destination slot, deliver a new-slot Reverb broadcast to an old connection, reconnect, and switch application code back while retaining live writes |
 
 The queue fixture stops the old test consumer before enqueueing twenty jobs for each transition. It records the destination worker's slot and sequence and requires each job to write exactly once. This covers pending-job handover. Production traffic volume, long-running business jobs, browser reconnection behavior, and infrastructure outages need workload-specific testing.
+
+The legacy scheduler test waits for active scheduled children to finish before stopping the idle parent. A durable freeze record lets startup recovery resume the same frozen process after an updater interruption. Native container tests also check the actual process signals and child completion.
 
 ## Online fixture scope
 
