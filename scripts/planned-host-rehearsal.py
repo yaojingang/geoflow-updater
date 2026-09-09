@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 import urllib.parse
 import urllib.request
 
@@ -299,6 +300,24 @@ class Rehearsal:
             return result.returncode == 0
         self.wait(ready, 'private signed repository', timeout=30)
         self.run('systemctl', 'restart', 'geoflow-updater')
+        self.wait_for_agent()
+
+    def wait_for_agent(self, timeout=30):
+        def ready():
+            connection = UnixConnection('localhost', timeout=2)
+            try:
+                connection.request('GET', '/v1/health')
+                response = connection.getresponse()
+                data = json.loads(response.read())
+                require(response.status == 200 and data.get('status') == 'ok' and
+                        data.get('version') == self.identity['updater']['version'],
+                        'Restarted updater health or candidate version differs')
+                return True
+            except (ConnectionError, FileNotFoundError, socket.timeout):
+                return False
+            finally:
+                connection.close()
+        self.wait(ready, 'restarted updater control API', timeout=timeout)
 
     def authorize(self):
         text = self.run('geoflow-updater', 'authorization-uri', '--instance', 'primary', log=False)
@@ -559,6 +578,8 @@ def main():
         getattr(rehearsal, rehearsal.args.mode)()
         success = True
     except Exception as error:
+        if rehearsal.owns_evidence:
+            rehearsal.save('failure.txt', traceback.format_exc())
         print('[planned-host] FAIL ' + rehearsal.redact(str(error)), file=sys.stderr, flush=True)
     finally:
         rehearsal.finish(success)
