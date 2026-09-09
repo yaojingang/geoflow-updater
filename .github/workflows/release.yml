@@ -301,21 +301,8 @@ jobs:
             umask 077
             printf '%s' "$APPROVED_EVIDENCE_B64" | base64 --decode > "$evidence"
             test "$(sha256sum "$evidence" | cut -d ' ' -f 1)" = "$PHASE_C_EVIDENCE_SHA256"
-            jq -e --slurpfile candidate candidate/candidate.json '
-              .schema_version == 1 and
-              .candidate == $candidate[0] and
-              .verification_scope == "planned-container-contract-and-ingress" and
-              .architectures["linux-amd64"].result == "pass" and
-              (.architectures["linux-amd64"].evidence_link | length > 0) and
-              .architectures["linux-arm64"].result == "pass" and
-              (.architectures["linux-arm64"].evidence_link | length > 0) and
-              .approvals.release_operator.decision == "approved" and
-              (.approvals.release_operator.name | length > 0) and
-              .approvals.security_reviewer.decision == "approved" and
-              (.approvals.security_reviewer.name | length > 0) and
-              .approvals.product_owner.decision == "approved" and
-              (.approvals.product_owner.name | length > 0)
-            ' "$evidence" >/dev/null
+            python3 scripts/planned-evidence.py validate --candidate candidate/candidate.json \
+              --evidence "$evidence" --approved
             jq -S -n \
               --slurpfile candidate candidate/candidate.json \
               --arg evidence_sha256 "$PHASE_C_EVIDENCE_SHA256" \

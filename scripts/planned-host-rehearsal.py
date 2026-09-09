@@ -398,41 +398,63 @@ class Rehearsal:
         require(plan['target_sequence'] == self.manifest['release_sequence'], 'Candidate target sequence changed')
         return {'allow_maintenance': True, 'expected_plan_sha256': plan['plan_sha256']}
 
-    def crash(self, stage):
-        self.current = 'crash-' + stage
+    def crash(self, stage, block_restore=False):
+        label = 'recovery-backoff' if block_restore else stage
+        self.current = 'crash-' + label
         self.fixture()
         payload = self.preview()
         MARKER.unlink(missing_ok=True)
         FAULT.write_text(json.dumps({'stage': stage, 'after': stage == 'upgrade'}))
         FAULT.chmod(0o600)
         operation = self.api('POST', 'updates', payload, 'update', expected=202)
-        self.wait(lambda: MARKER.exists(), 'durable stage ' + stage)
+        def boundary():
+            if MARKER.exists():
+                return True
+            current = self.api('GET', 'operations/current')
+            require(current['id'] == operation['id'] and not current.get('completed_at'),
+                    'Update ended before fault boundary: ' + json.dumps(current))
+            return False
+        self.wait(boundary, 'durable stage ' + stage)
         transaction = read_json(INSTANCE / 'release-transaction.json')
         require(transaction['stage'] == stage and transaction['operation_id'] == operation['id'], 'Fault hit a different transaction')
         self.save('interrupted-' + stage + '.json', {'stage': stage, 'operation_id': operation['id'],
                   'traffic_opened': transaction['traffic_opened'], 'recovery_point_id': transaction.get('recovery_point_id')})
         if transaction.get('recovery_point_id'):
             self.corrupt(stage)
+        if block_restore:
+            RESTORE_FAULT.touch(mode=0o600)
         self.run('systemctl', 'kill', '--signal=SIGKILL', '--kill-whom=all', 'geoflow-updater')
         FAULT.unlink()
         self.run('systemctl', 'restart', 'geoflow-updater')
-        expected = 'recovery_required' if transaction['traffic_opened'] else ('rolled_back' if transaction.get('recovery_point_id') else 'failed')
-        result = self.operation(operation['id'], [expected], stage)
+        expected = 'recovery_required' if transaction['traffic_opened'] or block_restore else ('rolled_back' if transaction.get('recovery_point_id') else 'failed')
+        result = self.operation(operation['id'], [expected], label)
+        if block_restore:
+            require(result['reconcile_attempts'] >= 1 and result.get('next_reconcile_at'), 'Recovery backoff was not persisted')
+            require('restore' in result.get('error', '').lower(), 'Recovery did not reach injected restore failure')
+            self.api('POST', 'backups', scope='backup', expected=409)
+            require(self.api('GET', 'operations/current')['id'] == operation['id'], 'Blocked write replaced interrupted operation')
+            self.run('systemctl', 'restart', 'geoflow-updater')
+            time.sleep(2)
+            current = self.api('GET', 'operations/current')
+            require(current['status'] == 'recovery_required' and current['recovery_point_id'] == result['recovery_point_id'], 'Recovery state lost after restart')
+            RESTORE_FAULT.unlink()
         if expected == 'recovery_required':
-            require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Post-traffic data was rewound automatically')
+            if transaction['traffic_opened']:
+                require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Post-traffic data was rewound automatically')
             self.mutate('rollbacks', 'rollback', {'recovery_point_id': result['recovery_point_id']}, 'recover-' + stage)
-        self.restored(stage)
+        self.restored(label)
         current_hash = sha(INSTANCE / 'operations/current.json')
         self.run('systemctl', 'restart', 'geoflow-updater')
         time.sleep(3)
         require(sha(INSTANCE / 'operations/current.json') == current_hash, 'Completed recovery repeated after restart')
-        self.record('crash-' + stage, 'SIGKILL at the recorded durable stage; correct recovery policy and restart stability')
+        self.record('crash-' + label, 'SIGKILL at the recorded durable stage; correct recovery policy and restart stability')
 
     def upgrade(self):
         self.legacy()
         self.repository(self.candidate / 'tuf/repository')
         for stage in ['retain-assets', 'quiesce', 'backup', 'upgrade', 'layout', 'candidate', 'switch', 'workers', 'observe']:
             self.crash(stage)
+        self.crash('upgrade', block_restore=True)
         self.current = 'successful-upgrade'
         self.fixture()
         result = self.mutate('updates', 'update', self.preview(), 'successful-upgrade')
@@ -486,6 +508,9 @@ class Rehearsal:
             'failed_check': '' if success else self.current, 'checks': self.checks})
         if self.installed:
             self.run('journalctl', '-u', 'geoflow-updater', '--output=cat', '--lines=1000', check=False)
+            self.run('/usr/bin/docker', 'ps', '-a', check=False)
+            for container in self.run('/usr/bin/docker', 'ps', '-aq', check=False, log=False).splitlines():
+                self.run('/usr/bin/docker', 'logs', '--tail', '80', container, check=False)
         # Load generated credentials before redacting captured diagnostics.
         for path in [ROOT / '.env.prod', ROOT / 'install-credentials.txt']:
             if path.exists():

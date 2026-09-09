@@ -391,7 +391,8 @@ func TestReleaseWorkflowPublishesOnlyAnApprovedExactCandidate(t *testing.T) {
 		"phase-c-candidate-$CANDIDATE_RUN_ID",
 		`--jq '.path')" = ".github/workflows/release-candidate.yml"`,
 		"candidate/targets-source",
-		".candidate == $candidate[0]",
+		"scripts/planned-evidence.py validate --candidate candidate/candidate.json",
+		"--evidence \"$evidence\" --approved",
 		"--draft",
 		"--clobber",
 		"needs.preflight.outputs.resume",
@@ -442,7 +443,7 @@ func TestPlannedAcceptanceBindsSignedPlanAndReportsItsActualScope(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"ubuntu-24.04-arm", "scripts/planned-candidate-acceptance.sh", "scripts/planned-host-rehearsal.py", "GEOFLOW_DOCKER_TEST=1", "TestDockerIngress", "planned-container-contract-and-ingress", "maintenance-upgrade-restore-stage-interruption-and-install-retry", "Online-compatible application switch-back and live business continuity require an online signed candidate.", "gh attestation verify", "tuf/repository/metadata/root.json"} {
+	for _, required := range []string{"ubuntu-24.04-arm", "scripts/planned-candidate-acceptance.sh", "scripts/planned-host-rehearsal.py", "GEOFLOW_DOCKER_TEST=1", "TestDockerIngress", "planned-container-contract-and-ingress", "scripts/planned-evidence.py assemble", "gh attestation verify", "tuf/repository/metadata/root.json"} {
 		if !strings.Contains(string(data), required) {
 			t.Errorf("missing planned acceptance contract %s", required)
 		}
@@ -470,5 +471,12 @@ func TestPlannedAcceptanceBindsSignedPlanAndReportsItsActualScope(t *testing.T) 
 	}
 	if output, err := exec.Command("bash", "-n", filepath.Join(root, "scripts/planned-candidate-acceptance.sh")).CombinedOutput(); err != nil {
 		t.Fatalf("acceptance shell syntax: %s %v", output, err)
+	}
+}
+
+func TestPlannedPublicationEvidenceRejectsIncompleteRehearsals(t *testing.T) {
+	command := exec.Command("python3", "../../scripts/test_planned_evidence.py")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("publication evidence checks: %v\n%s", err, output)
 	}
 }

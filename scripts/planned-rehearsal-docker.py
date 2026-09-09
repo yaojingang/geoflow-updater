@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -20,7 +21,8 @@ def matches(fault, transaction, arguments):
 
 def main():
     arguments = sys.argv[1:]
-    if (STATE / 'planned-rehearsal-block-restore').exists() and 'pg_restore' in arguments:
+    restoring = any(shlex.split(argument)[:2] == ['exec', 'pg_restore'] for argument in arguments if argument.startswith('exec pg_restore '))
+    if (STATE / 'planned-rehearsal-block-restore').exists() and restoring:
         return 98
     fault = json.loads(FAULT.read_text()) if FAULT.exists() else None
     transaction_path = STATE / 'instances/primary/release-transaction.json'
