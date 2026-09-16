@@ -16,6 +16,7 @@ import (
 
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/update"
 	"gopkg.in/yaml.v3"
 )
@@ -303,7 +304,10 @@ func (service *Service) ExecuteRelease(ctx context.Context, id string, release m
 			if err := step("backup", func() error {
 				var err error
 				tx.RecoveryPointID, err = service.CreateRecoveryPoint(ctx, id, "update-to-"+release.Version)
-				return err
+				if err != nil {
+					return err
+				}
+				return service.FreezeRecoveryCheckpoint(ctx, id, recovery.RestoreRequest{PointID: tx.RecoveryPointID, TransactionID: tx.OperationID})
 			}); err != nil {
 				return err
 			}

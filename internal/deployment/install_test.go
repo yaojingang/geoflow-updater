@@ -88,7 +88,7 @@ func testInstallRetry(t *testing.T, fault string) {
 		case strings.Contains(cmd, "ps --all --format json"):
 			var compose string
 			for i, arg := range args {
-				if arg == "-f" {
+				if arg == "-f" && !strings.HasSuffix(args[i+1], "/recovery-runtime.yml") {
 					compose = args[i+1]
 				}
 			}

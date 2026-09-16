@@ -94,7 +94,7 @@ func (deployment *fakeDeployment) Activate(context.Context, string, managed.Rele
 	return nil
 }
 
-func (deployment *fakeDeployment) Rollback(context.Context, string, string) error {
+func (deployment *fakeDeployment) Rollback(context.Context, string, recovery.RestoreRequest) error {
 	deployment.record("rollback")
 	return deployment.rollbackErr
 }

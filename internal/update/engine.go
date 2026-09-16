@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/managed"
@@ -44,7 +45,7 @@ type Deployment interface {
 	CreateRecoveryPoint(context.Context, string, string) (string, error)
 	Migrate(context.Context, string, managed.Release) error
 	Activate(context.Context, string, managed.Release) error
-	Rollback(context.Context, string, string) error
+	Rollback(context.Context, string, recovery.RestoreRequest) error
 	Resume(context.Context, string) error
 	Verify(context.Context, string) error
 }
@@ -150,9 +151,16 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 		return fail("backup", err)
 	}
 	if err := emit("backup", "succeeded", recoveryPointID); err != nil {
-		return engine.rollback(ctx, instanceID, recoveryPointID, target, fmt.Errorf("persist backup recovery point: %w", err), emit)
+		return engine.rollback(ctx, instanceID, recoveryPointID, options.OperationID, target, fmt.Errorf("persist backup recovery point: %w", err), emit)
 	}
 
+	if recorder, ok := engine.Deployment.(interface {
+		FreezeRecoveryCheckpoint(context.Context, string, recovery.RestoreRequest) error
+	}); ok {
+		if err := recorder.FreezeRecoveryCheckpoint(ctx, instanceID, recovery.RestoreRequest{PointID: recoveryPointID, TransactionID: options.OperationID}); err != nil {
+			return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: fmt.Sprintf("freeze recovery checkpoint: %v", err)}
+		}
+	}
 	protectedSteps := []struct {
 		name string
 		run  func() error
@@ -167,7 +175,7 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 			if step.name == "resume" || step.name == "verify" {
 				return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: err.Error()}
 			}
-			return engine.rollback(ctx, instanceID, recoveryPointID, target, fmt.Errorf("persist %s stage: %w", step.name, err), emit)
+			return engine.rollback(ctx, instanceID, recoveryPointID, options.OperationID, target, fmt.Errorf("persist %s stage: %w", step.name, err), emit)
 		}
 		if err := step.run(); err != nil {
 			if observeErr := emit(step.name, "failed", err.Error()); observeErr != nil {
@@ -176,13 +184,13 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 			if step.name == "resume" || step.name == "verify" {
 				return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: err.Error()}
 			}
-			return engine.rollback(ctx, instanceID, recoveryPointID, target, err, emit)
+			return engine.rollback(ctx, instanceID, recoveryPointID, options.OperationID, target, err, emit)
 		}
 		if err := emit(step.name, "succeeded", ""); err != nil {
 			if step.name == "resume" || step.name == "verify" {
 				return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: err.Error()}
 			}
-			return engine.rollback(ctx, instanceID, recoveryPointID, target, fmt.Errorf("persist %s completion: %w", step.name, err), emit)
+			return engine.rollback(ctx, instanceID, recoveryPointID, options.OperationID, target, fmt.Errorf("persist %s completion: %w", step.name, err), emit)
 		}
 	}
 
@@ -196,6 +204,7 @@ func (engine Engine) rollback(
 	ctx context.Context,
 	instanceID string,
 	recoveryPointID string,
+	transactionID string,
 	target managed.Release,
 	cause error,
 	emit func(string, string, string) error,
@@ -217,7 +226,7 @@ func (engine Engine) rollback(
 		_ = emit("rollback", "failed", combined.Error())
 		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
 	}
-	if err := engine.Deployment.Rollback(recoveryCtx, instanceID, recoveryPointID); err != nil {
+	if err := engine.Deployment.Rollback(recoveryCtx, instanceID, recovery.RestoreRequest{PointID: recoveryPointID, TransactionID: transactionID}); err != nil {
 		combined := errors.Join(cause, observeErr, fmt.Errorf("automatic rollback: %w", err))
 		_ = emit("rollback", "failed", combined.Error())
 		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}

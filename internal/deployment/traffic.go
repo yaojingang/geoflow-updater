@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"io"
 	"os"
 	"path/filepath"
@@ -263,6 +264,14 @@ func (service *Service) restoreBeforeTraffic(ctx context.Context, tx *releaseTra
 	if tx.TrafficOpened {
 		return errors.New("traffic may have resumed; start a new explicit data recovery")
 	}
+	inspector := tx.Source
+	if tx.LayoutStarted {
+		inspector = tx.Candidate
+	}
+	request, err := service.prepareRestore(ctx, inspector, recovery.RestoreRequest{PointID: tx.RecoveryPointID, TransactionID: tx.OperationID})
+	if err != nil {
+		return err
+	}
 	if tx.LayoutStarted {
 		names, err := applicationServices(tx.Candidate.ComposeFile)
 		if err != nil {
@@ -291,7 +300,7 @@ func (service *Service) restoreBeforeTraffic(ctx context.Context, tx *releaseTra
 			return err
 		}
 	}
-	if err := service.Recoveries.Restore(ctx, tx.Source, tx.RecoveryPointID, postgresDatabase{config: tx.Source, runner: service.runner()}); err != nil {
+	if err := service.Recoveries.Restore(ctx, tx.Source, request, postgresDatabase{config: tx.Source, runner: service.runner()}); err != nil {
 		return err
 	}
 	return service.resumeSource(ctx, tx)

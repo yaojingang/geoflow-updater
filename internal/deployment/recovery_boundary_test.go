@@ -24,7 +24,7 @@ func TestMaintenanceRecoveryPersistsBoundaryBeforeSourceResume(t *testing.T) {
 			restores, resumes := 0, 0
 			var crashState []byte
 			service.Recoveries = &topologyRecoveryStore{point: recovery.Point{ID: tx.RecoveryPointID, Deployment: &legacy}, restore: func() error { restores++; return nil }}
-			service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+			service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
 				if strings.Contains(strings.Join(args, " "), "artisan up") {
 					resumes++
 					var err error
@@ -72,7 +72,7 @@ func TestMaintenanceRecoveryCannotResumeWithoutPersistingBoundary(t *testing.T) 
 		}
 		return os.Mkdir(service.transactionPath(legacy.ID), 0700)
 	}}
-	service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+	service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
 		if strings.Contains(strings.Join(args, " "), "artisan up") {
 			resumes++
 			return errors.New("resume reached")
@@ -93,7 +93,7 @@ func TestMaintenanceLegacyRecoveryWithoutResumeEvidenceRequiresExplicitRestore(t
 	}
 	calls := 0
 	service.Recoveries = &topologyRecoveryStore{restore: func() error { calls++; return errors.New("restore reached") }}
-	service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, _ ...string) error { calls++; return nil })
+	service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, _ ...string) error { calls++; return nil })
 	result, handled := service.ReconcileRelease(context.Background(), legacy.ID, tx.OperationID)
 	if !handled || result.Status != update.StatusRecoveryRequired || !strings.Contains(result.Error, "explicit") || calls != 0 {
 		t.Fatalf("unsafe legacy recovery: status=%s error=%s handled=%v calls=%d", result.Status, result.Error, handled, calls)
@@ -112,7 +112,7 @@ func TestMaintenanceLegacyUnpersistedCheckpointRemainsHeldAcrossRestarts(t *test
 	}
 	calls := 0
 	service.Recoveries = &topologyRecoveryStore{restore: func() error { calls++; return nil }}
-	service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, _ ...string) error { calls++; return nil })
+	service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, _ ...string) error { calls++; return nil })
 	for attempt := 0; attempt < 3; attempt++ {
 		result, handled := service.ReconcileRelease(context.Background(), legacy.ID, tx.OperationID)
 		if !handled || result.Status != update.StatusRecoveryRequired || !strings.Contains(result.Error, "explicit") || calls != 0 {
@@ -125,7 +125,7 @@ func TestQuiesceFailureLeavesResumeToTheOperationJournal(t *testing.T) {
 	service, legacy, _, _ := recoveryTopologyFixture(t)
 	resumes := 0
 	failure := errors.New("retired worker cannot drain")
-	service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+	service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
 		cmd := strings.Join(args, " ")
 		if strings.Contains(cmd, "name=^/geoflow-system-update-queue-prod$") {
 			return failure

@@ -24,7 +24,7 @@ type topologyRecoveryStore struct {
 func (s *topologyRecoveryStore) List(string) ([]recovery.Point, error) {
 	return []recovery.Point{s.point}, nil
 }
-func (s *topologyRecoveryStore) Restore(context.Context, instance.Config, string, recovery.Database) error {
+func (s *topologyRecoveryStore) Restore(context.Context, instance.Config, recovery.RestoreRequest, recovery.Database) error {
 	return s.restore()
 }
 
@@ -74,7 +74,7 @@ func TestRecoveryStopsPendingLayoutBeforeRestoringAnyCheckpoint(t *testing.T) {
 				pointID = "20260908T010000Z-5678abcd"
 			}
 			var calls []string
-			service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+			service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
 				calls = append(calls, strings.Join(args, " "))
 				return nil
 			})
@@ -98,7 +98,7 @@ func TestRecoveryStopsPendingLayoutBeforeRestoringAnyCheckpoint(t *testing.T) {
 				if err := service.QuiesceForRecovery(context.Background(), legacy.ID, pointID); err != nil {
 					t.Fatal(err)
 				}
-				err := service.Rollback(context.Background(), legacy.ID, pointID)
+				err := service.Rollback(context.Background(), legacy.ID, recovery.RestoreRequest{PointID: pointID, TransactionID: "test-restore-transaction"})
 				if retry && i == 0 {
 					if err == nil {
 						t.Fatal("missing simulated restore failure")
@@ -171,7 +171,7 @@ func TestRecoveryClosesOnlyInfrastructureDifferentFromDestination(t *testing.T) 
 				writeTest(t, filepath.Join(service.instanceDirectory(legacy.ID), "instance.yml"), encoded)
 			}
 			var calls []string
-			service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+			service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
 				calls = append(calls, strings.Join(args, " "))
 				return nil
 			})
@@ -190,7 +190,7 @@ func TestRecoveryClosesOnlyInfrastructureDifferentFromDestination(t *testing.T) 
 				}
 				return nil
 			}
-			if err := service.Rollback(context.Background(), legacy.ID, tx.RecoveryPointID); err != nil {
+			if err := service.Rollback(context.Background(), legacy.ID, recovery.RestoreRequest{PointID: tx.RecoveryPointID, TransactionID: "test-restore-transaction"}); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -214,7 +214,7 @@ func TestInfrastructureReplacementRemovesBothSlotsBeforeNetworks(t *testing.T) {
 				writeTest(t, other.EnvironmentFile, []byte("VERSION=3.0.0\n"))
 				var removed []string
 				boundary := errors.New("teardown boundary")
-				service.Runner = functionRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+				service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
 					if !strings.Contains(strings.Join(args, " "), " down --remove-orphans") {
 						return nil
 					}
@@ -235,7 +235,7 @@ func TestInfrastructureReplacementRemovesBothSlotsBeforeNetworks(t *testing.T) {
 				}}
 				switch path {
 				case "rollback":
-					err = service.Rollback(context.Background(), legacy.ID, tx.RecoveryPointID)
+					err = service.Rollback(context.Background(), legacy.ID, recovery.RestoreRequest{PointID: tx.RecoveryPointID, TransactionID: "test-restore-transaction"})
 				case "before-traffic":
 					tx.TrafficOpened = false
 					err = service.restoreBeforeTraffic(context.Background(), &tx)

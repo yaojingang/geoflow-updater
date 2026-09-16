@@ -47,7 +47,7 @@ type CommandRunner interface {
 type RecoveryStore interface {
 	Create(context.Context, instance.Config, string, recovery.Database) (recovery.Point, error)
 	Validate(instance.Config, string) error
-	Restore(context.Context, instance.Config, string, recovery.Database) error
+	Restore(context.Context, instance.Config, recovery.RestoreRequest, recovery.Database) error
 	List(string) ([]recovery.Point, error)
 }
 
@@ -78,6 +78,9 @@ func (service *Service) Resolve(ctx context.Context, instanceID string) (managed
 }
 
 func (service *Service) Preflight(ctx context.Context, instanceID string, release managed.Release) error {
+	if err := service.requireRecoveryReady(instanceID); err != nil {
+		return err
+	}
 	config, err := service.loadConfig(instanceID)
 	if err != nil {
 		return err
@@ -194,7 +197,12 @@ func (service *Service) Pull(ctx context.Context, instanceID string, release man
 	if err != nil {
 		return err
 	}
-	arguments := composeArguments(config.Root, environmentPath, composePath)
+	candidate := config
+	candidate.ComposeFile, candidate.EnvironmentFile = composePath, environmentPath
+	arguments, err := service.runtimeArguments(candidate)
+	if err != nil {
+		return err
+	}
 	arguments = append(arguments, "pull")
 	return service.runner().Run(ctx, nil, io.Discard, "docker", arguments...)
 }
@@ -316,7 +324,12 @@ func (service *Service) Migrate(ctx context.Context, instanceID string, _ manage
 		return err
 	}
 	composePath, environmentPath := service.candidatePaths(config)
-	arguments := composeArguments(config.Root, environmentPath, composePath)
+	candidate := config
+	candidate.ComposeFile, candidate.EnvironmentFile = composePath, environmentPath
+	arguments, err := service.runtimeArguments(candidate)
+	if err != nil {
+		return err
+	}
 	arguments = append(arguments, "run", "--rm", "--no-deps", "init", "php", "artisan", "migrate", "--force")
 	if err := service.runner().Run(ctx, nil, io.Discard, "docker", arguments...); err != nil {
 		return fmt.Errorf("run database migrations: %w", err)
@@ -358,7 +371,8 @@ func (service *Service) Activate(_ context.Context, instanceID string, release m
 	return nil
 }
 
-func (service *Service) Rollback(ctx context.Context, instanceID string, recoveryPointID string) error {
+func (service *Service) Rollback(ctx context.Context, instanceID string, request recovery.RestoreRequest) error {
+	recoveryPointID := request.PointID
 	if !recoveryIDPattern.MatchString(recoveryPointID) {
 		return errors.New("recovery point identifier is invalid")
 	}
@@ -387,6 +401,14 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, recover
 	if err := service.Recoveries.Validate(config, recoveryPointID); err != nil {
 		return err
 	}
+	inspector := config
+	if tx, readErr := service.readTransaction(instanceID); readErr == nil && tx.LayoutStarted && (tx.Status == "running" || tx.Status == "recovery_required") {
+		inspector = tx.Candidate
+	}
+	request, err = service.prepareRestore(ctx, inspector, request)
+	if err != nil {
+		return err
+	}
 	destination := infrastructureConfig(source)
 	seen := map[string]bool{}
 	for _, topology := range topologies {
@@ -399,7 +421,7 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, recover
 			return err
 		}
 	}
-	if err := service.Recoveries.Restore(ctx, config, recoveryPointID, postgresDatabase{config: source, runner: service.runner()}); err != nil {
+	if err := service.Recoveries.Restore(ctx, config, request, postgresDatabase{config: source, runner: service.runner()}); err != nil {
 		return err
 	}
 	if tx, err := service.readTransaction(instanceID); err == nil {
@@ -434,6 +456,16 @@ func (service *Service) Resume(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return err
 	}
+	control := service.recoveryControl()
+	if authority, readErr := control.Read(instanceID); readErr == nil {
+		if authority.State.Phase != "ready" {
+			return service.resumeRecovered(ctx, config, authority)
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	} else if _, err := os.Lstat(filepath.Join(control.StateDir, "recovery-control", instanceID, "initialized")); !errors.Is(err, os.ErrNotExist) {
+		return readErr
+	}
 	if config.Layout == LayoutBlueGreen {
 		if err := service.startServices(ctx, infrastructureConfig(config), "postgres", "redis"); err != nil {
 			return err
@@ -463,7 +495,10 @@ func (service *Service) Resume(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return fmt.Errorf("select managed services: %w", err)
 	}
-	arguments := composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile)
+	arguments, err := service.runtimeArguments(config)
+	if err != nil {
+		return err
+	}
 	if err := service.runner().Run(ctx, nil, io.Discard, "docker", append(arguments, "run", "--rm", "--no-deps", "init", "php", "artisan", "up")...); err != nil {
 		return fmt.Errorf("disable maintenance mode: %w", err)
 	}
@@ -539,6 +574,23 @@ func resumeServices(composePath string) ([]string, error) {
 }
 
 func (service *Service) Verify(ctx context.Context, instanceID string) error {
+	control := service.recoveryControl()
+	if authority, readErr := control.Read(instanceID); readErr == nil && authority.State.Phase != "ready" {
+		if authority.State.Phase != "http_ready" || authority.PreparationSHA256 == "" || authority.RedisManifestSHA256 == "" {
+			return errors.New("recovery validation remains incomplete")
+		}
+		config, err := service.loadConfig(instanceID)
+		if err != nil {
+			return err
+		}
+		return service.checkHTTP(ctx, config)
+	} else if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	} else if readErr != nil {
+		if _, err := os.Lstat(filepath.Join(control.StateDir, "recovery-control", instanceID, "initialized")); !errors.Is(err, os.ErrNotExist) {
+			return readErr
+		}
+	}
 	if service.Doctor == nil {
 		return errors.New("deployment diagnostics are unavailable")
 	}

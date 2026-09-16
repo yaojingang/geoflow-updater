@@ -179,7 +179,9 @@ func (manager *Manager) StartRollback(instanceID string, recoveryPointID string)
 			operation.Status = StatusRecoveryRequired
 			return
 		}
-		if !manager.step(ctx, operation, save, "rollback", func() error { return manager.Deployment.Rollback(ctx, instanceID, recoveryPointID) }) {
+		if !manager.step(ctx, operation, save, "rollback", func() error {
+			return manager.Deployment.Rollback(ctx, instanceID, recovery.RestoreRequest{PointID: recoveryPointID, TransactionID: operation.ID})
+		}) {
 			operation.Status = StatusRecoveryRequired
 			return
 		}

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,11 +16,14 @@ import (
 
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
+	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
+	"strings"
 )
 
 type database struct {
-	dump     []byte
-	restored []byte
+	dump          []byte
+	restored      []byte
+	beforeRestore func()
 }
 
 func (db *database) Dump(_ context.Context, writer io.Writer) error {
@@ -28,6 +32,9 @@ func (db *database) Dump(_ context.Context, writer io.Writer) error {
 }
 
 func (db *database) Restore(_ context.Context, reader io.Reader) error {
+	if db.beforeRestore != nil {
+		db.beforeRestore()
+	}
 	contents, err := io.ReadAll(reader)
 	db.restored = contents
 	return err
@@ -55,7 +62,7 @@ func TestStoreCreatesVerifiedRecoveryPointAndRestoresDatabaseStorageAndManagedSt
 		ReleaseSequence: 17,
 	}
 	db := &database{dump: []byte("postgres custom dump")}
-	store := recovery.Store{
+	store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()},
 		BackupRoot: filepath.Join(t.TempDir(), "backups"),
 		Now:        func() time.Time { return time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC) },
 	}
@@ -69,8 +76,14 @@ func TestStoreCreatesVerifiedRecoveryPointAndRestoresDatabaseStorageAndManagedSt
 	mustWrite(t, filepath.Join(root, "storage", "app", "customer.txt"), []byte("changed data"), 0o640)
 	mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("changed redis"), 0o600)
 	mustWrite(t, config.EnvironmentFile, []byte("new release\n"), 0o640)
+	db.beforeRestore = func() {
+		state, err := store.Control.Read("primary")
+		if err != nil || state.State.Phase != "restoring" || state.State.TransactionID == nil || *state.State.TransactionID != "test-restore-transaction" {
+			t.Fatalf("database write without durable restore boundary: state=%+v error=%v", state, err)
+		}
+	}
 
-	if err := store.Restore(context.Background(), config, point.ID, db); err != nil {
+	if err := store.Restore(context.Background(), config, recovery.RestoreRequest{PointID: point.ID, TransactionID: "test-restore-transaction", AdminDigest: strings.Repeat("a", 64)}, db); err != nil {
 		t.Fatalf("Restore() error = %v", err)
 	}
 	assertContents(t, filepath.Join(root, ".env.prod"), "APP_ENV=production\n")
@@ -80,6 +93,93 @@ func TestStoreCreatesVerifiedRecoveryPointAndRestoresDatabaseStorageAndManagedSt
 	assertContents(t, config.EnvironmentFile, "old release\n")
 	if !bytes.Equal(db.restored, db.dump) {
 		t.Fatalf("restored database = %q, want %q", db.restored, db.dump)
+	}
+	state, err := store.Control.Read("primary")
+	if err != nil || state.State.Phase != "validating" || !state.DataRestored {
+		t.Fatalf("completed restore not held for validation: %+v %v", state, err)
+	}
+	db.restored = nil
+	if err := store.Restore(context.Background(), config, recovery.RestoreRequest{PointID: point.ID, TransactionID: "test-restore-transaction", AdminDigest: strings.Repeat("a", 64)}, db); err != nil {
+		t.Fatal(err)
+	}
+	if db.restored != nil {
+		t.Fatal("completed transaction restored the database twice")
+	}
+}
+
+func TestRedisEvidenceDirectoryDurabilityPrecedesEveryBusinessWrite(t *testing.T) {
+	for _, failedSync := range []string{"instance", "quarantine", "none"} {
+		t.Run(failedSync, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "site")
+			managed := filepath.Join(t.TempDir(), "instances", "primary")
+			mustWrite(t, filepath.Join(root, ".env.prod"), []byte("old env\n"), 0600)
+			mustWrite(t, filepath.Join(root, "version.json"), []byte("{}\n"), 0644)
+			mustWrite(t, filepath.Join(root, "storage", "data"), []byte("old storage"), 0600)
+			mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("old redis"), 0600)
+			mustWrite(t, filepath.Join(managed, "instance.yml"), []byte("instance\n"), 0600)
+			mustWrite(t, filepath.Join(managed, "release.env"), []byte("release\n"), 0600)
+			mustWrite(t, filepath.Join(managed, "docker-compose.managed.yml"), []byte("compose\n"), 0600)
+			config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(managed, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(managed, "release.env"), Version: "3.1.0", ReleaseSequence: 1}
+			store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()}, BackupRoot: t.TempDir()}
+			db := &database{dump: []byte("database")}
+			point, err := store.Create(context.Background(), config, "manual", db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, filepath.Join(root, ".env.prod"), []byte("current env\n"), 0600)
+			mustWrite(t, filepath.Join(root, "storage", "data"), []byte("current storage"), 0600)
+			mustWrite(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), []byte("current redis"), 0600)
+			controlDir := filepath.Join(store.Control.StateDir, "recovery-control", "primary")
+			quarantineCommitted, epochCommitted := false, false
+			failure := errors.New("injected directory sync failure")
+			store.SyncDirectory = func(path string) error {
+				state, err := store.Control.Read("primary")
+				if err != nil {
+					return err
+				}
+				quarantine := filepath.Join(controlDir, "quarantine")
+				_, epochExists := os.Stat(filepath.Join(quarantine, state.State.Epoch))
+				if (failedSync == "instance" && path == controlDir) || (failedSync == "quarantine" && path == quarantine && epochExists == nil) {
+					return failure
+				}
+				file, err := os.Open(path)
+				if err != nil {
+					return err
+				}
+				defer file.Close()
+				if err := file.Sync(); err != nil {
+					return err
+				}
+				if path == controlDir {
+					quarantineCommitted = true
+				}
+				if path == quarantine && epochExists == nil {
+					epochCommitted = true
+				}
+				return nil
+			}
+			db.beforeRestore = func() {
+				if !quarantineCommitted || !epochCommitted {
+					t.Fatal("database restoration preceded durable Redis evidence directory entries")
+				}
+			}
+			err = store.Restore(context.Background(), config, recovery.RestoreRequest{PointID: point.ID, TransactionID: "restore-durability-test", AdminDigest: strings.Repeat("a", 64)}, db)
+			if failedSync == "none" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if !errors.Is(err, failure) {
+				t.Fatalf("restore ignored directory sync failure: %v", err)
+			}
+			if db.restored != nil {
+				t.Fatal("directory durability failure allowed database writes")
+			}
+			assertContents(t, filepath.Join(root, ".env.prod"), "current env\n")
+			assertContents(t, filepath.Join(root, "storage", "data"), "current storage")
+			assertContents(t, filepath.Join(root, "docker-data", "prod", "redis", "appendonly.aof"), "current redis")
+		})
 	}
 }
 
@@ -98,7 +198,7 @@ func TestStoreRefusesATamperedRecoveryPointBeforeRestoring(t *testing.T) {
 	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
 	backupRoot := filepath.Join(t.TempDir(), "backups")
 	db := &database{dump: []byte("database")}
-	store := recovery.Store{BackupRoot: backupRoot}
+	store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()}, BackupRoot: backupRoot}
 	point, err := store.Create(context.Background(), config, "manual", db)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -106,7 +206,7 @@ func TestStoreRefusesATamperedRecoveryPointBeforeRestoring(t *testing.T) {
 	mustWrite(t, filepath.Join(backupRoot, "primary", point.ID, "database.dump"), []byte("tampered"), 0o600)
 	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("current env\n"), 0o600)
 
-	if err := store.Restore(context.Background(), config, point.ID, db); err == nil {
+	if err := store.Restore(context.Background(), config, recovery.RestoreRequest{PointID: point.ID, TransactionID: "test-restore-transaction", AdminDigest: strings.Repeat("a", 64)}, db); err == nil {
 		t.Fatal("Restore() accepted a tampered recovery point")
 	}
 	assertContents(t, filepath.Join(root, ".env.prod"), "current env\n")
@@ -130,7 +230,7 @@ func TestStoreRetainsTheNewestConfiguredRecoveryPoints(t *testing.T) {
 	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
 	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
 	clock := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
-	store := recovery.Store{
+	store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()},
 		BackupRoot: filepath.Join(t.TempDir(), "backups"),
 		Keep:       2,
 		Now: func() time.Time {
@@ -170,7 +270,7 @@ func TestStoreRetainsNewestPreUpdateCheckpointAcrossManualBackups(t *testing.T) 
 	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
 	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
 	clock := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
-	store := recovery.Store{
+	store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()},
 		BackupRoot: filepath.Join(t.TempDir(), "backups"),
 		Keep:       2,
 		Now: func() time.Time {
@@ -223,7 +323,7 @@ func TestStoreRecoversAnInterruptedStorageSwapBeforeRetryingRestore(t *testing.T
 	mustWrite(t, filepath.Join(stateDir, "release.env"), []byte("release\n"), 0o640)
 	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
 	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
-	store := recovery.Store{BackupRoot: filepath.Join(t.TempDir(), "backups")}
+	store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()}, BackupRoot: filepath.Join(t.TempDir(), "backups")}
 	db := &database{dump: []byte("database")}
 	point, err := store.Create(context.Background(), config, "before update", db)
 	if err != nil {
@@ -236,7 +336,7 @@ func TestStoreRecoversAnInterruptedStorageSwapBeforeRetryingRestore(t *testing.T
 		t.Fatalf("simulate interrupted storage swap: %v", err)
 	}
 
-	if err := store.Restore(context.Background(), config, point.ID, db); err != nil {
+	if err := store.Restore(context.Background(), config, recovery.RestoreRequest{PointID: point.ID, TransactionID: "test-restore-transaction", AdminDigest: strings.Repeat("a", 64)}, db); err != nil {
 		t.Fatalf("Restore() error = %v", err)
 	}
 	assertContents(t, filepath.Join(root, "storage", "app", "customer.txt"), "backup data")
@@ -260,7 +360,7 @@ func TestStoreStagesEveryDirectoryArchiveBeforeMutatingManagedState(t *testing.T
 	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
 	backupRoot := filepath.Join(t.TempDir(), "backups")
 	db := &database{dump: []byte("database")}
-	store := recovery.Store{BackupRoot: backupRoot}
+	store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()}, BackupRoot: backupRoot}
 	point, err := store.Create(context.Background(), config, "manual", db)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -291,7 +391,7 @@ func TestStoreStagesEveryDirectoryArchiveBeforeMutatingManagedState(t *testing.T
 	mustWrite(t, filepath.Join(root, ".env.prod"), []byte("current env\n"), 0o600)
 	db.restored = nil
 
-	if err := store.Restore(context.Background(), config, point.ID, db); err == nil {
+	if err := store.Restore(context.Background(), config, recovery.RestoreRequest{PointID: point.ID, TransactionID: "test-restore-transaction", AdminDigest: strings.Repeat("a", 64)}, db); err == nil {
 		t.Fatal("Restore() accepted an invalid storage archive")
 	}
 	assertContents(t, filepath.Join(root, ".env.prod"), "current env\n")
@@ -317,7 +417,7 @@ func TestStoreRestoresRegularFileModeDespiteProcessUmask(t *testing.T) {
 	}
 	mustWrite(t, filepath.Join(stateDir, "docker-compose.managed.yml"), []byte("compose\n"), 0o640)
 	config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(stateDir, "docker-compose.managed.yml"), EnvironmentFile: filepath.Join(stateDir, "release.env"), Version: "2.4.0", ReleaseSequence: 17}
-	store := recovery.Store{BackupRoot: filepath.Join(t.TempDir(), "backups")}
+	store := recovery.Store{Control: &recoverycontrol.Store{StateDir: t.TempDir()}, BackupRoot: filepath.Join(t.TempDir(), "backups")}
 	db := &database{dump: []byte("database")}
 	oldMask := syscall.Umask(0o027)
 	defer syscall.Umask(oldMask)
@@ -326,7 +426,7 @@ func TestStoreRestoresRegularFileModeDespiteProcessUmask(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	if err := store.Restore(context.Background(), config, point.ID, db); err != nil {
+	if err := store.Restore(context.Background(), config, recovery.RestoreRequest{PointID: point.ID, TransactionID: "test-restore-transaction", AdminDigest: strings.Repeat("a", 64)}, db); err != nil {
 		t.Fatalf("Restore() error = %v", err)
 	}
 	info, err := os.Stat(filepath.Join(root, "storage", "shared.txt"))

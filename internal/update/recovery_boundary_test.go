@@ -3,6 +3,8 @@ package update_test
 import (
 	"context"
 	"errors"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
+	"strings"
 	"testing"
 
 	"github.com/yaojingang/geoflow-updater/internal/update"
@@ -31,6 +33,32 @@ func TestRecoveryResumeStopsWhenBoundaryCannotBePersisted(t *testing.T) {
 				t.Fatalf("result = %+v", result)
 			}
 		})
+	}
+}
+
+type checkpointDeployment struct{ fakeDeployment }
+
+func (d *checkpointDeployment) FreezeRecoveryCheckpoint(_ context.Context, _ string, request recovery.RestoreRequest) error {
+	d.calls = append(d.calls, "freeze:"+request.TransactionID+":"+request.PointID)
+	return nil
+}
+func TestAutomaticRecoveryFreezesCheckpointIdentityBeforeMigration(t *testing.T) {
+	d := &checkpointDeployment{}
+	result := (update.Engine{Deployment: d}).RunWithOptions(context.Background(), "primary", update.Options{AllowMaintenance: true, OperationID: "stable-upgrade-operation"}, nil)
+	if result.Status != update.StatusSucceeded {
+		t.Fatalf("result=%+v", result)
+	}
+	freeze, migrate := -1, -1
+	for index, call := range d.calls {
+		if strings.HasPrefix(call, "freeze:stable-upgrade-operation:") {
+			freeze = index
+		}
+		if call == "migrate" {
+			migrate = index
+		}
+	}
+	if freeze < 0 || migrate <= freeze {
+		t.Fatalf("migration started without a frozen administrator checkpoint: %v", d.calls)
 	}
 }
 

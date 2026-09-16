@@ -88,7 +88,7 @@ networks:
 		if err := service.saveTransaction(&tx); err != nil {
 			t.Fatal(err)
 		}
-		if err := service.Rollback(ctx, legacy.ID, tx.RecoveryPointID); err != nil {
+		if err := service.Rollback(ctx, legacy.ID, recovery.RestoreRequest{PointID: tx.RecoveryPointID, TransactionID: "test-restore-transaction"}); err != nil {
 			t.Fatal(err)
 		}
 		start()

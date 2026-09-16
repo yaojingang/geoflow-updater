@@ -15,6 +15,7 @@ import (
 	"github.com/yaojingang/geoflow-updater/internal/deployment"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
+	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/operation"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/update"
@@ -93,6 +94,9 @@ func (app App) Run(ctx context.Context, arguments []string) int {
 		return app.recoveryPoints(arguments[1:], stdout, stderr)
 	case "authorization-uri":
 		return app.authorizationURI(arguments[1:], stdout, stderr)
+	case "protocol":
+		fmt.Fprintln(stdout, managed.UpdaterProtocolVersion)
+		return 0
 	case "version":
 		fmt.Fprintln(stdout, app.Version)
 		return 0

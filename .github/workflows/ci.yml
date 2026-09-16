@@ -21,6 +21,12 @@ jobs:
         run: test -z "$(gofmt -l cmd internal tuf)"
       - name: Vet
         run: go vet ./...
+      - name: Install recovery verification dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y php-cli php-sqlite3 redis-server
+          php internal/deployment/legacy-adapter-test.php
+          redis-server --version
       - name: Test with race detector
         run: go test -race ./...
       - name: Test candidate evidence and host readiness

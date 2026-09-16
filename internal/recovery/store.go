@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/instance"
+	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
 )
 
 const maxRestoreBytes int64 = 100 * 1024 * 1024 * 1024
@@ -60,11 +61,21 @@ func (point Point) IsUpdateCheckpoint() bool {
 	return strings.HasPrefix(point.Reason, "update-to-")
 }
 
+type RestoreRequest struct {
+	PointID       string
+	TransactionID string
+	AdminDigest   string
+}
+
 type Store struct {
+	Control    *recoverycontrol.Store
 	BackupRoot string
 	Keep       int
 	Now        func() time.Time
 	Random     io.Reader
+	// SyncDirectory overrides the directory durability primitive for storage
+	// adapters and fault-injection tests. Production uses file.Sync.
+	SyncDirectory func(string) error
 }
 
 func (store Store) Create(ctx context.Context, config instance.Config, reason string, database Database) (Point, error) {
@@ -187,7 +198,8 @@ func (store Store) Create(ctx context.Context, config instance.Config, reason st
 	return point, nil
 }
 
-func (store Store) Restore(ctx context.Context, config instance.Config, id string, database Database) error {
+func (store Store) Restore(ctx context.Context, config instance.Config, request RestoreRequest, database Database) error {
+	id := request.PointID
 	if database == nil {
 		return errors.New("database restore service is required")
 	}
@@ -196,7 +208,7 @@ func (store Store) Restore(ctx context.Context, config instance.Config, id strin
 		return err
 	}
 
-	return store.restoreValidated(ctx, config, id, pointPath, point, database)
+	return store.restoreValidated(ctx, config, request, pointPath, point, database)
 }
 
 func (store Store) Validate(config instance.Config, id string) error {
@@ -238,7 +250,8 @@ func (store Store) validate(config instance.Config, id string) (string, Point, e
 	return pointPath, point, nil
 }
 
-func (store Store) restoreValidated(ctx context.Context, config instance.Config, id string, pointPath string, point Point, database Database) error {
+func (store Store) restoreValidated(ctx context.Context, config instance.Config, request RestoreRequest, pointPath string, point Point, database Database) error {
+	id := request.PointID
 	source, err := recoveryConfiguration(config, point)
 	if err != nil {
 		return err
@@ -274,6 +287,19 @@ func (store Store) restoreValidated(ctx context.Context, config instance.Config,
 	}
 	if err := rejectMountedTree(filepath.Join(redisParent, "redis")); err != nil {
 		return err
+	}
+	if store.Control == nil {
+		return errors.New("durable recovery control is required before restoring data")
+	}
+	authority, err := store.Control.Begin(config.ID, request.PointID, request.TransactionID, request.AdminDigest)
+	if err != nil {
+		return fmt.Errorf("persist restore boundary: %w", err)
+	}
+	if authority.DataRestored {
+		return nil
+	}
+	if err := store.preserveRedis(ctx, config, pointPath, authority); err != nil {
+		return fmt.Errorf("preserve Redis recovery evidence: %w", err)
 	}
 
 	for _, name := range expectedFiles {
@@ -315,7 +341,96 @@ func (store Store) restoreValidated(ctx context.Context, config instance.Config,
 		return fmt.Errorf("restore Redis data: %w", err)
 	}
 
-	return nil
+	_, err = store.Control.Restored(config.ID, request.TransactionID)
+	return err
+}
+
+// Keep both queue populations outside the restored tree. The isolated host
+// validation subsequently moves restored queue keys into an epoch quarantine.
+func (store Store) preserveRedis(ctx context.Context, config instance.Config, pointPath string, authority recoverycontrol.Authority) error {
+	directory := filepath.Join(store.Control.StateDir, "recovery-control", config.ID, "quarantine", authority.State.Epoch)
+	for _, path := range []string{filepath.Dir(directory), directory} {
+		if err := ensureDirectory(path, 0700); err != nil {
+			return err
+		}
+		// Both new directory entries must survive before the old Redis tree can
+		// be replaced. Syncing only files within the epoch does not commit the
+		// epoch entry in quarantine, or quarantine in the instance directory.
+		if err := store.syncEvidenceDirectory(path); err != nil {
+			return err
+		}
+		if err := store.syncEvidenceDirectory(filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{"before-redis.tar.gz", "restored-redis.tar.gz"} {
+		path := filepath.Join(directory, name)
+		if info, err := os.Lstat(path); err == nil {
+			if !info.Mode().IsRegular() {
+				return errors.New("unsafe Redis quarantine archive")
+			}
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		temporary := path + ".partial"
+		if err := os.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		var err error
+		if name == "before-redis.tar.gz" {
+			err = archiveDirectory(ctx, filepath.Join(config.Root, "docker-data", "prod", "redis"), temporary, "redis")
+		} else {
+			err = copyRegularFile(filepath.Join(pointPath, "redis.tar.gz"), temporary)
+		}
+		if err != nil {
+			return err
+		}
+		if err = os.Rename(temporary, path); err != nil {
+			return err
+		}
+		if err = store.syncEvidenceDirectory(directory); err != nil {
+			return err
+		}
+	}
+	manifest := struct {
+		SchemaVersion int                   `json:"schema_version"`
+		PointID       string                `json:"point_id"`
+		Epoch         string                `json:"epoch"`
+		TransactionID string                `json:"transaction_id"`
+		Archives      map[string]FileRecord `json:"archives"`
+	}{1, authority.PointID, authority.State.Epoch, *authority.State.TransactionID, map[string]FileRecord{}}
+	for _, name := range []string{"before-redis.tar.gz", "restored-redis.tar.gz"} {
+		record, err := describeFile(filepath.Join(directory, name))
+		if err != nil {
+			return err
+		}
+		manifest.Archives[name] = record
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(directory, "archives.json")
+	if existing, err := os.ReadFile(path); err == nil {
+		if string(existing) != string(data) {
+			return errors.New("Redis archive evidence changed")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := writeExclusive(path, data, 0600); err != nil {
+		return err
+	}
+	return store.syncEvidenceDirectory(directory)
+}
+
+func (store Store) syncEvidenceDirectory(path string) error {
+	if store.SyncDirectory != nil {
+		return store.SyncDirectory(path)
+	}
+	return syncDirectory(path)
 }
 
 func (store Store) List(instanceID string) ([]Point, error) {
