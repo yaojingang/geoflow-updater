@@ -37,6 +37,7 @@ jobs:
         run: |
           docker pull nginx:1.31.1-alpine
           docker pull python:3.12-alpine
+          docker pull php:8.4-cli
           GEOFLOW_DOCKER_TEST=1 go test ./internal/deployment -run TestDockerIngress -v
       - name: Build static Linux binaries
         run: |
