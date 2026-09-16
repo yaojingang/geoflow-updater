@@ -95,6 +95,9 @@ func (service *Service) Preview(ctx context.Context, id string) (update.PlanSumm
 	if err != nil {
 		return update.PlanSummary{}, err
 	}
+	return service.previewRelease(ctx, id, release)
+}
+func (service *Service) previewRelease(ctx context.Context, id string, release managed.Release) (update.PlanSummary, error) {
 	config, err := service.loadConfig(id)
 	if err != nil {
 		return update.PlanSummary{}, err

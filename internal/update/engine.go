@@ -88,7 +88,14 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 	if err := emit("resolve", "running", ""); err != nil {
 		return persistenceFailure("resolve", err)
 	}
-	target, err := engine.Deployment.Resolve(ctx, instanceID)
+	var target managed.Release
+	var err error
+	if options.PinnedTarget != nil {
+		target = *options.PinnedTarget
+		err = target.Validate()
+	} else {
+		target, err = engine.Deployment.Resolve(ctx, instanceID)
+	}
 	if err != nil {
 		return fail("resolve", err)
 	}

@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yaojingang/geoflow-updater/internal/coordination"
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"gopkg.in/yaml.v3"
 )
@@ -126,7 +127,20 @@ func (service Service) Configured(instanceID string) error {
 }
 
 func (service Service) Authorize(instanceID string, scope Scope, code string, callback func() error) error {
-	if !validScope(scope) || !codePattern.MatchString(code) || callback == nil {
+	if callback == nil {
+		return ErrInvalid
+	}
+	return service.authorize(instanceID, scope, code, nil, func(_ int64) error { return callback() }, false)
+}
+
+// AuthorizeAdmission holds the same lock and factors as v1. The callback must
+// durably bind the matched counter to an admission before returning success.
+// Existing receipts are resolved under the lock before checking an OTP.
+func (service Service) AuthorizeAdmission(instanceID string, scope Scope, code string, existing func() (bool, error), callback func(int64) error) error {
+	return service.authorize(instanceID, scope, code, existing, callback, true)
+}
+func (service Service) authorize(instanceID string, scope Scope, code string, existing func() (bool, error), callback func(int64) error, admission bool) error {
+	if !validScope(scope) || callback == nil {
 		return ErrInvalid
 	}
 	instanceDir, err := service.instanceDir(instanceID)
@@ -145,6 +159,18 @@ func (service Service) Authorize(instanceID string, scope Scope, code string, ca
 		return fmt.Errorf("lock mutation authorization: %w", err)
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	if existing != nil {
+		found, err := existing()
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+	}
+	if !codePattern.MatchString(code) {
+		return ErrInvalid
+	}
 
 	masterSecret, err := readSecret(filepath.Join(instanceDir, "mutation.secret"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -176,6 +202,13 @@ func (service Service) Authorize(instanceID string, scope Scope, code string, ca
 	if err != nil {
 		return err
 	}
+	authorityCounter, err := (coordination.Store{StateDir: service.StateDir}).Counter(instanceID, string(scope))
+	if err != nil {
+		return fmt.Errorf("read admission authorization authority: %w", err)
+	}
+	if authorityCounter > lastCounter {
+		lastCounter = authorityCounter
+	}
 	currentCounter := now.Unix() / period
 	matchedCounter := int64(-1)
 	for _, candidate := range []int64{currentCounter - 1, currentCounter, currentCounter + 1} {
@@ -197,10 +230,21 @@ func (service Service) Authorize(instanceID string, scope Scope, code string, ca
 	if err != nil {
 		return fmt.Errorf("calculate mutation authorization attempts: %w", err)
 	}
+	if admission {
+		if err := callback(matchedCounter); err != nil {
+			return err
+		}
+		// These files are projections. A failed cleanup cannot undo an admission;
+		// the next authorization still reads the consumed counter from its receipt.
+		_ = replacePrivateFile(counterPath, []byte(strconv.FormatInt(matchedCounter, 10)+"\n"))
+		_ = writeAttemptState(attemptsPath, attemptState{})
+		_ = writeAttemptState(globalAttemptsPath, clearedGlobalAttempts)
+		return nil
+	}
 	if err := replacePrivateFile(counterPath, []byte(strconv.FormatInt(matchedCounter, 10)+"\n")); err != nil {
 		return fmt.Errorf("persist mutation authorization counter: %w", err)
 	}
-	if err := callback(); err != nil {
+	if err := callback(matchedCounter); err != nil {
 		counterErr := restoreCounter(counterPath, lastCounter)
 
 		return errors.Join(

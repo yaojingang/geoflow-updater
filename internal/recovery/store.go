@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yaojingang/geoflow-updater/internal/coordination"
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
 )
@@ -478,10 +479,16 @@ func (store Store) prune(instanceID string, protectedID string) error {
 		return err
 	}
 	retainedIDs := map[string]struct{}{protectedID: {}}
-	for _, point := range points {
-		if len(retainedIDs) >= keep {
-			break
+	if store.Control != nil {
+		protected, err := (coordination.Store{StateDir: store.Control.StateDir}).ProtectedPoints(instanceID, store.now())
+		if err != nil {
+			return err
 		}
+		for id := range protected {
+			retainedIDs[id] = struct{}{}
+		}
+	}
+	for _, point := range points {
 		if point.IsUpdateCheckpoint() {
 			retainedIDs[point.ID] = struct{}{}
 			break

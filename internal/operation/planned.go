@@ -41,7 +41,10 @@ func (manager *Manager) Preview(ctx context.Context, id string) (update.PlanSumm
 }
 
 func (manager *Manager) StartSwitchBack(id string) (Operation, error) {
-	return manager.start(id, KindSwitchBack, "", func(ctx context.Context, operation *Operation, save func() error) {
+	return manager.start(id, KindSwitchBack, "", manager.switchBackRunner(id))
+}
+func (manager *Manager) switchBackRunner(id string) func(context.Context, *Operation, func() error) {
+	return func(ctx context.Context, operation *Operation, save func() error) {
 		deployment, ok := manager.Deployment.(interface {
 			SwitchBack(context.Context, string, string, update.Observer) update.Result
 		})
@@ -61,5 +64,5 @@ func (manager *Manager) StartSwitchBack(id string) (Operation, error) {
 		default:
 			operation.Status = StatusFailed
 		}
-	})
+	}
 }

@@ -6,10 +6,11 @@ import (
 )
 
 type Options struct {
-	LegacyRequest      bool   `json:"-"`
-	AllowMaintenance   bool   `json:"allow_maintenance"`
-	ExpectedPlanSHA256 string `json:"expected_plan_sha256,omitempty"`
-	OperationID        string `json:"-"`
+	PinnedTarget       *managed.Release `json:"-"`
+	LegacyRequest      bool             `json:"-"`
+	AllowMaintenance   bool             `json:"allow_maintenance"`
+	ExpectedPlanSHA256 string           `json:"expected_plan_sha256,omitempty"`
+	OperationID        string           `json:"-"`
 }
 
 type PlanSummary struct {

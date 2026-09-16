@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/yaojingang/geoflow-updater/internal/coordination"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/update"
 )
@@ -90,6 +91,7 @@ type Manager struct {
 	OperationTimeout time.Duration
 	PreviewTimeout   time.Duration
 	RecoveryTimeout  time.Duration
+	Coordination     *coordination.Store
 	mu               sync.Mutex
 	active           map[string]string
 	wg               sync.WaitGroup
@@ -100,7 +102,11 @@ func (manager *Manager) StartUpdate(instanceID string) (Operation, error) {
 }
 
 func (manager *Manager) StartUpdateWithOptions(instanceID string, options update.Options) (Operation, error) {
-	return manager.start(instanceID, KindUpdate, "", func(ctx context.Context, operation *Operation, save func() error) {
+	return manager.start(instanceID, KindUpdate, "", manager.updateRunner(instanceID, options))
+}
+
+func (manager *Manager) updateRunner(instanceID string, options update.Options) func(context.Context, *Operation, func() error) {
+	return func(ctx context.Context, operation *Operation, save func() error) {
 		options.OperationID = operation.ID
 		result := manager.Engine.RunWithOptions(ctx, instanceID, options, func(stage update.Stage) error {
 			if stage.Name == "backup" && stage.Status == "succeeded" && stage.Message != "" {
@@ -125,11 +131,15 @@ func (manager *Manager) StartUpdateWithOptions(instanceID string, options update
 				operation.Status = StatusFailed
 			}
 		}
-	})
+	}
 }
 
 func (manager *Manager) StartBackup(instanceID string) (Operation, error) {
-	return manager.start(instanceID, KindBackup, "", func(ctx context.Context, operation *Operation, save func() error) {
+	return manager.start(instanceID, KindBackup, "", manager.backupRunner(instanceID))
+}
+
+func (manager *Manager) backupRunner(instanceID string) func(context.Context, *Operation, func() error) {
+	return func(ctx context.Context, operation *Operation, save func() error) {
 		if !manager.requireDeployment(operation) {
 			return
 		}
@@ -144,6 +154,7 @@ func (manager *Manager) StartBackup(instanceID string) (Operation, error) {
 		backupOK := manager.step(ctx, operation, save, "backup", func() error {
 			var err error
 			recoveryPointID, err = manager.Deployment.CreateRecoveryPoint(ctx, instanceID, "manual-backup")
+			operation.RecoveryPointID = recoveryPointID
 			return err
 		})
 		operation.RecoveryPointID = recoveryPointID
@@ -159,14 +170,18 @@ func (manager *Manager) StartBackup(instanceID string) (Operation, error) {
 		} else if backupOK && resumeOK {
 			operation.Status = StatusRecoveryRequired
 		}
-	})
+	}
 }
 
 func (manager *Manager) StartRollback(instanceID string, recoveryPointID string) (Operation, error) {
 	if !recoveryIDPattern.MatchString(recoveryPointID) {
 		return Operation{}, ErrInvalidRecoveryPoint
 	}
-	return manager.start(instanceID, KindRollback, recoveryPointID, func(ctx context.Context, operation *Operation, save func() error) {
+	return manager.start(instanceID, KindRollback, recoveryPointID, manager.rollbackRunner(instanceID, recoveryPointID))
+}
+
+func (manager *Manager) rollbackRunner(instanceID string, recoveryPointID string) func(context.Context, *Operation, func() error) {
+	return func(ctx context.Context, operation *Operation, save func() error) {
 		if !manager.requireDeployment(operation) {
 			return
 		}
@@ -194,7 +209,7 @@ func (manager *Manager) StartRollback(instanceID string, recoveryPointID string)
 		} else {
 			operation.Status = StatusRecoveryRequired
 		}
-	})
+	}
 }
 
 func (manager *Manager) StartVerify(instanceID string) (Operation, error) {
@@ -264,7 +279,13 @@ func (manager *Manager) Reconcile(instanceID string) error {
 		return errors.New("managed instance identifier is invalid")
 	}
 	if _, err := manager.Current(instanceID); errors.Is(err, os.ErrNotExist) {
-		return nil
+		_, readErr := manager.coordinationStore().Latest(instanceID)
+		if errors.Is(readErr, os.ErrNotExist) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
 	} else if err != nil {
 		return err
 	}
@@ -277,6 +298,9 @@ func (manager *Manager) Reconcile(instanceID string) error {
 		_ = lock.Close()
 	}()
 
+	if err := manager.repairAdmissions(instanceID); err != nil {
+		return err
+	}
 	operation, err := manager.Current(instanceID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -321,6 +345,15 @@ func (manager *Manager) Reconcile(instanceID string) error {
 }
 
 func (manager *Manager) reconcileOperation(ctx context.Context, operation *Operation) (Status, error) {
+	if len(operation.Stages) == 0 && operationIDPattern.MatchString(operation.ID) {
+		head, err := manager.coordinationStore().Latest(operation.InstanceID)
+		if err == nil && head.OperationID == operation.ID {
+			return StatusFailed, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return StatusFailed, err
+		}
+	}
 	if legacyPartialRestore(*operation) {
 		if !hasLegacyRestoreHold(operation.Stages) {
 			message := legacyRestoreUncertain + ": " + operation.Error
@@ -421,6 +454,9 @@ func (manager *Manager) reconcileOperation(ctx context.Context, operation *Opera
 }
 
 func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID string, run func(context.Context, *Operation, func() error)) (Operation, error) {
+	return manager.startAccepted(instanceID, kind, recoveryPointID, run, nil, nil)
+}
+func (manager *Manager) startAccepted(instanceID string, kind Kind, recoveryPointID string, run func(context.Context, *Operation, func() error), validate func() error, accept func(*Operation) error) (Operation, error) {
 	if !instanceIDPattern.MatchString(instanceID) {
 		return Operation{}, errors.New("managed instance identifier is invalid")
 	}
@@ -432,19 +468,33 @@ func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID stri
 		manager.mu.Unlock()
 		return Operation{}, ErrActive
 	}
+	lock, err := manager.acquireLock(instanceID)
+	if err != nil {
+		manager.mu.Unlock()
+		return Operation{}, err
+	}
+	if err := manager.repairAdmissions(instanceID); err != nil {
+		_ = lock.Close()
+		manager.mu.Unlock()
+		return Operation{}, err
+	}
 	current, currentErr := manager.Current(instanceID)
 	if currentErr == nil && (current.Status == StatusQueued || current.Status == StatusRunning || (current.Status == StatusRecoveryRequired && kind != KindRollback)) {
+		_ = lock.Close()
 		manager.mu.Unlock()
 		return Operation{}, ErrActive
 	}
 	if currentErr != nil && !errors.Is(currentErr, os.ErrNotExist) {
 		manager.mu.Unlock()
+		_ = lock.Close()
 		return Operation{}, fmt.Errorf("read current operation: %w", currentErr)
 	}
-	lock, err := manager.acquireLock(instanceID)
-	if err != nil {
-		manager.mu.Unlock()
-		return Operation{}, err
+	if validate != nil {
+		if err := validate(); err != nil {
+			_ = lock.Close()
+			manager.mu.Unlock()
+			return Operation{}, err
+		}
 	}
 	id, err := manager.newID()
 	if err != nil {
@@ -461,6 +511,23 @@ func (manager *Manager) start(instanceID string, kind Kind, recoveryPointID stri
 		Stages:          []update.Stage{},
 		RecoveryPointID: recoveryPointID,
 		StartedAt:       manager.now().UTC(),
+	}
+	if accept != nil {
+		if err := accept(&operation); err != nil {
+			_ = lock.Close()
+			manager.mu.Unlock()
+			return Operation{}, err
+		}
+	} else {
+		contents, err := json.Marshal(operation)
+		if err == nil {
+			err = manager.coordinationStore().BeginLegacy(instanceID, operation.ID, contents)
+		}
+		if err != nil {
+			_ = lock.Close()
+			manager.mu.Unlock()
+			return Operation{}, err
+		}
 	}
 	if err := manager.save(&operation); err != nil {
 		_ = lock.Close()
@@ -703,6 +770,9 @@ func (manager *Manager) save(operation *Operation) error {
 		return err
 	}
 	contents = append(contents, '\n')
+	if err := manager.coordinationStore().UpdateOperation(operation.InstanceID, operation.ID, contents); err != nil {
+		return err
+	}
 	for _, path := range []string{
 		filepath.Join(directory, operation.ID+".json"),
 		manager.currentPath(operation.InstanceID),

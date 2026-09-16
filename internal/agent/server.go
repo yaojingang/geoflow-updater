@@ -58,6 +58,7 @@ func (server Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", server.health)
 	mux.HandleFunc("/v1/instances/", server.instanceRequest)
+	mux.HandleFunc("/v2/instances/", server.coordinatedRequest)
 
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.Header().Set("Cache-Control", "no-store")
@@ -279,6 +280,7 @@ func (server Server) startMutationOperation(
 	case errors.Is(err, authorization.ErrInvalid):
 		writeError(response, http.StatusForbidden, "mutation_authorization_invalid")
 	case errors.Is(err, authorization.ErrRateLimited):
+		server.retryAfter(response, instanceID, scope)
 		writeError(response, http.StatusTooManyRequests, "mutation_authorization_rate_limited")
 	case errors.Is(err, operation.ErrActive):
 		writeError(response, http.StatusConflict, "operation_active")
