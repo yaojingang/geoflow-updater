@@ -18,6 +18,7 @@ import (
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
+	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
 	"github.com/yaojingang/geoflow-updater/internal/update"
 	"gopkg.in/yaml.v3"
 )
@@ -79,7 +80,7 @@ func TestEnrolledCurrentReleaseConvertsOnceWithPreviewAndMaintenanceConsent(t *t
 	}
 	var calls []string
 	service.Runner = conversionRunner(t, release, &calls)
-	service.Recoveries = recovery.Store{BackupRoot: canonicalTemp(t)}
+	service.Recoveries = recovery.Store{Control: &recoverycontrol.Store{StateDir: service.StateDir}, BackupRoot: canonicalTemp(t)}
 	service.ObservationDuration = time.Nanosecond
 	options := update.Options{OperationID: "enrolled-conversion", ExpectedPlanSHA256: preview.PlanSHA256}
 	result := service.ExecuteRelease(context.Background(), "primary", release, options, nil)
@@ -116,19 +117,19 @@ func TestEnrolledCurrentReleaseConvertsOnceWithPreviewAndMaintenanceConsent(t *t
 	if err := service.QuiesceForRecovery(context.Background(), "primary", result.RecoveryPointID); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Rollback(context.Background(), "primary", result.RecoveryPointID); err != nil {
+	if err := service.Rollback(context.Background(), "primary", recovery.RestoreRequest{PointID: result.RecoveryPointID, TransactionID: "test-restore-transaction"}); err != nil {
 		t.Fatalf("full recovery failed: %v", err)
 	}
 	restored, err := service.loadConfig("primary")
 	if err != nil || restored.Layout != "" || restored.EnrolledReleaseSHA256 != enrolled.EnrolledReleaseSHA256 {
 		t.Fatalf("recovery lost the enrolled release proof: %+v %v", restored, err)
 	}
-	if _, err := service.Preview(context.Background(), "primary"); err != nil {
-		t.Fatalf("restored enrollment can no longer retry conversion: %v", err)
+	if _, err := service.Preview(context.Background(), "primary"); err == nil {
+		t.Fatal("restored enrollment bypassed pending recovery validation")
 	}
 	options.OperationID = "conversion-after-recovery"
-	if result := service.ExecuteRelease(context.Background(), "primary", release, options, nil); result.Status != update.StatusSucceeded {
-		t.Fatalf("conversion failed after full recovery: %+v", result)
+	if result := service.ExecuteRelease(context.Background(), "primary", release, options, nil); result.Status != update.StatusFailed {
+		t.Fatalf("conversion bypassed recovery hold: %+v", result)
 	}
 }
 
@@ -138,6 +139,9 @@ func conversionRunner(t *testing.T, release managed.Release, calls *[]string) Co
 		command := strings.Join(args, " ")
 		*calls = append(*calls, command)
 		switch {
+		case isRecoveryInspect(args):
+			_, err := io.WriteString(out, recoveryInspectFixture)
+			return err
 		case strings.Contains(command, "pg_dump"):
 			_, err := io.WriteString(out, "PGDMP-fixture")
 			return err
@@ -167,7 +171,7 @@ func conversionRunner(t *testing.T, release managed.Release, calls *[]string) Co
 		case strings.HasSuffix(command, "ps --all --format json"):
 			var compose string
 			for i, arg := range args {
-				if arg == "-f" {
+				if arg == "-f" && !strings.HasSuffix(args[i+1], "/recovery-runtime.yml") {
 					compose = args[i+1]
 				}
 			}

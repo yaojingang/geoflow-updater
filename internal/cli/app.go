@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/yaojingang/geoflow-updater/internal/authorization"
+	"github.com/yaojingang/geoflow-updater/internal/coordination"
 	"github.com/yaojingang/geoflow-updater/internal/deployment"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
+	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/operation"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/update"
@@ -89,10 +91,15 @@ func (app App) Run(ctx context.Context, arguments []string) int {
 		return app.serve(ctx, arguments[1:], stderr)
 	case "update", "backup", "rollback", "switch-back", "verify":
 		return app.operation(ctx, arguments[0], arguments[1:], stdout, stderr)
+	case "request":
+		return app.request(arguments[1:], stdout, stderr)
 	case "recovery-points":
 		return app.recoveryPoints(arguments[1:], stdout, stderr)
 	case "authorization-uri":
 		return app.authorizationURI(arguments[1:], stdout, stderr)
+	case "protocol":
+		fmt.Fprintln(stdout, managed.UpdaterProtocolVersion)
+		return 0
 	case "version":
 		fmt.Fprintln(stdout, app.Version)
 		return 0
@@ -382,7 +389,7 @@ func (app App) serve(ctx context.Context, arguments []string, stderr io.Writer) 
 }
 
 func (app App) usage(writer io.Writer) {
-	fmt.Fprintln(writer, "Usage: geoflow-updater <install|enroll|doctor|authorization-uri|update|backup|rollback|switch-back|verify|recovery-points|serve|version>")
+	fmt.Fprintln(writer, "Usage: geoflow-updater <install|enroll|doctor|authorization-uri|update|backup|rollback|switch-back|verify|recovery-points|request|serve|protocol|version>")
 }
 
 func validPlanHash(value string) bool {
@@ -420,5 +427,42 @@ func (app App) install(ctx context.Context, arguments []string, stdout, stderr i
 		return 1
 	}
 	fmt.Fprintf(stdout, "Installed GEOFlow instance %s at %s. Credentials are stored in %s.\n", result.Instance.ID, result.Instance.Root, result.CredentialsFile)
+	return 0
+}
+
+// request reads the host authority and never submits or reconciles an action.
+func (app App) request(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 2 && args[1] == "--json" {
+		args = args[:1]
+	}
+	if len(args) != 1 || !coordination.ValidRequestID(args[0]) {
+		fmt.Fprintln(stderr, "usage: geoflow-updater request REQUEST_ID [--json]")
+		return 2
+	}
+	reader, ok := app.Operations.(interface {
+		Request(string, string) (coordination.Receipt, error)
+	})
+	if !ok {
+		fmt.Fprintln(stderr, "request receipts are unavailable")
+		return 1
+	}
+	receipt, err := reader.Request("primary", args[0])
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err = json.NewEncoder(stdout).Encode(receipt); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	var op operation.Operation
+	if len(receipt.Operation) > 0 {
+		if err = json.Unmarshal(receipt.Operation, &op); err != nil {
+			return 1
+		}
+	}
+	if receipt.BackgroundStatus == "held" || op.Status == operation.StatusFailed || op.Status == operation.StatusRolledBack || op.Status == operation.StatusRecoveryRequired {
+		return 1
+	}
 	return 0
 }

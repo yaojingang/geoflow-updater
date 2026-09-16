@@ -16,7 +16,7 @@ var (
 	versionPattern       = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
 )
 
-const UpdaterProtocolVersion uint64 = 4
+const UpdaterProtocolVersion uint64 = 5
 
 type Release struct {
 	Sequence               uint64

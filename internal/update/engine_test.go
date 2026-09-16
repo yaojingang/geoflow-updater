@@ -3,6 +3,7 @@ package update_test
 import (
 	"context"
 	"errors"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"reflect"
 	"strings"
 	"testing"
@@ -65,7 +66,7 @@ func (deployment *fakeDeployment) Activate(ctx context.Context, _ string, _ mana
 	return deployment.call(ctx, "activate")
 }
 
-func (deployment *fakeDeployment) Rollback(ctx context.Context, _ string, _ string) error {
+func (deployment *fakeDeployment) Rollback(ctx context.Context, _ string, _ recovery.RestoreRequest) error {
 	return deployment.call(ctx, "rollback")
 }
 

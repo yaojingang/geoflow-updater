@@ -158,7 +158,7 @@ func (*recordingRecoveryStore) Create(context.Context, instance.Config, string, 
 	return recovery.Point{}, nil
 }
 
-func (store *recordingRecoveryStore) Restore(context.Context, instance.Config, string, recovery.Database) error {
+func (store *recordingRecoveryStore) Restore(context.Context, instance.Config, recovery.RestoreRequest, recovery.Database) error {
 	store.restored = true
 	return nil
 }
@@ -167,13 +167,17 @@ func (*recordingRecoveryStore) List(string) ([]recovery.Point, error) {
 	return nil, nil
 }
 
-func (runner *recordingRunner) Run(_ context.Context, stdin io.Reader, _ io.Writer, name string, arguments ...string) error {
+func (runner *recordingRunner) Run(_ context.Context, stdin io.Reader, stdout io.Writer, name string, arguments ...string) error {
 	contents := ""
 	if stdin != nil {
 		read, _ := io.ReadAll(stdin)
 		contents = string(read)
 	}
 	runner.commands = append(runner.commands, recordedCommand{name: name, arguments: append([]string(nil), arguments...), stdin: contents})
+	if isRecoveryInspect(arguments) {
+		_, err := io.WriteString(stdout, recoveryInspectFixture)
+		return err
+	}
 	return nil
 }
 
@@ -336,7 +340,7 @@ func TestRollbackLoadsInstanceWhenStorageSwapWasInterrupted(t *testing.T) {
 		t.Fatal("missing graceful drain inspections")
 	}
 
-	if err := service.Rollback(context.Background(), "primary", recoveryPointID); err != nil {
+	if err := service.Rollback(context.Background(), "primary", recovery.RestoreRequest{PointID: recoveryPointID, TransactionID: "test-restore-transaction"}); err != nil {
 		t.Fatalf("Rollback() error = %v", err)
 	}
 	if !recoveries.restored {

@@ -59,7 +59,7 @@ func TestTopologyRuntimeProcessesUseSharedStorageOwner(t *testing.T) {
 func TestInstallCommandUsesRuntimeUser(t *testing.T) {
 	runner := &recordingRunner{}
 	service := Service{Runner: runner}
-	if err := service.installCommand(context.Background(), instance.Config{}, "install-test", false, "geoflow:install"); err != nil {
+	if err := service.installCommand(context.Background(), instance.Config{ID: "primary"}, "install-test", false, "geoflow:install"); err != nil {
 		t.Fatal(err)
 	}
 	args := runner.commands[0].arguments

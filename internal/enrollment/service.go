@@ -19,6 +19,7 @@ import (
 
 	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/managed"
+	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
 	"gopkg.in/yaml.v3"
 )
 
@@ -268,6 +269,9 @@ func (service Service) register(root string, infrastructure infrastructureConfig
 	}
 	if err := chown(config.ControlToken, -1, controlGroupID); err != nil {
 		return Result{}, fmt.Errorf("set control token group: %w", err)
+	}
+	if _, err := (recoverycontrol.Store{StateDir: stateDir}).Initialize(request.InstanceID); err != nil {
+		return Result{}, err
 	}
 	committed = true
 

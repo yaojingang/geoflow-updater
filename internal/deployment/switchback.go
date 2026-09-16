@@ -11,6 +11,9 @@ import (
 // SwitchBack only reactivates a compatible retained application. Business data stays live.
 func (service *Service) SwitchBack(ctx context.Context, id, operationID string, observe update.Observer) update.Result {
 	fail := func(err error) update.Result { return update.Result{Status: update.StatusFailed, Error: err.Error()} }
+	if err := service.requireRecoveryReady(id); err != nil {
+		return fail(err)
+	}
 	if !safeOperationID(operationID) {
 		return fail(errors.New("invalid operation identity"))
 	}

@@ -109,7 +109,7 @@ func TestOnlineReleaseAndFailuresPreserveDatabase(t *testing.T) {
 				case strings.Contains(cmd, "ps --all --format json"):
 					var compose string
 					for i, arg := range args {
-						if arg == "-f" {
+						if arg == "-f" && !strings.HasSuffix(args[i+1], "/recovery-runtime.yml") {
 							compose = args[i+1]
 						}
 					}
@@ -308,7 +308,7 @@ func TestDrainDeadlineRetainsRunningWorkerWithoutKillEscalation(t *testing.T) {
 	})}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
 	defer cancel()
-	if e := s.drainServices(ctx, instance.Config{}, "queue"); e == nil || !strings.Contains(e.Error(), "retained") {
+	if e := s.drainServices(ctx, instance.Config{ID: "primary"}, "queue"); e == nil || !strings.Contains(e.Error(), "retained") {
 		t.Fatalf("expected retained timeout, got %v", e)
 	}
 	found := false

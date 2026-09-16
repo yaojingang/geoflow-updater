@@ -3,6 +3,7 @@ package deployment
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,23 @@ func TestDockerIngressRecoveryCanRecreateSlotNetworks(t *testing.T) {
 		t.Skip("set GEOFLOW_DOCKER_TEST=1 to exercise recovery network reuse")
 	}
 	service, legacy, candidate, tx := recoveryTopologyFixture(t)
+	inspection := filepath.Join(canonicalTemp(t), "artisan")
+	writeTest(t, inspection, []byte(`<?php
+if (!in_array('geoflow:recovery', $argv, true) || !in_array('--phase=inspect', $argv, true)) { exit(2); }
+$state = json_decode(file_get_contents('/run/geoflow-recovery-control/state.json'), true);
+if (($state['phase'] ?? null) !== 'ready' || ($state['minimum_updater_protocol'] ?? null) !== 5) { exit(3); }
+echo '`+recoveryInspectFixture+`';
+`))
+	if err := os.Chmod(inspection, 0644); err != nil {
+		t.Fatal(err)
+	}
+	inspections := 0
+	service.Runner = functionRunner(func(ctx context.Context, in io.Reader, out io.Writer, name string, args ...string) error {
+		if isRecoveryInspect(args) {
+			inspections++
+		}
+		return (RealRunner{}).Run(ctx, in, out, name, args...)
+	})
 	prefix := fmt.Sprintf("geoflow-recovery-test-%d", time.Now().UnixNano())
 	infra := infrastructureConfig(candidate)
 	writeTest(t, infra.ComposeFile, []byte(fmt.Sprintf(`name: %s-infra
@@ -42,6 +60,12 @@ networks:
 	for _, slot := range slots {
 		writeTest(t, slot.ComposeFile, []byte(fmt.Sprintf(`name: %s-%s
 services:
+  init:
+    image: php:8.4-cli
+    working_dir: /fixture
+    volumes:
+      - %s:/fixture/artisan:ro
+    networks: [data]
   app:
     image: python:3.12-alpine
     command: ["sleep", "600"]
@@ -50,7 +74,7 @@ networks:
   data:
     name: %s-data
     external: true
-`, prefix, slot.ActiveSlot, prefix)))
+`, prefix, slot.ActiveSlot, inspection, prefix)))
 		writeTest(t, slot.EnvironmentFile, nil)
 	}
 	t.Cleanup(func() {
@@ -88,7 +112,7 @@ networks:
 		if err := service.saveTransaction(&tx); err != nil {
 			t.Fatal(err)
 		}
-		if err := service.Rollback(ctx, legacy.ID, tx.RecoveryPointID); err != nil {
+		if err := service.Rollback(ctx, legacy.ID, recovery.RestoreRequest{PointID: tx.RecoveryPointID, TransactionID: "test-restore-transaction"}); err != nil {
 			t.Fatal(err)
 		}
 		start()
@@ -98,5 +122,8 @@ networks:
 				t.Fatalf("discarded slot container survived restoration: %s %v", ids, err)
 			}
 		}
+	}
+	if inspections != 2 {
+		t.Fatalf("expected both restores to inspect the mounted recovery contract, got %d", inspections)
 	}
 }

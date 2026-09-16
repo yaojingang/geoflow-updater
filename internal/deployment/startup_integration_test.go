@@ -20,7 +20,7 @@ func TestDockerIngressServiceStartupWaitsForHealth(t *testing.T) {
 	for _, healthy := range []bool{true, false} {
 		t.Run(fmt.Sprintf("healthy=%t", healthy), func(t *testing.T) {
 			root := canonicalTemp(t)
-			config := instance.Config{Root: root, ComposeFile: filepath.Join(root, "compose.yml"), EnvironmentFile: filepath.Join(root, "release.env")}
+			config := instance.Config{ID: "primary", Root: root, ComposeFile: filepath.Join(root, "compose.yml"), EnvironmentFile: filepath.Join(root, "release.env")}
 			project := fmt.Sprintf("geoflow-startup-test-%d", time.Now().UnixNano())
 			command := "sleep 2; touch /tmp/ready; exec sleep 120"
 			if !healthy {
@@ -46,7 +46,7 @@ services:
 			t.Cleanup(func() { _ = exec.Command("docker", append(arguments, "down", "--remove-orphans")...).Run() })
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			service := Service{}
+			service := Service{StateDir: canonicalTemp(t)}
 			err := service.startServices(ctx, config, "app")
 			if !healthy {
 				if err == nil {

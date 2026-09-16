@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,11 +40,19 @@ func (service *Service) instanceDirectory(id string) string {
 }
 
 func (service *Service) command(ctx context.Context, config instance.Config, args ...string) error {
-	return service.runner().Run(ctx, nil, io.Discard, "docker", append(composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile), args...)...)
+	arguments, err := service.runtimeArguments(config)
+	if err != nil {
+		return err
+	}
+	return service.runner().Run(ctx, nil, io.Discard, "docker", append(arguments, args...)...)
 }
 func (service *Service) output(ctx context.Context, config instance.Config, args ...string) (string, error) {
 	var out limitedBuffer
-	err := service.runner().Run(ctx, nil, &out, "docker", append(composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile), args...)...)
+	arguments, err := service.runtimeArguments(config)
+	if err != nil {
+		return "", err
+	}
+	err = service.runner().Run(ctx, nil, &out, "docker", append(arguments, args...)...)
 	return strings.TrimSpace(out.String()), err
 }
 func infrastructureConfig(config instance.Config) instance.Config {
@@ -155,7 +164,11 @@ func (service *Service) applicationPhase(ctx context.Context, config instance.Co
 	}
 	args = append(args, "-e", "GEOFLOW_SECURITY_UPGRADE_DRAIN_CONFIRMED="+confirmation, "init", "artisan", "geoflow:upgrade", "--phase="+phase, "--strategy="+executionStrategy(release, drained), "--operation="+operation, "--source-sequence="+strconv.FormatUint(source, 10), "--plan=/run/geoflow-upgrade-plan.json", "--plan-sha256="+managed.PlanSHA256(release.UpgradePlan), "--json", "--no-interaction")
 	var out boundedOutput
-	err := service.runner().Run(ctx, nil, &out, "docker", append(composeArguments(config.Root, config.EnvironmentFile, config.ComposeFile), args...)...)
+	arguments, err := service.runtimeArguments(config)
+	if err != nil {
+		return report, err
+	}
+	err = service.runner().Run(ctx, nil, &out, "docker", append(arguments, args...)...)
 	if err != nil {
 		return report, fmt.Errorf("application upgrade %s failed: %w", phase, err)
 	}
@@ -350,6 +363,32 @@ func applicationServices(composeFile string) ([]string, error) {
 func (service *Service) startServices(ctx context.Context, config instance.Config, names ...string) error {
 	if len(names) == 0 {
 		return nil
+	}
+	control := service.recoveryControl()
+	if state, err := control.Read(config.ID); err == nil && state.State.Phase != "ready" {
+		http := false
+		for _, name := range names {
+			switch name {
+			case "postgres", "redis":
+			case "app", "web", "edge":
+				if state.State.Phase != "http_ready" {
+					return errors.New("recovery validation must finish before opening HTTP")
+				}
+				if name == "app" || name == "web" {
+					http = true
+				}
+			default:
+				return errors.New("recovered background services remain quarantined")
+			}
+		}
+		if http {
+			if len(names) != 2 || !slices.Contains(names, "app") || !slices.Contains(names, "web") {
+				return errors.New("recovery HTTP startup requires the guarded app and web pair")
+			}
+			return service.startRecoveredHTTP(ctx, config)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	ids, err := service.containerIDs(ctx, config, names...)
 	if err != nil {

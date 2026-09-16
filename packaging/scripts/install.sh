@@ -29,6 +29,34 @@ if ! "$archive_root/geoflow-updater" version >/dev/null 2>&1; then
     exit 1
 fi
 
+# The host floor survives completed operations and business snapshot restores.
+floor_path=/var/lib/geoflow-updater/minimum-updater-protocol
+if [ -e "$floor_path" ] || [ -d /var/lib/geoflow-updater/recovery-control ]; then
+    if [ -L "$floor_path" ] || [ ! -f "$floor_path" ]; then
+        echo "Unsafe updater protocol floor." >&2
+        exit 1
+    fi
+    minimum_protocol=$(cat "$floor_path")
+    candidate_protocol=$("$archive_root/geoflow-updater" protocol) || {
+        echo "This updater cannot enforce the host recovery contract." >&2
+        exit 1
+    }
+    case "$minimum_protocol" in
+        ''|*[!0-9]*) echo "Invalid host updater protocol floor." >&2; exit 1 ;;
+    esac
+    case "$candidate_protocol" in
+        ''|*[!0-9]*) echo "Invalid updater protocol identity." >&2; exit 1 ;;
+    esac
+    if [ "${#minimum_protocol}" -gt 9 ] || [ "${#candidate_protocol}" -gt 9 ] || [ "$minimum_protocol" -lt 5 ]; then
+        echo "Unsupported updater protocol identity." >&2
+        exit 1
+    fi
+    if [ "$candidate_protocol" -lt "$minimum_protocol" ]; then
+        echo "This host requires a newer updater protocol; downgrade refused." >&2
+        exit 1
+    fi
+fi
+
 if ! getent group geoflow-updater >/dev/null 2>&1; then
     groupadd --system geoflow-updater
 fi

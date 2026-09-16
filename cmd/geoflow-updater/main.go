@@ -19,8 +19,10 @@ import (
 	"github.com/yaojingang/geoflow-updater/internal/deployment"
 	"github.com/yaojingang/geoflow-updater/internal/doctor"
 	"github.com/yaojingang/geoflow-updater/internal/enrollment"
+	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/operation"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
+	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
 	"github.com/yaojingang/geoflow-updater/internal/tufclient"
 	"github.com/yaojingang/geoflow-updater/internal/update"
 	trust "github.com/yaojingang/geoflow-updater/tuf"
@@ -40,6 +42,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if len(os.Args) < 2 || (os.Args[1] != "version" && os.Args[1] != "protocol") {
+		if err := recoverycontrol.CheckProtocol(stateDir, managed.UpdaterProtocolVersion); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	}
 	metadataURL, targetsURL, err := releaseRepositoryURLs()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -59,7 +67,18 @@ func main() {
 		Releases:    releases,
 		Doctor:      diagnostics,
 		Runner:      deployment.RealRunner{},
-		Recoveries:  recovery.Store{BackupRoot: "/var/backups/geoflow-updater", Keep: 5},
+		Recoveries:  recovery.Store{Control: &recoverycontrol.Store{StateDir: stateDir}, BackupRoot: "/var/backups/geoflow-updater", Keep: 5},
+	}
+	if len(os.Args) < 2 || (os.Args[1] != "version" && os.Args[1] != "protocol") {
+		if _, err := os.Stat(stateDir + "/instances/primary/instance.yml"); err == nil {
+			if _, err := (recoverycontrol.Store{StateDir: stateDir}).Initialize("primary"); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 	}
 	operations := &operation.Manager{
 		StateDir:   stateDir,

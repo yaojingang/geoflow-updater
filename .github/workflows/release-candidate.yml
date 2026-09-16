@@ -58,6 +58,9 @@ jobs:
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
         run: |
           test "$GITHUB_REF" = "refs/heads/main"
+          # A rebuilt run must get a new identity and fresh acceptance evidence.
+          # Rerunning a previous run would retain the candidate_run_id.
+          test "$GITHUB_RUN_ATTEMPT" = 1
           [[ "$UPDATER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           [[ "$GEOFLOW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
@@ -164,7 +167,7 @@ jobs:
           python3 geoflow/deployment/generate-upgrade-plan.py --check
           cp geoflow/deployment/upgrade-plan.json "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json"
           plan_strategy="$(jq -er '.strategy' geoflow/deployment/upgrade-plan.json)"
-          case "$plan_strategy" in maintenance) minimum_protocol=3 ;; online) minimum_protocol=4 ;; *) exit 1 ;; esac
+          minimum_protocol="$(python3 scripts/core-protocol.py geoflow "$plan_strategy")"
           cp geoflow/version.json "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json"
           cp candidate/dist/geoflow-updater_*.tar.gz candidate/dist/checksums.txt "candidate/targets-source/updater/$UPDATER_VERSION/"
           jq -n \

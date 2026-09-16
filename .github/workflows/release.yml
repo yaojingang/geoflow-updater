@@ -138,11 +138,7 @@ jobs:
             test "$plan_target" = "releases/$GEOFLOW_VERSION/upgrade-plan.json"
             plan="$(verified_target_path "$plan_target")"
             test "$(jq -er '.schema_version' "$plan")" = "1"
-            case "$(jq -er '.strategy' "$plan")" in
-              maintenance) minimum_protocol=3 ;;
-              online) minimum_protocol=4 ;;
-              *) echo "Signed upgrade plan strategy is unsupported." >&2; exit 1 ;;
-            esac
+            minimum_protocol="$(python3 scripts/core-protocol.py geoflow "$(jq -er '.strategy' "$plan")")"
             test "$(jq -er '.minimum_updater_protocol' "$manifest")" = "$minimum_protocol"
             test "$(jq -er '.source_commit' "$manifest")" = "$GEOFLOW_SOURCE_COMMIT"
             version_target="$(jq -er '.version_target' "$manifest")"
@@ -238,7 +234,12 @@ jobs:
             done < "$RUNNER_TEMP/publication-paths"
           else
             test "$PUBLICATION_RESUME" = false
-            test "$candidate_sha" = "$GITHUB_SHA"
+            if [ "$candidate_sha" != "$GITHUB_SHA" ]; then
+              # First publication permits daily online metadata refresh only.
+              # The committed-publication resume path above has a separate gate.
+              python3 scripts/planned-release-source.py first-publication \
+                --candidate "$candidate_sha" --publication "$GITHUB_SHA"
+            fi
           fi
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.name')" = "Build Phase C release candidate"
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.path')" = ".github/workflows/release-candidate.yml"
@@ -248,6 +249,17 @@ jobs:
             --name "phase-c-candidate-$CANDIDATE_RUN_ID" \
             --dir candidate
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+      - name: Verify original candidate retention
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_SOURCE_SHA: ${{ steps.candidate-source.outputs.candidate_sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > "$RUNNER_TEMP/candidate-run.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/candidate-artifacts.json"
+          python3 scripts/planned-release-source.py artifact \
+            --run "$RUNNER_TEMP/candidate-run.json" --artifacts "$RUNNER_TEMP/candidate-artifacts.json" \
+            --run-id "$CANDIDATE_RUN_ID" --source "$CANDIDATE_SOURCE_SHA"
       - name: Validate candidate identity and publication authorization
         env:
           APPROVED_EVIDENCE_B64: ${{ secrets.PHASE_C_REHEARSAL_EVIDENCE_B64 }}
@@ -282,8 +294,7 @@ jobs:
           test "$(sha256sum candidate/targets-source/deploy/docker-compose.managed.yml | cut -d ' ' -f 1)" = "$(jq -er '.targets.compose_sha256' candidate/candidate.json)"
           test "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json" | cut -d ' ' -f 1)" = "$(jq -er '.targets.version_document_sha256' candidate/candidate.json)"
           test "$(jq -er '.schema_version' candidate/targets-source/releases/current.json)" = "3"
-          expected_protocol=3
-          if test "$(jq -er '.strategy' "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json")" = online; then expected_protocol=4; fi
+          expected_protocol="$(python3 scripts/core-protocol.py geoflow "$(jq -er '.strategy' "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json")")"
           test "$(jq -er '.minimum_updater_protocol' candidate/targets-source/releases/current.json)" = "$expected_protocol"
           test "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json" | cut -d ' ' -f 1)" = "$(jq -er '.targets.upgrade_plan_sha256' candidate/candidate.json)"
           python3 geoflow/deployment/generate-upgrade-plan.py --check

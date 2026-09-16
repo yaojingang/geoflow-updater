@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"io"
 	"os"
 	"path/filepath"
@@ -260,6 +261,17 @@ func (service *Service) restoreApplication(ctx context.Context, tx *releaseTrans
 	return service.drainServices(ctx, tx.Candidate, "web", "app")
 }
 func (service *Service) restoreBeforeTraffic(ctx context.Context, tx *releaseTransaction) error {
+	if tx.TrafficOpened {
+		return errors.New("traffic may have resumed; start a new explicit data recovery")
+	}
+	inspector := tx.Source
+	if tx.LayoutStarted {
+		inspector = tx.Candidate
+	}
+	request, err := service.prepareRestore(ctx, inspector, recovery.RestoreRequest{PointID: tx.RecoveryPointID, TransactionID: tx.OperationID})
+	if err != nil {
+		return err
+	}
 	if tx.LayoutStarted {
 		names, err := applicationServices(tx.Candidate.ComposeFile)
 		if err != nil {
@@ -288,11 +300,24 @@ func (service *Service) restoreBeforeTraffic(ctx context.Context, tx *releaseTra
 			return err
 		}
 	}
-	if err := service.Recoveries.Restore(ctx, tx.Source, tx.RecoveryPointID, postgresDatabase{config: tx.Source, runner: service.runner()}); err != nil {
+	if err := service.Recoveries.Restore(ctx, tx.Source, request, postgresDatabase{config: tx.Source, runner: service.runner()}); err != nil {
 		return err
+	}
+	return service.resumeSource(ctx, tx)
+}
+
+// Both target activation and source recovery can reopen writes. Persist the
+// existing traffic flag before Resume so older updater versions also refuse
+// another full restore after a failed or interrupted source restart.
+func (service *Service) resumeSource(ctx context.Context, tx *releaseTransaction) error {
+	tx.Stage = "resume"
+	tx.TrafficOpened = true
+	if err := service.saveTransaction(tx); err != nil {
+		return fmt.Errorf("persist source resume boundary: %w", err)
 	}
 	return service.Resume(ctx, tx.Source.ID)
 }
+
 func (service *Service) runningServices(ctx context.Context, config instance.Config) error {
 	expected, err := applicationServices(config.ComposeFile)
 	if err != nil {

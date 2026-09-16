@@ -21,6 +21,12 @@ jobs:
         run: test -z "$(gofmt -l cmd internal tuf)"
       - name: Vet
         run: go vet ./...
+      - name: Install recovery verification dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y php-cli php-sqlite3 redis-server
+          php internal/deployment/legacy-adapter-test.php
+          redis-server --version
       - name: Test with race detector
         run: go test -race ./...
       - name: Test candidate evidence and host readiness
@@ -31,6 +37,7 @@ jobs:
         run: |
           docker pull nginx:1.31.1-alpine
           docker pull python:3.12-alpine
+          docker pull php:8.4-cli
           GEOFLOW_DOCKER_TEST=1 go test ./internal/deployment -run TestDockerIngress -v
       - name: Build static Linux binaries
         run: |
