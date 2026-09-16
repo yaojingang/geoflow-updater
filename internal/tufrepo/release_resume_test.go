@@ -314,6 +314,9 @@ func TestPublicationResumeExecutesVerifiedSchemaThreePlanPreflight(t *testing.T)
 		wantResume     bool
 	}{
 		{"maintenance-protocol-three", "maintenance", 3, true},
+		{"coordinated-maintenance-five", "maintenance", 5, true},
+		{"coordinated-protocol-too-low", "maintenance", 3, false},
+		{"coordinated-online-unaccepted", "online", 5, false},
 		{"draft-hidden-from-read-only-preflight", "maintenance", 3, true},
 		{"online-protocol-four", "online", 4, true},
 		{"online-protocol-too-low", "online", 3, false},
@@ -327,6 +330,14 @@ func TestPublicationResumeExecutesVerifiedSchemaThreePlanPreflight(t *testing.T)
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			root := t.TempDir()
+			helper, err := os.ReadFile(filepath.Join("..", "..", "scripts", "core-protocol.py"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, filepath.Join(root, "scripts", "core-protocol.py"), helper)
+			if strings.HasPrefix(scenario.name, "coordinated-") {
+				mustWrite(t, filepath.Join(root, "geoflow", "deployment", "recovery-contract.json"), []byte(`{"schema_version":1,"minimum_updater_protocol":5,"recovery_state_schema":1,"host_api_protocol":2,"management_protocol":"1.0"}`))
+			}
 			targets := filepath.Join(root, "source")
 			repository := filepath.Join(root, "tuf", "repository")
 			mustWriteReleaseManifest(t, targets, 18, "2.4.1", "1", "2")
