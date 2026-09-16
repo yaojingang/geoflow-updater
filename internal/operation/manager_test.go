@@ -208,7 +208,7 @@ func TestManagerBlocksNewOperationsWhileDurableRecoveryIsRequired(t *testing.T) 
 	}
 }
 
-func TestManagerReconcilesInterruptedProtectedOperationWithRollback(t *testing.T) {
+func TestManagerLeavesInterruptedLegacyUpdateForExplicitRecovery(t *testing.T) {
 	t.Parallel()
 
 	deployment := &fakeDeployment{}
@@ -226,17 +226,17 @@ func TestManagerReconcilesInterruptedProtectedOperationWithRollback(t *testing.T
 	if err := manager.save(&operation); err != nil {
 		t.Fatalf("save interrupted operation: %v", err)
 	}
-	if err := manager.Reconcile("primary"); err != nil {
-		t.Fatalf("Reconcile() error = %v", err)
+	if err := manager.Reconcile("primary"); err == nil || !strings.Contains(err.Error(), "explicit data recovery") {
+		t.Fatalf("Reconcile() error = %v, want explicit recovery", err)
 	}
 	current, err := manager.Current("primary")
 	if err != nil {
 		t.Fatalf("Current() error = %v", err)
 	}
-	if current.Status != StatusRolledBack || current.CurrentStage != "reconciled" || current.CompletedAt == nil {
+	if current.Status != StatusRecoveryRequired || current.CurrentStage != "activate" || current.CompletedAt == nil {
 		t.Fatalf("reconciled operation = %#v", current)
 	}
-	want := []string{"quiesce", "rollback", "resume", "verify"}
+	var want []string
 	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}
@@ -246,7 +246,7 @@ func TestManagerPersistsAndBacksOffFailedStartupRecovery(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC)
-	deployment := &fakeDeployment{rollbackErr: errors.New("database unavailable")}
+	deployment := &fakeDeployment{resumeErr: errors.New("service unavailable")}
 	manager := &Manager{
 		StateDir:   t.TempDir(),
 		Deployment: deployment,
@@ -258,7 +258,8 @@ func TestManagerPersistsAndBacksOffFailedStartupRecovery(t *testing.T) {
 		InstanceID:      "primary",
 		Kind:            KindUpdate,
 		Status:          StatusRunning,
-		CurrentStage:    "activate",
+		CurrentStage:    "resume",
+		Stages:          []update.Stage{{Name: "rollback", Status: "succeeded"}, {Name: "resume", Status: "running", Message: update.ResumeBoundaryMessage}},
 		RecoveryPointID: "20260827T123456Z-1234abcd",
 		StartedAt:       now,
 	}
@@ -273,7 +274,7 @@ func TestManagerPersistsAndBacksOffFailedStartupRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Current() error = %v", err)
 	}
-	if current.Status != StatusRecoveryRequired || !strings.Contains(current.Error, "database unavailable") {
+	if current.Status != StatusRecoveryRequired || !strings.Contains(current.Error, "service unavailable") {
 		t.Fatalf("failed reconciliation state = %#v", current)
 	}
 	if current.ReconcileAttempts != 1 || current.NextReconcileAt == nil || !current.NextReconcileAt.After(now) {
@@ -291,7 +292,7 @@ func TestManagerPersistsAndBacksOffFailedStartupRecovery(t *testing.T) {
 	}
 
 	now = current.NextReconcileAt.Add(time.Second)
-	deployment.rollbackErr = nil
+	deployment.resumeErr = nil
 	if err := manager.Reconcile("primary"); err != nil {
 		t.Fatalf("Reconcile() after recovery became available = %v", err)
 	}
@@ -307,7 +308,7 @@ func TestManagerPersistsAndBacksOffFailedStartupRecovery(t *testing.T) {
 func TestManagerBoundsPersistedRecoveryErrorsForTheWebsiteContract(t *testing.T) {
 	t.Parallel()
 
-	deployment := &fakeDeployment{rollbackErr: errors.New(strings.Repeat("故", 2000))}
+	deployment := &fakeDeployment{resumeErr: errors.New(strings.Repeat("故", 2000))}
 	manager := &Manager{StateDir: t.TempDir(), Deployment: deployment}
 	operation := Operation{
 		SchemaVersion:   1,
@@ -315,7 +316,8 @@ func TestManagerBoundsPersistedRecoveryErrorsForTheWebsiteContract(t *testing.T)
 		InstanceID:      "primary",
 		Kind:            KindUpdate,
 		Status:          StatusRunning,
-		CurrentStage:    "activate",
+		CurrentStage:    "resume",
+		Stages:          []update.Stage{{Name: "resume", Status: "running", Message: update.ResumeBoundaryMessage}},
 		RecoveryPointID: "20260827T123456Z-1234abcd",
 		StartedAt:       time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC),
 	}
@@ -330,7 +332,7 @@ func TestManagerBoundsPersistedRecoveryErrorsForTheWebsiteContract(t *testing.T)
 	if err != nil {
 		t.Fatalf("Current() error = %v", err)
 	}
-	if len(current.Error) > 4096 || !utf8.ValidString(current.Error) {
+	if len(current.Error) < 4000 || len(current.Error) > 4096 || !utf8.ValidString(current.Error) {
 		t.Fatalf("persisted recovery error is not a bounded UTF-8 string: bytes=%d", len(current.Error))
 	}
 }
@@ -366,7 +368,7 @@ func TestManagerDoesNotReconcileWhileAnotherProcessOwnsTheOperationLock(t *testi
 	}
 }
 
-func TestManagerReconcilesAFailedRollbackThatStillRequiresRecovery(t *testing.T) {
+func TestManagerRequiresExplicitRecoveryForLegacyFailedRollback(t *testing.T) {
 	t.Parallel()
 
 	deployment := &fakeDeployment{}
@@ -386,17 +388,17 @@ func TestManagerReconcilesAFailedRollbackThatStillRequiresRecovery(t *testing.T)
 		t.Fatalf("save operation: %v", err)
 	}
 
-	if err := manager.Reconcile("primary"); err != nil {
-		t.Fatalf("Reconcile() error = %v", err)
+	if err := manager.Reconcile("primary"); err == nil || !strings.Contains(err.Error(), "explicit data recovery") {
+		t.Fatalf("Reconcile() error = %v, want explicit recovery", err)
 	}
 	current, err := manager.Current("primary")
 	if err != nil {
 		t.Fatalf("Current() error = %v", err)
 	}
-	if current.Status != StatusRolledBack {
+	if current.Status != StatusRecoveryRequired {
 		t.Fatalf("reconciled status = %s, want rolled_back", current.Status)
 	}
-	want := []string{"quiesce", "rollback", "resume", "verify"}
+	var want []string
 	if calls := deployment.snapshotCalls(); !reflect.DeepEqual(calls, want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}
@@ -473,7 +475,7 @@ func TestManagerCommitsAnInterruptedUpdateWhoseSuccessStageWasPersisted(t *testi
 		Status:          StatusRunning,
 		CurrentStage:    "succeeded",
 		RecoveryPointID: "20260827T123456Z-1234abcd",
-		Stages:          []update.Stage{{Name: "succeeded", Status: "succeeded"}},
+		Stages:          []update.Stage{{Name: "resume", Status: "running", Message: update.ResumeBoundaryMessage}, {Name: "succeeded", Status: "succeeded"}},
 		StartedAt:       time.Date(2026, time.August, 27, 12, 34, 56, 0, time.UTC),
 	}
 	if err := manager.save(&operation); err != nil {

@@ -237,6 +237,7 @@ func TestInfrastructureReplacementRemovesBothSlotsBeforeNetworks(t *testing.T) {
 				case "rollback":
 					err = service.Rollback(context.Background(), legacy.ID, tx.RecoveryPointID)
 				case "before-traffic":
+					tx.TrafficOpened = false
 					err = service.restoreBeforeTraffic(context.Background(), &tx)
 				case "maintenance-upgrade":
 					err = service.installInfrastructure(context.Background(), candidate, other, tx.Target)

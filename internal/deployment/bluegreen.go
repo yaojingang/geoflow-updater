@@ -461,6 +461,14 @@ func (service *Service) failRelease(ctx context.Context, tx *releaseTransaction,
 				tx.Status = update.StatusRolledBack
 			}
 		}
+	} else if tx.TrafficOpened && tx.Stage == "resume" {
+		err = service.resumeSource(recoveryCtx, tx)
+		if err == nil {
+			tx.Status = update.StatusFailed
+			if tx.RecoveryPointID != "" {
+				tx.Status = update.StatusRolledBack
+			}
+		}
 	} else if tx.TrafficOpened {
 		err = errors.New("traffic or background writes may have resumed; data restoration requires a separate authorized recovery")
 	} else if tx.RecoveryPointID != "" {
@@ -469,7 +477,7 @@ func (service *Service) failRelease(ctx context.Context, tx *releaseTransaction,
 			tx.Status = update.StatusRolledBack
 		}
 	} else {
-		err = service.Resume(recoveryCtx, tx.Source.ID)
+		err = service.resumeSource(recoveryCtx, tx)
 		if err == nil {
 			tx.Status = update.StatusFailed
 		}
@@ -496,6 +504,17 @@ func (service *Service) ReconcileRelease(ctx context.Context, id, operationID st
 		return update.Result{}, false
 	}
 	if tx.Status == update.StatusSucceeded || tx.Status == update.StatusRolledBack || tx.Status == update.StatusFailed {
+		return update.Result{Status: tx.Status, Target: tx.Target, RecoveryPointID: tx.RecoveryPointID, Error: tx.Error}, true
+	}
+	if tx.Strategy != managed.StrategyOnline && !(tx.Stage == "resume" && tx.TrafficOpened) {
+		// Older failure handlers could restore without a successful journal save.
+		// Even a missing recovery point cannot prove that data is still intact.
+		// Only the new source-resume boundary authorizes service-only recovery.
+		tx.Status = update.StatusRecoveryRequired
+		tx.Error = "interrupted maintenance recovery has no durable resume boundary; start a new explicit data recovery"
+		if err := service.saveTransaction(&tx); err != nil {
+			tx.Error = errors.Join(errors.New(tx.Error), err).Error()
+		}
 		return update.Result{Status: tx.Status, Target: tx.Target, RecoveryPointID: tx.RecoveryPointID, Error: tx.Error}, true
 	}
 	if tx.Strategy == managed.StrategyOnline && tx.Stage == "drain" {

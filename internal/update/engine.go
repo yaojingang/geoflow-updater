@@ -17,6 +17,11 @@ const (
 	StatusRolledBack Status = "rolled_back"
 )
 
+// ResumeBoundaryMessage identifies a journal written by the coordinator that
+// never restores data after this boundary. Older resume stages are ambiguous:
+// an older coordinator may have started another restore without recording it.
+const ResumeBoundaryMessage = "service resume boundary v1"
+
 type Stage struct {
 	Name      string    `json:"name"`
 	Status    string    `json:"status"`
@@ -61,6 +66,9 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 		return Result{Status: StatusFailed, Error: "deployment service is unavailable"}
 	}
 	emit := func(name string, status string, message string) error {
+		if name == "resume" && status == "running" {
+			message = ResumeBoundaryMessage
+		}
 		if observe != nil {
 			return observe(Stage{Name: name, Status: status, Message: message, UpdatedAt: engine.now().UTC()})
 		}
@@ -120,10 +128,8 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 	if err := engine.Deployment.Quiesce(ctx, instanceID); err != nil {
 		recoveryCtx, cancel := engine.recoveryContext(ctx)
 		defer cancel()
-		if resumeErr := engine.Deployment.Resume(recoveryCtx, instanceID); resumeErr != nil {
-			err = errors.Join(err, fmt.Errorf("resume after failed quiesce: %w", resumeErr))
-		} else if verifyErr := engine.Deployment.Verify(recoveryCtx, instanceID); verifyErr != nil {
-			err = errors.Join(err, fmt.Errorf("verify after failed quiesce: %w", verifyErr))
+		if resumeErr := engine.resumeAndVerify(recoveryCtx, instanceID, emit); resumeErr != nil {
+			return Result{Status: StatusRecoveryRequired, Target: target, Error: errors.Join(err, resumeErr).Error()}
 		}
 		return fail("quiesce", err)
 	}
@@ -138,9 +144,8 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 	if err != nil {
 		recoveryCtx, cancel := engine.recoveryContext(ctx)
 		defer cancel()
-		resumeErr := engine.Deployment.Resume(recoveryCtx, instanceID)
-		if resumeErr != nil {
-			err = errors.Join(err, fmt.Errorf("resume current release: %w", resumeErr))
+		if resumeErr := engine.resume(recoveryCtx, instanceID, emit); resumeErr != nil {
+			return Result{Status: StatusRecoveryRequired, Target: target, Error: errors.Join(err, resumeErr).Error()}
 		}
 		return fail("backup", err)
 	}
@@ -159,7 +164,7 @@ func (engine Engine) RunWithOptions(ctx context.Context, instanceID string, opti
 	}
 	for _, step := range protectedSteps {
 		if err := emit(step.name, "running", ""); err != nil {
-			if step.name == "verify" {
+			if step.name == "resume" || step.name == "verify" {
 				return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: err.Error()}
 			}
 			return engine.rollback(ctx, instanceID, recoveryPointID, target, fmt.Errorf("persist %s stage: %w", step.name, err), emit)
@@ -217,15 +222,13 @@ func (engine Engine) rollback(
 		_ = emit("rollback", "failed", combined.Error())
 		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
 	}
-	if err := engine.Deployment.Resume(recoveryCtx, instanceID); err != nil {
-		combined := errors.Join(cause, observeErr, fmt.Errorf("resume rolled back release: %w", err))
-		_ = emit("rollback", "failed", combined.Error())
-		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
+	if err := emit("rollback", "succeeded", ""); err != nil {
+		combined := errors.Join(cause, observeErr, fmt.Errorf("persist completed data recovery: %w", err))
+		return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
 	}
-	if err := engine.Deployment.Verify(recoveryCtx, instanceID); err != nil {
-		combined := errors.Join(cause, observeErr, fmt.Errorf("verify rolled back release: %w", err))
-		_ = emit("rollback", "failed", combined.Error())
-		return Result{Status: StatusFailed, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
+	if err := engine.resumeAndVerify(recoveryCtx, instanceID, emit); err != nil {
+		combined := errors.Join(cause, observeErr, err)
+		return Result{Status: StatusRecoveryRequired, Target: target, RecoveryPointID: recoveryPointID, Error: combined.Error()}
 	}
 	observeErr = errors.Join(observeErr, emit("rolled_back", "succeeded", cause.Error()))
 	if observeErr != nil {
@@ -247,14 +250,43 @@ func (engine Engine) resumeAfterPersistenceFailure(
 	defer cancel()
 
 	cause := fmt.Errorf("persist %s stage: %w", stage, persistErr)
-	if err := engine.Deployment.Resume(recoveryCtx, instanceID); err != nil {
-		cause = errors.Join(cause, fmt.Errorf("resume current release: %w", err))
-	} else if err := engine.Deployment.Verify(recoveryCtx, instanceID); err != nil {
-		cause = errors.Join(cause, fmt.Errorf("verify current release: %w", err))
+	if err := engine.resumeAndVerify(recoveryCtx, instanceID, emit); err != nil {
+		return Result{Status: StatusRecoveryRequired, Target: target, Error: errors.Join(cause, err).Error()}
 	}
 	_ = emit(stage, "failed", cause.Error())
 
 	return Result{Status: StatusFailed, Target: target, Error: cause.Error()}
+}
+
+// Persist the boundary before any service can accept writes. This uses existing
+// v1 stages so older readers can still decode the operation journal.
+func (engine Engine) resume(ctx context.Context, instanceID string, emit func(string, string, string) error) error {
+	if err := emit("resume", "running", ""); err != nil {
+		return fmt.Errorf("persist resume boundary: %w", err)
+	}
+	if err := engine.Deployment.Resume(ctx, instanceID); err != nil {
+		return errors.Join(err, emit("resume", "failed", err.Error()))
+	}
+	if err := emit("resume", "succeeded", ""); err != nil {
+		return fmt.Errorf("persist resume completion: %w", err)
+	}
+	return nil
+}
+
+func (engine Engine) resumeAndVerify(ctx context.Context, instanceID string, emit func(string, string, string) error) error {
+	if err := engine.resume(ctx, instanceID, emit); err != nil {
+		return err
+	}
+	if err := emit("verify", "running", ""); err != nil {
+		return fmt.Errorf("persist verification stage: %w", err)
+	}
+	if err := engine.Deployment.Verify(ctx, instanceID); err != nil {
+		return errors.Join(err, emit("verify", "failed", err.Error()))
+	}
+	if err := emit("verify", "succeeded", ""); err != nil {
+		return fmt.Errorf("persist verification completion: %w", err)
+	}
+	return nil
 }
 
 func (engine Engine) recoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {

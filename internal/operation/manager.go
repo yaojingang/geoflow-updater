@@ -30,6 +30,12 @@ var (
 	operationIDPattern      = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[a-f0-9]{16}$`)
 )
 
+const (
+	// Core's v1 socket response accepts at most 100 operation stages.
+	maximumOperationStages = 100
+	legacyRestoreUncertain = "legacy recovery may have partially restored data; start a new explicit data recovery"
+)
+
 type Kind string
 
 const (
@@ -131,7 +137,7 @@ func (manager *Manager) StartBackup(instanceID string) (Operation, error) {
 			return
 		}
 		if !manager.step(ctx, operation, save, "quiesce", func() error { return manager.Deployment.Quiesce(ctx, instanceID) }) {
-			manager.resumeAfterFailure(ctx, instanceID, operation)
+			manager.resumeAfterFailure(ctx, operation)
 			return
 		}
 		var recoveryPointID string
@@ -146,7 +152,7 @@ func (manager *Manager) StartBackup(instanceID string) (Operation, error) {
 		resumeOK := manager.step(resumeCtx, operation, save, "resume", func() error { return manager.Deployment.Resume(resumeCtx, instanceID) })
 		if !resumeOK {
 			operation.Status = StatusRecoveryRequired
-			manager.resumeAfterFailure(ctx, instanceID, operation)
+			manager.resumeAfterFailure(ctx, operation)
 		}
 		if backupOK && resumeOK && manager.step(ctx, operation, save, "verify", func() error { return manager.Deployment.Verify(ctx, instanceID) }) {
 			operation.Status = StatusSucceeded
@@ -313,6 +319,16 @@ func (manager *Manager) Reconcile(instanceID string) error {
 }
 
 func (manager *Manager) reconcileOperation(ctx context.Context, operation *Operation) (Status, error) {
+	if legacyPartialRestore(*operation) {
+		if !hasLegacyRestoreHold(operation.Stages) {
+			message := legacyRestoreUncertain + ": " + operation.Error
+			if err := manager.updateStage(operation, update.Stage{Name: "rollback", Status: "failed", Message: message, UpdatedAt: manager.now().UTC()}, func() error { return manager.save(operation) }); err != nil {
+				return StatusFailed, errors.Join(errors.New(legacyRestoreUncertain), fmt.Errorf("persist explicit recovery requirement: %w", err))
+			}
+		}
+		return StatusFailed, errors.New(legacyRestoreUncertain)
+	}
+
 	if reconciler, ok := manager.Deployment.(interface {
 		ReconcileRelease(context.Context, string, string) (update.Result, bool)
 	}); ok && (operation.Kind == KindUpdate || operation.Kind == KindSwitchBack) {
@@ -343,19 +359,8 @@ func (manager *Manager) reconcileOperation(ctx context.Context, operation *Opera
 	}
 
 	resumeAndVerify := func() error {
-		if err := manager.Deployment.Resume(ctx, operation.InstanceID); err != nil {
-			return fmt.Errorf("resume after interrupted operation: %w", err)
-		}
-		if err := manager.Deployment.Verify(ctx, operation.InstanceID); err != nil {
-			return fmt.Errorf("verify after interrupted operation: %w", err)
-		}
-		return nil
+		return manager.resumeAndVerify(ctx, operation, func() error { return manager.save(operation) })
 	}
-	lastStageStatus := ""
-	if len(operation.Stages) > 0 && operation.Stages[len(operation.Stages)-1].Name == operation.CurrentStage {
-		lastStageStatus = operation.Stages[len(operation.Stages)-1].Status
-	}
-
 	switch operation.Kind {
 	case KindBackup:
 		if err := resumeAndVerify(); err != nil {
@@ -371,68 +376,43 @@ func (manager *Manager) reconcileOperation(ctx context.Context, operation *Opera
 		}
 		return StatusSucceeded, nil
 	case KindRollback:
-		if (operation.CurrentStage == "resume" || operation.CurrentStage == "verify") && lastStageStatus != "failed" {
-			if err := resumeAndVerify(); err == nil {
-				return StatusSucceeded, nil
-			}
-		}
-		if operation.RecoveryPointID == "" {
-			return StatusFailed, errors.New("interrupted rollback has no recovery point")
-		}
-		if err := manager.Deployment.QuiesceForRecovery(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
-			return StatusFailed, fmt.Errorf("quiesce before recovering interrupted rollback: %w", err)
-		}
-		if err := manager.Deployment.Rollback(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
-			return StatusFailed, fmt.Errorf("recover interrupted rollback: %w", err)
+		if !hasDurableResumeBoundary(operation.Stages) {
+			return StatusFailed, errors.New("interrupted recovery has no durable resume boundary; start a new explicit data recovery")
 		}
 		if err := resumeAndVerify(); err != nil {
 			return StatusFailed, err
 		}
 		return StatusSucceeded, nil
 	case KindUpdate:
-		if operation.CurrentStage == "succeeded" {
-			if err := resumeAndVerify(); err == nil {
-				return StatusSucceeded, nil
+		if hasDurableResumeBoundary(operation.Stages) {
+			status := StatusFailed
+			activated := operation.CurrentStage == "succeeded"
+			recoveryStarted := operation.CurrentStage == "rolled_back"
+			recoveryCompleted := operation.CurrentStage == "rolled_back"
+			for _, stage := range operation.Stages {
+				if stage.Name == "succeeded" || (stage.Name == "activate" && stage.Status == "succeeded") {
+					activated = true
+				}
+				if stage.Name == "rollback" || stage.Name == "rolled_back" {
+					recoveryStarted = true
+					if stage.Status == "succeeded" {
+						recoveryCompleted = true
+					}
+				}
 			}
-		}
-		if operation.CurrentStage == "rolled_back" {
-			if err := resumeAndVerify(); err == nil {
-				return StatusRolledBack, nil
+			if recoveryCompleted {
+				status = StatusRolledBack
+			} else if activated && !recoveryStarted {
+				status = StatusSucceeded
 			}
-		}
-		if (operation.CurrentStage == "resume" || operation.CurrentStage == "verify") && lastStageStatus != "failed" {
-			if err := resumeAndVerify(); err == nil {
-				return StatusSucceeded, nil
-			}
-		}
-
-		for _, stage := range operation.Stages {
-			if stage.Name == "resume" || stage.Name == "verify" || stage.Name == "succeeded" {
-				return StatusFailed, errors.New("traffic may have resumed; full data restoration requires a separate authorized recovery")
-			}
-		}
-		if operation.RecoveryPointID == "" {
 			if err := resumeAndVerify(); err != nil {
 				return StatusFailed, err
 			}
-			return StatusFailed, nil
+			return status, nil
 		}
-		if operation.CurrentStage == "backup" && lastStageStatus == "succeeded" {
-			if err := resumeAndVerify(); err != nil {
-				return StatusFailed, err
-			}
-			return StatusFailed, nil
-		}
-		if err := manager.Deployment.QuiesceForRecovery(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
-			return StatusFailed, fmt.Errorf("quiesce before recovering interrupted update: %w", err)
-		}
-		if err := manager.Deployment.Rollback(ctx, operation.InstanceID, operation.RecoveryPointID); err != nil {
-			return StatusFailed, fmt.Errorf("recover interrupted update: %w", err)
-		}
-		if err := resumeAndVerify(); err != nil {
-			return StatusFailed, err
-		}
-		return StatusRolledBack, nil
+		// Older coordinators could begin another restore without recording it.
+		// Their resume history cannot prove that restored data is complete.
+		return StatusFailed, errors.New("interrupted update recovery has no durable resume boundary; start a new explicit data recovery")
 	default:
 		return StatusFailed, errors.New("interrupted operation kind is invalid")
 	}
@@ -535,7 +515,11 @@ func (manager *Manager) Wait(ctx context.Context) error {
 }
 
 func (manager *Manager) step(ctx context.Context, operation *Operation, save func() error, name string, run func() error) bool {
-	if err := manager.updateStage(operation, update.Stage{Name: name, Status: "running", UpdatedAt: manager.now().UTC()}, save); err != nil {
+	message := ""
+	if name == "resume" {
+		message = update.ResumeBoundaryMessage
+	}
+	if err := manager.updateStage(operation, update.Stage{Name: name, Status: "running", Message: message, UpdatedAt: manager.now().UTC()}, save); err != nil {
 		manager.failPersistence(operation, name, err)
 		return false
 	}
@@ -565,16 +549,114 @@ func (manager *Manager) failPersistence(operation *Operation, stage string, err 
 	operation.Error = fmt.Sprintf("persist %s stage: %v", stage, err)
 }
 
-func (manager *Manager) resumeAfterFailure(ctx context.Context, instanceID string, operation *Operation) {
+// Older coordinators left the first resume history in place when a later data
+// restore failed. Persist a v1 stage hold before any health-based reconciliation.
+func legacyPartialRestore(operation Operation) bool {
+	if operation.Kind != KindRollback && operation.Kind != KindUpdate {
+		return false
+	}
+	if hasLegacyRestoreHold(operation.Stages) || strings.Contains(operation.Error, legacyRestoreUncertain) {
+		return true
+	}
+	if operation.ReconcileAttempts == 0 {
+		return false
+	}
+	for _, failure := range []string{
+		"recover interrupted rollback:", "recover interrupted update:",
+		"quiesce before recovering interrupted rollback:", "quiesce before recovering interrupted update:",
+	} {
+		if strings.Contains(operation.Error, failure) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLegacyRestoreHold(stages []update.Stage) bool {
+	for _, stage := range stages {
+		if stage.Name == "rollback" && stage.Status == "failed" && strings.HasPrefix(stage.Message, legacyRestoreUncertain) {
+			return true
+		}
+	}
+	return false
+}
+
+// Keep the first safety/completion evidence and fill the remaining capacity with
+// recent stages. Output stays chronological, including the latest current stage.
+func boundedOperationStages(stages []update.Stage) []update.Stage {
+	if len(stages) <= maximumOperationStages {
+		return stages
+	}
+	selected := make([]bool, len(stages))
+	evidence := map[string]bool{}
+	count := 0
+	for index, stage := range stages {
+		key := ""
+		switch stage.Name {
+		case "resume", "verify", "activate", "rollback", "rolled_back", "succeeded":
+			key = stage.Name
+			if stage.Status == "succeeded" {
+				key += ":succeeded"
+			}
+		}
+		if stage.Name == "rollback" && stage.Status == "failed" && strings.HasPrefix(stage.Message, legacyRestoreUncertain) {
+			key = "legacy-restore-hold"
+		}
+		if isDurableResumeBoundary(stage) {
+			key = "durable-resume-boundary"
+		}
+		if key != "" && !evidence[key] {
+			evidence[key] = true
+			selected[index] = true
+			count++
+		}
+	}
+	for index := len(stages) - 1; index >= 0 && count < maximumOperationStages; index-- {
+		if !selected[index] {
+			selected[index] = true
+			count++
+		}
+	}
+	bounded := make([]update.Stage, 0, maximumOperationStages)
+	for index, stage := range stages {
+		if selected[index] {
+			bounded = append(bounded, stage)
+		}
+	}
+	return bounded
+}
+
+// Only the explicit new boundary proves that no unjournaled restore followed.
+// A plain resume/verify stage from an older updater does not carry that promise.
+func hasDurableResumeBoundary(stages []update.Stage) bool {
+	for _, stage := range stages {
+		if isDurableResumeBoundary(stage) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDurableResumeBoundary(stage update.Stage) bool {
+	return stage.Name == "resume" && stage.Status == "running" && stage.Message == update.ResumeBoundaryMessage
+}
+
+func (manager *Manager) resumeAndVerify(ctx context.Context, operation *Operation, save func() error) error {
+	if !manager.step(ctx, operation, save, "resume", func() error { return manager.Deployment.Resume(ctx, operation.InstanceID) }) {
+		return errors.New(operation.Error)
+	}
+	if !manager.step(ctx, operation, save, "verify", func() error { return manager.Deployment.Verify(ctx, operation.InstanceID) }) {
+		return errors.New(operation.Error)
+	}
+	return nil
+}
+
+func (manager *Manager) resumeAfterFailure(ctx context.Context, operation *Operation) {
 	recoveryCtx, cancel := manager.recoveryContext(ctx)
 	defer cancel()
-	if err := manager.Deployment.Resume(recoveryCtx, instanceID); err != nil {
-		operation.Error = errors.Join(errors.New(operation.Error), fmt.Errorf("resume current release: %w", err)).Error()
-		operation.Status = StatusRecoveryRequired
-		return
-	}
-	if err := manager.Deployment.Verify(recoveryCtx, instanceID); err != nil {
-		operation.Error = errors.Join(errors.New(operation.Error), fmt.Errorf("verify current release: %w", err)).Error()
+	cause := operation.Error
+	if err := manager.resumeAndVerify(recoveryCtx, operation, func() error { return manager.save(operation) }); err != nil {
+		operation.Error = errors.Join(errors.New(cause), err).Error()
 		operation.Status = StatusRecoveryRequired
 	}
 }
@@ -605,6 +687,7 @@ func (manager *Manager) acquireLock(instanceID string) (*os.File, error) {
 }
 
 func (manager *Manager) save(operation *Operation) error {
+	operation.Stages = boundedOperationStages(operation.Stages)
 	operation.Error = boundedOperationMessage(operation.Error)
 	for index := range operation.Stages {
 		operation.Stages[index].Message = boundedOperationMessage(operation.Stages[index].Message)

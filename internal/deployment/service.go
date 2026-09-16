@@ -205,7 +205,7 @@ func (service *Service) Quiesce(ctx context.Context, instanceID string) error {
 		return err
 	}
 
-	return service.quiesce(ctx, instanceID, config, true)
+	return service.quiesce(ctx, instanceID, config)
 }
 
 func (service *Service) QuiesceForRecovery(ctx context.Context, instanceID string, recoveryPointID string) error {
@@ -221,10 +221,10 @@ func (service *Service) QuiesceForRecovery(ctx context.Context, instanceID strin
 	if err != nil {
 		return err
 	}
-	return service.quiesce(ctx, instanceID, config, false, topologies[1:]...)
+	return service.quiesce(ctx, instanceID, config, topologies[1:]...)
 }
 
-func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config, resumeOnFailure bool, additional ...instance.Config) error {
+func (service *Service) quiesce(ctx context.Context, instanceID string, config instance.Config, additional ...instance.Config) error {
 	drainCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
 	// A stopped application is a normal state during recovery. Enter maintenance
@@ -237,23 +237,16 @@ func (service *Service) quiesce(ctx context.Context, instanceID string, config i
 		return errors.New("maintenance storage is unavailable")
 	}
 
-	fail := func(err error) error {
-		if !resumeOnFailure {
-			return err
-		}
-		resumeCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 4*time.Minute)
-		defer stop()
-		return errors.Join(err, service.Resume(resumeCtx, instanceID))
-	}
+	// Operation owners persist their resume boundary before recovering services.
 	if err := service.drainRetiredWorker(drainCtx); err != nil {
-		return fail(err)
+		return err
 	}
 	if tx, err := service.readTransaction(instanceID); err == nil {
 		if err := service.waitUpgradeContainers(drainCtx, tx.OperationID); err != nil {
-			return fail(err)
+			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fail(err)
+		return err
 	}
 	configs := append([]instance.Config{config}, additional...)
 	for _, topology := range append([]instance.Config(nil), configs...) {
@@ -266,11 +259,11 @@ func (service *Service) quiesce(ctx context.Context, instanceID string, config i
 		other.EnvironmentFile = filepath.Join(filepath.Dir(other.ComposeFile), "release.env")
 		if err := regularFile(other.ComposeFile); err == nil {
 			if err := regularFile(other.EnvironmentFile); err != nil {
-				return fail(err)
+				return err
 			}
 			configs = append(configs, other)
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return fail(err)
+			return err
 		}
 	}
 	seen := map[string]bool{}
@@ -280,10 +273,10 @@ func (service *Service) quiesce(ctx context.Context, instanceID string, config i
 		}
 		seen[slot.ComposeFile] = true
 		if err := service.drainBackground(drainCtx, slot); err != nil {
-			return fail(err)
+			return err
 		}
 		if err := service.drainServices(drainCtx, slot, "reverb", "web", "app"); err != nil {
-			return fail(err)
+			return err
 		}
 	}
 
@@ -296,7 +289,7 @@ func (service *Service) quiesce(ctx context.Context, instanceID string, config i
 		}
 		seen[infra.ComposeFile] = true
 		if err := service.drainServices(drainCtx, infra, "redis"); err != nil {
-			return fail(err)
+			return err
 		}
 	}
 	return nil
