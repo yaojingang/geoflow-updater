@@ -138,11 +138,7 @@ jobs:
             test "$plan_target" = "releases/$GEOFLOW_VERSION/upgrade-plan.json"
             plan="$(verified_target_path "$plan_target")"
             test "$(jq -er '.schema_version' "$plan")" = "1"
-            case "$(jq -er '.strategy' "$plan")" in
-              maintenance) minimum_protocol=3 ;;
-              online) minimum_protocol=4 ;;
-              *) echo "Signed upgrade plan strategy is unsupported." >&2; exit 1 ;;
-            esac
+            minimum_protocol="$(python3 scripts/core-protocol.py geoflow "$(jq -er '.strategy' "$plan")")"
             test "$(jq -er '.minimum_updater_protocol' "$manifest")" = "$minimum_protocol"
             test "$(jq -er '.source_commit' "$manifest")" = "$GEOFLOW_SOURCE_COMMIT"
             version_target="$(jq -er '.version_target' "$manifest")"
@@ -298,8 +294,7 @@ jobs:
           test "$(sha256sum candidate/targets-source/deploy/docker-compose.managed.yml | cut -d ' ' -f 1)" = "$(jq -er '.targets.compose_sha256' candidate/candidate.json)"
           test "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json" | cut -d ' ' -f 1)" = "$(jq -er '.targets.version_document_sha256' candidate/candidate.json)"
           test "$(jq -er '.schema_version' candidate/targets-source/releases/current.json)" = "3"
-          expected_protocol=3
-          if test "$(jq -er '.strategy' "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json")" = online; then expected_protocol=4; fi
+          expected_protocol="$(python3 scripts/core-protocol.py geoflow "$(jq -er '.strategy' "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json")")"
           test "$(jq -er '.minimum_updater_protocol' candidate/targets-source/releases/current.json)" = "$expected_protocol"
           test "$(sha256sum "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json" | cut -d ' ' -f 1)" = "$(jq -er '.targets.upgrade_plan_sha256' candidate/candidate.json)"
           python3 geoflow/deployment/generate-upgrade-plan.py --check

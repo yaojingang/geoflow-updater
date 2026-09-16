@@ -167,7 +167,7 @@ jobs:
           python3 geoflow/deployment/generate-upgrade-plan.py --check
           cp geoflow/deployment/upgrade-plan.json "candidate/targets-source/releases/$GEOFLOW_VERSION/upgrade-plan.json"
           plan_strategy="$(jq -er '.strategy' geoflow/deployment/upgrade-plan.json)"
-          case "$plan_strategy" in maintenance) minimum_protocol=3 ;; online) minimum_protocol=4 ;; *) exit 1 ;; esac
+          minimum_protocol="$(python3 scripts/core-protocol.py geoflow "$plan_strategy")"
           cp geoflow/version.json "candidate/targets-source/releases/$GEOFLOW_VERSION/version.json"
           cp candidate/dist/geoflow-updater_*.tar.gz candidate/dist/checksums.txt "candidate/targets-source/updater/$UPDATER_VERSION/"
           jq -n \

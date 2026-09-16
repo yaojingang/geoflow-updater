@@ -17,12 +17,20 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
 
 
+def rehearsal_protocol(source):
+    floor = source.get('minimum_updater_protocol')
+    if type(floor) is not int or floor not in {3, 4, 5}:
+        raise ValueError('unsupported source updater protocol')
+    return max(4, floor)
+
+
 def main():
     assert os.environ['GITHUB_REPOSITORY'] == 'yaojingang/geoflow-updater'
     assert os.environ['GITHUB_REF'] == 'refs/heads/main'
     candidate = Path('candidate')
     identity = json.loads((candidate / 'candidate.json').read_text())
     source = json.loads((candidate / 'targets-source/releases/current.json').read_text())
+    minimum_protocol = rehearsal_protocol(source)
     assert source['release_sequence'] == identity['geoflow']['release_sequence']
     assert re.fullmatch(r'ghcr.io/yaojingang/geoflow-app@sha256:[a-f0-9]{64}', source['app_image'])
     fixture = candidate / 'online-fixture'
@@ -50,7 +58,7 @@ def main():
                     '--tag', tag, str(context)], check=True)
     image_digest = json.loads(metadata.read_text())['containerimage.digest']
     assert re.fullmatch(r'sha256:[a-f0-9]{64}', image_digest)
-    manifest = dict(source, minimum_updater_protocol=4, release_sequence=source['release_sequence'] + 1,
+    manifest = dict(source, minimum_updater_protocol=minimum_protocol, release_sequence=source['release_sequence'] + 1,
                     app_image='ghcr.io/yaojingang/geoflow-app@' + image_digest)
     write(targets / 'releases/current.json', manifest)
     repository = fixture / 'tuf/repository'
