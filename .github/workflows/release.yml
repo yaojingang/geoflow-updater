@@ -238,7 +238,12 @@ jobs:
             done < "$RUNNER_TEMP/publication-paths"
           else
             test "$PUBLICATION_RESUME" = false
-            test "$candidate_sha" = "$GITHUB_SHA"
+            if [ "$candidate_sha" != "$GITHUB_SHA" ]; then
+              # First publication permits daily online metadata refresh only.
+              # The committed-publication resume path above has a separate gate.
+              python3 scripts/planned-release-source.py first-publication \
+                --candidate "$candidate_sha" --publication "$GITHUB_SHA"
+            fi
           fi
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.name')" = "Build Phase C release candidate"
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --jq '.path')" = ".github/workflows/release-candidate.yml"
@@ -248,6 +253,17 @@ jobs:
             --name "phase-c-candidate-$CANDIDATE_RUN_ID" \
             --dir candidate
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+      - name: Verify original candidate retention
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_SOURCE_SHA: ${{ steps.candidate-source.outputs.candidate_sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > "$RUNNER_TEMP/candidate-run.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/candidate-artifacts.json"
+          python3 scripts/planned-release-source.py artifact \
+            --run "$RUNNER_TEMP/candidate-run.json" --artifacts "$RUNNER_TEMP/candidate-artifacts.json" \
+            --run-id "$CANDIDATE_RUN_ID" --source "$CANDIDATE_SOURCE_SHA"
       - name: Validate candidate identity and publication authorization
         env:
           APPROVED_EVIDENCE_B64: ${{ secrets.PHASE_C_REHEARSAL_EVIDENCE_B64 }}

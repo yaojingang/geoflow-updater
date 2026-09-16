@@ -58,6 +58,9 @@ jobs:
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
         run: |
           test "$GITHUB_REF" = "refs/heads/main"
+          # A rebuilt run must get a new identity and fresh acceptance evidence.
+          # Rerunning a previous run would retain the candidate_run_id.
+          test "$GITHUB_RUN_ATTEMPT" = 1
           [[ "$UPDATER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           [[ "$GEOFLOW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
