@@ -15,8 +15,10 @@ import (
 	"regexp"
 
 	"github.com/yaojingang/geoflow-updater/internal/instance"
+	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
+	"github.com/yaojingang/geoflow-updater/internal/update"
 )
 
 var recoveryDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -38,11 +40,12 @@ type recoveryReport struct {
 	QuarantineSHA256       string `json:"quarantine_sha256,omitempty"`
 }
 
-func (service *Service) prepareExplicitRestore(ctx context.Context, config instance.Config, request recovery.RestoreRequest) (recovery.RestoreRequest, error) {
+func (service *Service) prepareExplicitRestore(ctx context.Context, config instance.Config, tx releaseTransaction, request recovery.RestoreRequest) (recovery.RestoreRequest, error) {
 	if !safeOperationID(request.TransactionID) {
 		return request, errors.New("recovery requires a stable operation identity")
 	}
-	state, err := service.recoveryControl().Read(config.ID)
+	control := service.recoveryControl()
+	state, err := control.Read(config.ID)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return request, err
 	}
@@ -52,6 +55,20 @@ func (service *Service) prepareExplicitRestore(ctx context.Context, config insta
 		// and administrator identity remain bound while its HTTP is still closed.
 		request.AdminDigest = state.AdminDigest
 		return request, nil
+	}
+	if err == nil && state.State.Phase == "ready" &&
+		tx.Strategy == managed.StrategyMaintenance && tx.Status == update.StatusRecoveryRequired && !tx.TrafficOpened &&
+		tx.RecoveryPointID == request.PointID && tx.OperationID != request.TransactionID {
+		// The original update recorded this identity after draining writers and
+		// before applying migrations. Its schema may no longer suit the source.
+		checkpoint, checkpointErr := control.Checkpoint(config.ID, request.PointID, tx.OperationID)
+		if checkpointErr == nil {
+			request.AdminDigest = checkpoint.AdminDigest
+			return request, nil
+		}
+		if !errors.Is(checkpointErr, os.ErrNotExist) {
+			return request, checkpointErr
+		}
 	}
 	return service.prepareRestore(ctx, config, request)
 }

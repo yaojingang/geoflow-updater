@@ -21,9 +21,13 @@ epoch. A completed data restore cannot replay within the same transaction.
 Lost or corrupt initialized authority stops recovery.
 
 Updates freeze an opaque administrator digest in a private checkpoint before
-migration or topology changes. Manual restores inspect the current source before
-restoring it. The digest must match the restored administrator set; a mismatch
-requires operator investigation and leaves maintenance active.
+migration or topology changes. An explicit restore ordinarily inspects the
+current source. If an interrupted maintenance update has never reopened
+traffic, a new explicit restore can use the private proof bound to its exact
+validated update checkpoint. A newly authorized retry of the same point may
+use the previous digest while that restore is incomplete and HTTP is closed.
+The digest must match the restored administrator set; a mismatch requires
+operator investigation and leaves maintenance active.
 
 ## Isolation and evidence
 
