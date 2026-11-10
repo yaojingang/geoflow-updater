@@ -21,10 +21,22 @@ def matches(fault, transaction, arguments):
     return transaction.get('status') == 'running' and transaction.get('stage') == fault['stage']
 
 
+def record_restore_attempt():
+    blocked = (STATE / 'planned-rehearsal-block-restore').exists()
+    authority_path = STATE / 'recovery-control/primary/authority.json'
+    authority = json.loads(authority_path.read_text()) if authority_path.exists() else {}
+    state = authority.get('state', {})
+    with (STATE / 'planned-rehearsal-restore-attempts.jsonl').open('a') as stream:
+        stream.write(json.dumps({'transaction_id': state.get('transaction_id'), 'epoch': state.get('epoch'),
+                                 'point_id': authority.get('point_id'), 'blocked': blocked}) + '\n')
+    return blocked
+
+
 def main():
     arguments = sys.argv[1:]
     restoring = any(shlex.split(argument)[:2] == ['exec', 'pg_restore'] for argument in arguments if argument.startswith('exec pg_restore '))
-    if (STATE / 'planned-rehearsal-block-restore').exists() and restoring:
+    if restoring and record_restore_attempt():
+        print('planned rehearsal intentionally blocked PostgreSQL restore', file=sys.stderr)
         return 98
     fault = json.loads(FAULT.read_text()) if FAULT.exists() else None
     transaction_path = STATE / 'instances/primary/release-transaction.json'

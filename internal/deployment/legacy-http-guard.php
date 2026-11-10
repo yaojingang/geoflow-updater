@@ -113,12 +113,15 @@ final class GeoFlowLegacyHttpGuard
             define('LARAVEL_START', microtime(true));
             require GeoFlowLegacyRecoveryAdapter::ROOT.'/vendor/autoload.php';
             $app = require GeoFlowLegacyRecoveryAdapter::ROOT.'/bootstrap/app.php';
+            $request = Illuminate\Http\Request::capture();
+            $app->instance('request', $request);
+            Illuminate\Support\Facades\Request::clearResolvedInstance();
             $app->make(Illuminate\Contracts\Http\Kernel::class)->bootstrap();
             self::install($app);
             Illuminate\Queue\Queue::createPayloadUsing(static function (): never {
                 throw new RuntimeException('recovery_background_held');
             });
-            $app->handleRequest(Illuminate\Http\Request::capture());
+            $app->handleRequest($request);
             exit;
         } catch (Throwable) {
             http_response_code(503);

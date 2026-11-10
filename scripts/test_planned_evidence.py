@@ -121,6 +121,31 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises((ValueError, KeyError)):
                     gate.validate(evidence, candidate, approved=True)
 
+    def test_crash_evidence_requires_an_explicit_held_restore_on_both_sides_of_the_checkpoint(self):
+        required_by_scenario = {
+            'crash-retain-assets': {'manual-recovery-point'},
+            'crash-quiesce': {'manual-recovery-point'},
+            'crash-scheduler-freeze': {'manual-recovery-point', 'legacy-scheduler-fixture', 'scheduler-frozen-at-interruption'},
+            'crash-backup': {'manual-recovery-point'},
+            'crash-upgrade': {'update-recovery-point'},
+            'crash-layout': {'update-recovery-point'},
+            'crash-candidate': {'update-recovery-point'},
+            'crash-switch': {'update-recovery-point'},
+            'crash-workers': {'update-recovery-point'},
+            'crash-observe': {'update-recovery-point'},
+            'crash-recovery-backoff': {'update-recovery-point', 'rollback-backoff-held'},
+        }
+        for scenario, specific in required_by_scenario.items():
+            required = specific | {'maintenance-interruption-held', 'explicit-data-restore',
+                                   'protocol-5-hold-after-restart', 'protocol-5-credentials-invalidated'}
+            for missing in sorted(required):
+                with self.subTest(scenario=scenario, missing=missing):
+                    evidence, candidate = complete()
+                    checks = evidence['architectures']['linux-arm64']['hosts'][scenario]['checks']
+                    checks[:] = [check for check in checks if check['id'] != missing]
+                    with self.assertRaisesRegex(ValueError, 'Required host checks missing'):
+                        gate.validate(evidence, candidate, approved=True)
+
     def test_assembly_uses_all_native_reports_and_keeps_private_diagnostics_out_of_approval(self):
         evidence, candidate = complete()
         with tempfile.TemporaryDirectory() as directory:
