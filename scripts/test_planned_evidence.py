@@ -125,7 +125,7 @@ class EvidenceTests(unittest.TestCase):
         required_by_scenario = {
             'crash-retain-assets': {'manual-recovery-point'},
             'crash-quiesce': {'manual-recovery-point'},
-            'crash-scheduler-freeze': {'manual-recovery-point', 'scheduler-frozen-at-interruption'},
+            'crash-scheduler-freeze': {'manual-recovery-point', 'legacy-scheduler-fixture', 'scheduler-frozen-at-interruption'},
             'crash-backup': {'manual-recovery-point'},
             'crash-upgrade': {'update-recovery-point'},
             'crash-layout': {'update-recovery-point'},

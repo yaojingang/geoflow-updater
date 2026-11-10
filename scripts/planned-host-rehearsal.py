@@ -759,6 +759,17 @@ class Rehearsal:
             return result
         return self.mutate('rollbacks', 'rollback', {'recovery_point_id': point}, label)
 
+    def install_legacy_scheduler_fixture(self):
+        override = self.evidence / 'legacy-scheduler-fixture.yml'
+        command = ['php', 'artisan', 'schedule:work']
+        override.write_text(yaml.safe_dump({'services': {'scheduler': {'command': command}}}))
+        self.compose('-f', override, 'up', '-d', '--no-deps', '--force-recreate', '--wait',
+                     '--wait-timeout', '120', 'scheduler')
+        actual = self.run('/usr/bin/docker', 'inspect', '--format', '{{json .Config.Cmd}}',
+                          self.container('scheduler'))
+        require(json.loads(actual) == command, 'Legacy scheduler fixture did not start')
+        self.record('legacy-scheduler-fixture', 'Only this rehearsal host uses the legacy scheduler command')
+
     def exercise_restore_backoff(self, point, update_id, payload):
         RESTORE_FAULT.touch(mode=0o600)
         try:
@@ -816,6 +827,8 @@ class Rehearsal:
             require(backup['kind'] == 'backup', 'Fallback point was not made by a manual backup')
             self.verify_legacy_point(manual_point, 'manual-backup')
             self.record('manual-recovery-point', 'Verified a complete independent legacy backup before interrupting the upgrade')
+            if stage == 'scheduler-freeze':
+                self.install_legacy_scheduler_fixture()
             self.corrupt(label)
         payload = self.preview()
         MARKER.unlink(missing_ok=True)

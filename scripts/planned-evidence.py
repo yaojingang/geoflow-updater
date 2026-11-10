@@ -34,7 +34,7 @@ HOST_CHECKS = {
     **{'crash-' + stage: CRASH_CHECKS | {'crash-' + stage, 'restored-' + stage, 'update-recovery-point'}
        for stage in sorted(POST_CHECKPOINT)},
 }
-HOST_CHECKS['crash-scheduler-freeze'].add('scheduler-frozen-at-interruption')
+HOST_CHECKS['crash-scheduler-freeze'].update({'legacy-scheduler-fixture', 'scheduler-frozen-at-interruption'})
 HOST_CHECKS['crash-recovery-backoff'].add('rollback-backoff-held')
 
 
