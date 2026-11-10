@@ -402,10 +402,14 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, request
 		return err
 	}
 	inspector := config
-	if tx, readErr := service.readTransaction(instanceID); readErr == nil && tx.LayoutStarted && (tx.Status == "running" || tx.Status == "recovery_required") {
+	tx, readErr := service.readTransaction(instanceID)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	if readErr == nil && tx.LayoutStarted && (tx.Status == "running" || tx.Status == "recovery_required") {
 		inspector = tx.Candidate
 	}
-	request, err = service.prepareExplicitRestore(ctx, inspector, request)
+	request, err = service.prepareExplicitRestore(ctx, inspector, tx, request)
 	if err != nil {
 		return err
 	}

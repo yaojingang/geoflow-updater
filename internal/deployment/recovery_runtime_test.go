@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/yaojingang/geoflow-updater/internal/instance"
+	"github.com/yaojingang/geoflow-updater/internal/managed"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
 	"gopkg.in/yaml.v3"
@@ -139,6 +140,72 @@ func TestExplicitRetryUsesOnlyTheUnopenedSamePointAuthority(t *testing.T) {
 				}
 			} else if err != nil || store.request == nil || store.request.AdminDigest != digest || store.request.TransactionID != next || store.request.PointID != point {
 				t.Fatalf("same point did not retain the verified administrator identity under a new authorization: request=%+v error=%v", store.request, err)
+			}
+		})
+	}
+}
+
+func TestExplicitRestoreUsesOnlyTheBoundPreTrafficCheckpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		traffic      bool
+		different    bool
+		missingProof bool
+		wrongProof   bool
+	}{
+		{name: "same checkpoint during interrupted layout"},
+		{name: "traffic was opened", traffic: true},
+		{name: "another point was requested", different: true},
+		{name: "no private checkpoint proof", missingProof: true},
+		{name: "private proof names a different point", wrongProof: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, legacy, _, tx := recoveryTopologyFixture(t)
+			tx.Strategy, tx.Stage, tx.LayoutStarted, tx.TrafficOpened = managed.StrategyMaintenance, "layout", false, tc.traffic
+			if err := service.saveTransaction(&tx); err != nil {
+				t.Fatal(err)
+			}
+			digest := strings.Repeat("b", 64)
+			control := service.recoveryControl()
+			if _, err := control.Initialize(legacy.ID); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.missingProof {
+				proofPoint := tx.RecoveryPointID
+				if tc.wrongProof {
+					proofPoint = "20260908T010000Z-5678abcd"
+				}
+				if err := control.CaptureCheckpoint(legacy.ID, proofPoint, tx.OperationID, digest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			point := tx.RecoveryPointID
+			if tc.different {
+				point = "20260908T010000Z-5678abcd"
+			}
+			store := &observedRestoreStore{topologyRecoveryStore: topologyRecoveryStore{
+				point: recovery.Point{ID: point, Deployment: &legacy},
+			}}
+			service.Recoveries = store
+			inspectErr := errors.New("the source inspector cannot read the migrated database")
+			service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+				if isRecoveryInspect(args) {
+					return inspectErr
+				}
+				return nil
+			})
+			const next = "authorized-maintenance-recovery"
+			err := service.Rollback(context.Background(), legacy.ID, recovery.RestoreRequest{PointID: point, TransactionID: next})
+			if tc.wrongProof {
+				if err == nil || !strings.Contains(err.Error(), "checkpoint identity mismatch") || store.request != nil {
+					t.Fatalf("mismatched private proof did not stop restoration: %v", err)
+				}
+			} else if tc.traffic || tc.different || tc.missingProof {
+				if !errors.Is(err, inspectErr) || store.request != nil {
+					t.Fatalf("unbound checkpoint reached restoration: %v", err)
+				}
+			} else if err != nil || store.request == nil || store.request.AdminDigest != digest || store.request.TransactionID != next || store.request.PointID != point {
+				t.Fatalf("explicit restore did not use the pre-traffic proof: request=%+v error=%v", store.request, err)
 			}
 		})
 	}
