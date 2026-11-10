@@ -39,18 +39,23 @@ class EnrollmentEntryTests(unittest.TestCase):
         self.assertIn('geoflow:schedule-work', compose['services']['scheduler']['command'])
         self.assertIn('reverb:start', compose['services']['reverb']['command'])
 
-    def test_eight_native_host_jobs_and_enrollment_cli_are_available(self):
+    def test_every_scenario_has_a_fresh_host_on_both_native_architectures(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/planned-acceptance.yml').read_text())
-        matrix = workflow['jobs']['host']['strategy']['matrix']['include']
-        expected = {(platform, mode, runner)
-                    for platform, runner in [('linux-amd64', 'ubuntu-24.04'), ('linux-arm64', 'ubuntu-24.04-arm')]
-                    for mode in ['upgrade', 'install', 'online', 'enrollment']}
-        self.assertEqual(len(matrix), 8)
-        self.assertEqual({(item['platform'], item['mode'], item['runner']) for item in matrix}, expected)
+        matrix = workflow['jobs']['host']['strategy']['matrix']
+        self.assertEqual(set(matrix['platform']), {'linux-amd64', 'linux-arm64'})
+        self.assertEqual({(item['platform'], item['runner']) for item in matrix['include']},
+                         {('linux-amd64', 'ubuntu-24.04'), ('linux-arm64', 'ubuntu-24.04-arm')})
+        required = {'upgrade', 'install', 'online', 'enrollment', 'crash-retain-assets', 'crash-quiesce',
+                    'crash-scheduler-freeze', 'crash-backup', 'crash-upgrade', 'crash-layout', 'crash-candidate',
+                    'crash-switch', 'crash-workers', 'crash-observe', 'crash-recovery-backoff'}
+        self.assertEqual(set(matrix['scenario']), required)
+        self.assertEqual(len(matrix['scenario']), len(required))
+        self.assertEqual(set(host.SCENARIOS), required)
         result = subprocess.run([sys.executable, str(ROOT / 'scripts/planned-host-rehearsal.py'), '--help'],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r'--mode\s+\{[^}]*\benrollment\b')
+        self.assertRegex(result.stdout, r'--scenario\s+\{[^}]*\bcrash-recovery-backoff\b')
 
 
 if __name__ == '__main__':
