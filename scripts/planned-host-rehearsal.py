@@ -2,6 +2,7 @@
 """Exercise an installed signed candidate on an empty GitHub-hosted Linux VM."""
 import argparse
 import base64
+from copy import copy
 import hashlib
 import hmac
 import http.client
@@ -32,6 +33,27 @@ MARKER = STATE / 'planned-rehearsal-hit.json'
 RESTORE_FAULT = STATE / 'planned-rehearsal-block-restore'
 SOCKET = '/run/geoflow-updater/geoflow-updater.sock'
 REPO = Path(__file__).resolve().parent.parent
+CONTROL = STATE / 'recovery-control/primary'
+PUBLIC_URL = 'http://localhost:18080'
+LEGACY_BASELINE = {
+    'schema_version': 3, 'minimum_updater_protocol': 3, 'release_sequence': 3, 'version': '3.1.0',
+    'source_commit': '6c963783bbf49f0b5ec9d0121a924ee54005b60d',
+    'app_image': 'ghcr.io/yaojingang/geoflow-app@sha256:94c01bfd52941cf48ad9693fce30fc571c29353189fb5e128d0e0752daa36448',
+    'upgrade_plan_target': 'releases/3.1.0/upgrade-plan.json',
+}
+CRASH_STAGES = {
+    'retain-assets': False, 'quiesce': False, 'scheduler-freeze': False, 'backup': False,
+    'upgrade': True, 'layout': True, 'candidate': True, 'switch': True,
+    'workers': True, 'observe': True, 'recovery-backoff': True,
+}
+MODES = ('upgrade', 'install', 'online', 'enrollment')
+SCENARIOS = (*MODES, *('crash-' + stage for stage in CRASH_STAGES))
+BACKGROUND_ROLES = {
+    'queue', 'knowledge-queue', 'scheduler', 'reverb', 'ai-quality-queue',
+    'ai-quality-backfill-queue', 'ai-optimization-queue',
+}
+QUEUE_PROBE_KEY = 'geoflow-rehearsal:queues:release-acceptance:delayed'
+QUEUE_PROBE_VALUE = 'geoflow-rehearsal-held-payload'
 
 
 def require(condition, message):
@@ -113,6 +135,9 @@ class Rehearsal:
             'GEOFLOW_UPDATER_TUF_METADATA_URL': 'https://127.0.0.1:18443/metadata',
             'GEOFLOW_UPDATER_TUF_TARGETS_URL': 'https://127.0.0.1:18443/targets',
         })
+        self.reset_browser()
+
+    def reset_browser(self):
         self.cookies = http.cookiejar.CookieJar()
         self.browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
 
@@ -168,7 +193,7 @@ class Rehearsal:
         return self.run('/usr/bin/docker', 'exec', self.container('redis'), 'sh', '-ec',
                         'exec redis-cli --no-auth-warning -a "${REDIS_PASSWORD:-}" "$@"', 'rehearsal', *args, log=False)
 
-    def api(self, method, endpoint, payload=None, scope=None, expected=200):
+    def api(self, method, endpoint, payload=None, scope=None, expected=200, protocol=1):
         token = self.mask((INSTANCE / 'control.token').read_text().strip())
         headers = {'Authorization': 'Bearer ' + token}
         if scope:
@@ -187,7 +212,7 @@ class Rehearsal:
             body = json.dumps(payload)
         connection = UnixConnection('localhost', timeout=1500)
         try:
-            connection.request(method, '/v1/instances/primary/' + endpoint, body, headers)
+            connection.request(method, f'/v{protocol}/instances/primary/' + endpoint, body, headers)
             response = connection.getresponse()
             data = json.loads(response.read())
             require(response.status == expected, f'{method} {endpoint}: HTTP {response.status}: {data}')
@@ -226,11 +251,14 @@ class Rehearsal:
         report = json.loads(self.run('geoflow-updater', 'doctor', '--instance', 'primary', '--json'))
         self.save('doctor-' + label + '.json', report)
         require(report['status'] == 'pass', 'Doctor failed: ' + label)
-        with urllib.request.urlopen('http://localhost:18080/up', timeout=15) as response:
+        self.public_health()
+
+    def public_health(self):
+        with urllib.request.urlopen(PUBLIC_URL + '/up', timeout=15) as response:
             require(response.status == 200, 'Public health failed')
 
-    def login(self, password):
-        url = 'http://localhost:18080/geo_admin/login'
+    def login(self, password, *, read_only=False, label='login'):
+        url = PUBLIC_URL + '/geo_admin/login'
         with self.browser.open(url, timeout=30) as response:
             html = response.read().decode()
         csrf = re.search(r'name="_token"[^>]*value="([^"]+)"', html)
@@ -241,7 +269,39 @@ class Rehearsal:
             require(response.status == 200 and '/login' not in response.url, 'Administrator login failed')
         for cookie in self.cookies:
             self.mask(cookie.value)
-        self.session('login')
+        if read_only:
+            with self.browser.open(PUBLIC_URL + '/geo_admin/dashboard', timeout=30) as response:
+                require(response.status == 200 and urllib.parse.urlparse(response.url).path == '/geo_admin/dashboard',
+                        'New administrator session cannot read the restored dashboard')
+        else:
+            self.session(label)
+
+    def core_api(self, method, endpoint, *, payload=None, token=None, expected=200):
+        headers = {'Accept': 'application/json'}
+        if token is not None:
+            headers['Authorization'] = 'Bearer ' + token
+        data = None
+        if payload is not None:
+            headers['Content-Type'] = 'application/json'
+            data = json.dumps(payload).encode()
+        request = urllib.request.Request(PUBLIC_URL + '/api/v1/' + endpoint, data=data, headers=headers, method=method)
+        try:
+            response = urllib.request.urlopen(request, timeout=30)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            require(response.status == expected, f'Core {method} {endpoint}: expected HTTP {expected}, got {response.status}')
+            return json.loads(response.read())
+
+    def core_token(self):
+        result = self.core_api('POST', 'auth/login', payload={'username': 'admin', 'password': self.admin_password})
+        token = result.get('data', {}).get('token')
+        require(result.get('success') is True and isinstance(token, str) and token, 'Core login did not issue a token')
+        return self.mask(token)
+
+    def assert_session_rejected(self, browser, message):
+        with browser.open(PUBLIC_URL + '/geo_admin/dashboard', timeout=30) as response:
+            require(urllib.parse.urlparse(response.url).path == '/geo_admin/login', message)
 
     def session(self, label, record=True):
         with self.browser.open('http://localhost:18080/geo_admin/system-updates', timeout=30) as response:
@@ -266,7 +326,7 @@ class Rehearsal:
         require(not occupied, 'An existing installation must not be touched: ' + ', '.join(map(str, occupied)))
         unit = subprocess.run(['systemctl', 'show', '-p', 'LoadState', '--value', 'geoflow-updater.service'], capture_output=True, text=True)
         require(unit.stdout.strip() == 'not-found', 'An existing updater unit must not be touched')
-        expected_evidence = REPO / 'rehearsal/host-evidence' / (self.args.platform + '-' + self.args.mode)
+        expected_evidence = REPO / 'rehearsal/host-evidence' / (self.args.platform + '-' + self.args.scenario)
         require(self.evidence == expected_evidence and expected_evidence.parent.resolve() == expected_evidence.parent,
                 'Evidence must stay in the workflow-owned directory')
         parent_stat = expected_evidence.parent.stat()
@@ -275,8 +335,11 @@ class Rehearsal:
         require(not self.evidence.exists(), 'Evidence directory already exists')
         expected = {'linux-amd64': 'x86_64', 'linux-arm64': 'aarch64'}
         require(self.args.platform in expected and os.uname().machine == expected[self.args.platform], 'Native architecture mismatch')
-        require(self.manifest['schema_version'] == 3, 'A planned candidate is required')
+        require(self.manifest['schema_version'] == 3 and self.manifest['minimum_updater_protocol'] == 5,
+                'A schema-3 protocol-5 candidate is required')
         require(str(self.identity['candidate_run_id']) == os.environ['CANDIDATE_RUN_ID'], 'Candidate identity mismatch')
+        require(sha(self.candidate / 'targets-source/releases/current.json') == self.identity['targets']['release_manifest_sha256'],
+                'Candidate manifest checksum mismatch')
         self.evidence.mkdir(parents=True, mode=0o700)
         self.owns_evidence = True
         require(not self.run('/usr/bin/docker', 'ps', '-aq'), 'The disposable Docker daemon must start empty')
@@ -284,13 +347,13 @@ class Rehearsal:
         arch = self.args.platform.removeprefix('linux-')
         archive = self.candidate / f'dist/geoflow-updater_{self.identity["updater"]["version"]}_linux_{arch}.tar.gz'
         require(sha(archive) == self.identity['updater']['archives'][self.args.platform], 'Archive checksum mismatch')
-        archive_root = self.evidence.parent / ('archive-' + self.args.mode)
+        archive_root = self.evidence.parent / ('archive-' + self.args.scenario)
         archive_root.mkdir(mode=0o700)
         self.run('tar', '-xzf', archive, '-C', archive_root)
         self.run('bash', archive_root / 'packaging/scripts/install.sh')
         self.installed = True
         require(self.run('geoflow-updater', 'version') == self.identity['updater']['version'], 'Installed binary version differs')
-        self.tls = self.evidence.parent / ('tls-' + self.args.mode)
+        self.tls = self.evidence.parent / ('tls-' + self.args.scenario)
         self.tls.mkdir(mode=0o700)
         self.run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-sha256',
                  '-subj', '/CN=GEOFlow planned rehearsal', '-addext', 'subjectAltName=IP:127.0.0.1',
@@ -359,8 +422,12 @@ class Rehearsal:
             require(baseline == self.manifest and baseline['schema_version'] == 3,
                     'Same-version enrollment must use the exact signed candidate')
         else:
-            require(baseline['schema_version'] == 2 and baseline['release_sequence'] < self.manifest['release_sequence'], 'Expected an older stable baseline')
+            require(all(baseline.get(key) == value for key, value in LEGACY_BASELINE.items()) and
+                    baseline['release_sequence'] < self.manifest['release_sequence'],
+                    'Expected the official Core 3.1.0 sequence-3 baseline')
         self.repository(repository)
+        if not same_candidate:
+            self.source_plan = read_json(target(repository, baseline['upgrade_plan_target']))
         ROOT.mkdir(mode=0o755)
         for relative in ['storage/app/public', 'storage/app/private', 'storage/framework/cache/data',
                          'storage/framework/sessions', 'storage/framework/views', 'storage/logs',
@@ -415,8 +482,12 @@ class Rehearsal:
         self.compose('up', '-d', '--wait', '--wait-timeout', '600')
         self.authorize()
         self.healthy('legacy')
-        self.login(values['GEOFLOW_ADMIN_PASSWORD'])
+        self.admin_password = values['GEOFLOW_ADMIN_PASSWORD']
+        self.login(self.admin_password)
         self.baseline = baseline
+        if not same_candidate:
+            require(self.query('SELECT count(*) FROM migrations;') == '152', 'Official 3.1.0 migration count differs')
+            self.record('official-310-baseline', 'Official signed Core 3.1.0 image and sequence 3 started with 152 migrations')
         self.record('legacy-enrollment', 'Existing deployment enrolled and started with signed images on PostgreSQL 18 / Redis 8')
 
     def unmanaged_candidate(self, baseline):
@@ -458,7 +529,7 @@ class Rehearsal:
                 enrolled['version'] == self.manifest['version'] and re.fullmatch(r'[a-f0-9]{64}', proof),
                 'Enrollment did not persist the candidate identity in the legacy layout')
         self.save('enrollment-identity.json', {'release_sequence': sequence, 'enrolled_release_sha256': proof})
-        self.fixture()
+        self.fixture(recoverable=True)
 
         def conversion_plan(label):
             plan = self.api('GET', 'plan')
@@ -485,24 +556,22 @@ class Rehearsal:
         require(not saved.get('layout') and saved.get('enrolled_release_sha256') == proof,
                 'The recovery point omitted the legacy enrollment identity')
         self.record('same-sequence-layout-conversion', 'Same-version maintenance conversion completed and backed up the legacy layout and enrolled identity')
+        rejection = self.api('GET', 'plan', expected=503)
+        require(rejection.get('error') == 'plan_failed', 'The already converted same-sequence release was not rejected')
+        self.record('enrollment-repeat-rejected', 'A healthy converted deployment rejects another same-sequence conversion preview')
         self.current = 'restored-enrollment-legacy'
         self.corrupt('enrollment-restore', config=True)
         self.mutate('rollbacks', 'rollback', {'recovery_point_id': checkpoint}, 'enrollment-restore')
         self.restored('enrollment-legacy')
         require(not self.config().get('layout') and self.config().get('enrolled_release_sha256') == proof,
                 'Full restoration did not restore the legacy enrollment identity')
-        self.run('systemctl', 'restart', 'geoflow-updater')
-        self.wait_for_agent()
-        self.current = 'same-sequence-enrollment-retry'
-        self.mutate('updates', 'update', conversion_plan('enrollment-retry'), 'enrollment-retry')
-        converted('enrollment-retry')
-        self.session('after-enrollment-retry')
-        self.record('same-sequence-enrollment-retry', 'After full restoration and agent restart, the restored identity authorized another same-sequence conversion')
+        self.verify_after_restart(expect_held=True)
         rejection = self.api('GET', 'plan', expected=503)
-        require(rejection.get('error') == 'plan_failed', 'The already converted same-sequence release was not rejected')
-        self.record('enrollment-repeat-rejected', 'A healthy converted deployment rejects another same-sequence conversion preview')
+        require(rejection.get('error') == 'plan_failed', 'A held restore allowed another conversion')
+        self.record('same-sequence-enrollment-retry-blocked',
+                    'Restored enrollment identity persisted across restart and the held instance rejected another conversion')
 
-    def fixture(self):
+    def fixture(self, *, recoverable=False):
         self.query('CREATE TABLE IF NOT EXISTS geoflow_rehearsal_markers (id integer PRIMARY KEY, value text NOT NULL);'
                    "INSERT INTO geoflow_rehearsal_markers VALUES (1,'baseline') ON CONFLICT (id) DO UPDATE SET value='baseline';")
         self.redis('SET', 'geoflow:planned-rehearsal:marker', 'baseline')
@@ -510,6 +579,22 @@ class Rehearsal:
         self.baseline_hashes = {str(path): sha(path) for path in [ROOT / '.env.prod', ROOT / 'version.json',
             INSTANCE / 'instance.yml', INSTANCE / 'release.env', INSTANCE / 'docker-compose.managed.yml']}
         self.migrations = self.query('SELECT migration || \':\' || batch FROM migrations ORDER BY migration;')
+        if recoverable:
+            self.source_recovery_state = self.recovery_state()
+            require(self.source_recovery_state.get('phase') == 'ready', 'Source was not ready before the scenario')
+            self.source_admin_version = int(self.query("SELECT auth_version FROM admins WHERE username='admin';"))
+            old_cookies = http.cookiejar.CookieJar()
+            for cookie in self.cookies:
+                old_cookies.set_cookie(copy(cookie))
+            self.source_browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(old_cookies))
+            with self.source_browser.open(PUBLIC_URL + '/geo_admin/dashboard', timeout=30) as response:
+                require(response.status == 200 and urllib.parse.urlparse(response.url).path == '/geo_admin/dashboard',
+                        'Source administrator session could not read before restoration')
+            self.source_token = self.core_token()
+            require(self.core_api('GET', 'tasks', token=self.source_token).get('success') is True,
+                    'Source token could not read before restoration')
+            require(self.redis('ZADD', QUEUE_PROBE_KEY, '4102444800', QUEUE_PROBE_VALUE) == '1',
+                    'Delayed queue fixture was not created')
 
     def corrupt(self, label, config=False):
         self.query("UPDATE geoflow_rehearsal_markers SET value='changed' WHERE id=1;")
@@ -523,26 +608,104 @@ class Rehearsal:
         self.record('changed-' + label, 'Verified non-baseline database, Redis and storage markers before restoration')
         require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Corruption fixture did not write')
 
-    def restored(self, label):
+    def recovery_state(self):
+        return read_json(CONTROL / 'public/state.json')
+
+    def assert_background_held(self, state):
+        caps = self.api('GET', 'capabilities', protocol=2)
+        require(caps.get('updater_protocol') == 5 and caps.get('protocol_version') == 2 and
+                caps.get('background_status') == 'held' and caps.get('actions') == ['restore'] and
+                caps.get('recovery', {}).get('phase') == 'http_ready' and
+                caps['recovery'].get('epoch') == state['epoch'], 'Updater did not expose the held recovery boundary')
+        roles = set(self.run('/usr/bin/docker', 'ps', '--format',
+                             '{{.Label "com.docker.compose.service"}}', log=False).splitlines())
+        require({'app', 'web', 'postgres', 'redis'} <= roles and not roles & BACKGROUND_ROLES,
+                'Recovery reopened background services or left HTTP/infrastructure unavailable')
+        self.public_health()
+
+    def verify_recovery_hold(self, label):
+        state = self.recovery_state()
+        authority = read_json(CONTROL / 'authority.json')
+        require(state.get('schema_version') == 1 and state.get('minimum_updater_protocol') == 5 and
+                state.get('instance_id') == 'primary' and state.get('phase') == 'http_ready' and
+                state.get('host_id') == self.source_recovery_state.get('host_id') and
+                state.get('epoch') != self.source_recovery_state.get('epoch') and
+                re.fullmatch(r'[a-f0-9]{32}', state.get('epoch', '')) and state.get('transaction_id') and
+                authority.get('state') == state and authority.get('data_restored') is True and
+                authority.get('http_opened') is True, 'Restore did not durably rotate the epoch and open HTTP only')
+        manifest = CONTROL / 'quarantine' / state['epoch'] / 'queues.json'
+        require(re.fullmatch(r'[a-f0-9]{64}', authority.get('preparation_sha256', '')) and
+                sha(manifest) == authority.get('redis_manifest_sha256'), 'Durable restore proofs are missing or inconsistent')
+        queue_manifest = read_json(manifest)
+        require(queue_manifest.get('status') == 'pass' and queue_manifest.get('epoch') == state['epoch'] and
+                queue_manifest.get('entries') and self.redis('EXISTS', QUEUE_PROBE_KEY) == '0' and
+                self.redis('ZRANGE', 'geoflow-recovery:' + state['epoch'] + ':payload:' + QUEUE_PROBE_KEY, '0', '-1') == QUEUE_PROBE_VALUE,
+                'Restored delayed work was not moved intact to quarantine')
+        self.record('protocol-5-redis-quarantined', 'Delayed Redis payload was retained in the new epoch quarantine, outside live queues')
+        self.assert_background_held(state)
+        self.record('protocol-5-background-held', 'HTTP and infrastructure are healthy; workers, scheduler and Reverb are held')
+        require(self.query('SELECT count(*) FROM personal_access_tokens;') == '0' and
+                self.query("SELECT auth_version FROM admins WHERE username='admin';") == str(self.source_admin_version + 1),
+                'Backup credentials were not invalidated after restore')
+        self.core_api('GET', 'tasks', token=self.source_token, expected=401)
+        self.assert_session_rejected(self.source_browser, 'A pre-restore administrator session still had access')
+        self.record('protocol-5-credentials-invalidated', 'Old administrator session and API token failed after the recovery generation changed')
+        self.reset_browser()
+        self.login(self.admin_password, read_only=True)
+        token = self.core_token()
+        require(self.core_api('GET', 'tasks', token=token).get('success') is True,
+                'A newly authenticated client could not read tasks')
+        count = self.query('SELECT count(*) FROM tasks;')
+        rejected = self.core_api('POST', 'tasks', payload={}, token=token, expected=503)
+        require(rejected.get('error', {}).get('code') == 'recovery_background_held' and
+                self.query('SELECT count(*) FROM tasks;') == count, 'Restored business writes were not held')
+        self.record('protocol-5-read-only', 'Fresh administrator and API login read the restored site; a business write was rejected without modifying data')
+        self.save('recovery-state-' + label + '.json', state)
+
+    def verify_after_restart(self, *, expect_held):
+        state = self.recovery_state()
+        current_hash = sha(INSTANCE / 'operations/current.json')
+        self.run('systemctl', 'restart', 'geoflow-updater')
+        self.wait_for_agent()
+        require(sha(INSTANCE / 'operations/current.json') == current_hash and self.recovery_state() == state,
+                'Completed recovery repeated or changed generation after restart')
+        if expect_held:
+            self.assert_background_held(state)
+            self.record('protocol-5-hold-after-restart', 'Restart preserved the recovery generation, operation result and background hold')
+
+    def restored(self, label, *, expect_held=True):
         require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'baseline', 'Database marker not restored')
         require(self.redis('GET', 'geoflow:planned-rehearsal:marker') == 'baseline', 'Redis marker not restored')
         require((ROOT / 'storage/app/rehearsal.txt').read_text() == 'baseline', 'Storage marker not restored')
         for path, digest in self.baseline_hashes.items():
             require(sha(path) == digest, 'Restored file differs: ' + path)
         require(self.query('SELECT migration || \':\' || batch FROM migrations ORDER BY migration;') == self.migrations, 'Migration history not restored')
-        self.healthy(label)
-        self.record('restored-' + label, 'Data markers, full configuration hashes, migration history and doctor match the baseline')
+        if expect_held:
+            self.verify_recovery_hold(label)
+        else:
+            require(self.recovery_state() == self.source_recovery_state, 'A pre-checkpoint failure changed recovery authority')
+            self.healthy(label)
+            self.record('pre-checkpoint-resumed', 'Original deployment resumed normally without a data restore or recovery epoch change')
+        self.record('restored-' + label, 'Data markers, full configuration hashes and migration history match the baseline')
 
     def preview(self):
         plan = self.api('GET', 'plan')
         require(plan['strategy'] == 'maintenance' and plan['layout_change'], 'Legacy conversion must require maintenance')
-        require(plan['target_sequence'] == self.manifest['release_sequence'], 'Candidate target sequence changed')
+        signed_plan = self.candidate / 'targets-source' / self.manifest['upgrade_plan_target']
+        source_migrations = {item['name'] for item in self.source_plan['migrations']}
+        expected = [item for item in read_json(signed_plan)['migrations'] if item['name'] not in source_migrations]
+        require(plan['source_sequence'] == LEGACY_BASELINE['release_sequence'] and
+                plan['target_sequence'] == self.manifest['release_sequence'] and
+                plan['target_version'] == self.manifest['version'] and
+                plan['upgrade_plan_sha256'] == sha(signed_plan) == self.identity['targets']['upgrade_plan_sha256'] and
+                plan['pending_migrations'] == expected,
+                'The 3.1.0 upgrade plan did not bind the signed target and exact pending migration set')
         return {'allow_maintenance': True, 'expected_plan_sha256': plan['plan_sha256']}
 
     def crash(self, stage, block_restore=False):
         label = 'recovery-backoff' if block_restore else stage
         self.current = 'crash-' + label
-        self.fixture()
+        self.fixture(recoverable=True)
         payload = self.preview()
         MARKER.unlink(missing_ok=True)
         FAULT.write_text(json.dumps({'stage': stage, 'after': stage in ['upgrade', 'scheduler-freeze']}))
@@ -559,6 +722,8 @@ class Rehearsal:
         transaction = read_json(INSTANCE / 'release-transaction.json')
         expected_stage = 'quiesce' if stage == 'scheduler-freeze' else stage
         require(transaction['stage'] == expected_stage and transaction['operation_id'] == operation['id'], 'Fault hit a different transaction')
+        expect_held = CRASH_STAGES[label]
+        require(bool(transaction.get('recovery_point_id')) == expect_held, 'Fault reached the wrong side of the backup checkpoint')
         scheduler = None
         if stage == 'scheduler-freeze':
             scheduler = self.container('scheduler')
@@ -590,30 +755,36 @@ class Rehearsal:
             if transaction['traffic_opened']:
                 require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Post-traffic data was rewound automatically')
             self.mutate('rollbacks', 'rollback', {'recovery_point_id': result['recovery_point_id']}, 'recover-' + label)
-        self.restored(label)
+        self.restored(label, expect_held=expect_held)
         if scheduler:
             processes = self.run('/usr/bin/docker', 'top', scheduler, '-eo', 'pid,stat')
             require(any(parts[0] == parent and not parts[1].startswith('T') for line in processes.splitlines()[1:] if len(parts := line.split()) == 2), 'Scheduler remained frozen after startup reconciliation')
-        current_hash = sha(INSTANCE / 'operations/current.json')
-        self.run('systemctl', 'restart', 'geoflow-updater')
-        time.sleep(3)
-        require(sha(INSTANCE / 'operations/current.json') == current_hash, 'Completed recovery repeated after restart')
+        self.verify_after_restart(expect_held=expect_held)
         self.record('crash-' + label, 'SIGKILL at the recorded durable stage; correct recovery policy and restart stability')
 
     def upgrade(self):
         self.legacy()
         self.repository(self.candidate / 'tuf/repository')
-        for stage in ['retain-assets', 'quiesce', 'scheduler-freeze', 'backup', 'upgrade', 'layout', 'candidate', 'switch', 'workers', 'observe']:
-            self.crash(stage)
-        self.crash('upgrade', block_restore=True)
+        if self.args.scenario.startswith('crash-'):
+            stage = self.args.scenario.removeprefix('crash-')
+            if stage == 'recovery-backoff':
+                self.crash('upgrade', block_restore=True)
+            else:
+                self.crash(stage)
+            return
         self.current = 'successful-upgrade'
-        self.fixture()
+        self.fixture(recoverable=True)
         result = self.mutate('updates', 'update', self.preview(), 'successful-upgrade')
         checkpoint = result['recovery_point_id']
         config = self.config()
         require(config['layout'] == 'blue-green' and config['release_sequence'] == self.manifest['release_sequence'], 'Candidate was not activated')
         self.healthy('candidate')
-        self.session('after-upgrade')
+        self.assert_session_rejected(self.browser, 'A 3.1.0 session without a recovery epoch survived the protocol transition')
+        self.reset_browser()
+        self.login(self.admin_password, label='after-upgrade')
+        target_plan = read_json(self.candidate / 'targets-source' / self.manifest['upgrade_plan_target'])
+        require(set(self.query('SELECT migration FROM migrations;').splitlines()) ==
+                {item['name'] for item in target_plan['migrations']}, 'Candidate did not apply the complete migration set')
         self.record('signed-upgrade', 'Stable installed deployment converted to the signed candidate with automatic migrations')
         backup = Path('/var/backups/geoflow-updater/primary') / checkpoint
         for name in ['database.dump', 'storage.tar.gz', 'redis.tar.gz', 'site.env', 'version.json', 'managed/instance.yml', 'managed/release.env', 'managed/docker-compose.yml']:
@@ -622,6 +793,7 @@ class Rehearsal:
         self.corrupt('manual-rollback', config=True)
         self.mutate('rollbacks', 'rollback', {'recovery_point_id': checkpoint}, 'manual-rollback')
         self.restored('manual-rollback')
+        self.verify_after_restart(expect_held=True)
         self.record('complete-backup-restore', 'A later manual backup retained the update checkpoint; explicit restore recovered all tested surfaces')
 
     def install(self):
@@ -658,7 +830,7 @@ class Rehearsal:
         if not self.owns_evidence:
             return
         self.save('result.json', {'schema_version': 1, 'candidate_run_id': str(self.identity['candidate_run_id']),
-            'platform': self.args.platform, 'kernel_arch': os.uname().machine, 'mode': self.args.mode,
+            'platform': self.args.platform, 'kernel_arch': os.uname().machine, 'mode': self.args.mode, 'scenario': self.args.scenario,
             'harness_commit': os.environ.get('GITHUB_SHA'), 'result': 'pass' if success else 'fail',
             'failed_check': '' if success else self.current, 'checks': self.checks})
         if self.installed:
@@ -689,8 +861,13 @@ def main():
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--evidence', required=True)
     parser.add_argument('--platform', required=True, choices=['linux-amd64', 'linux-arm64'])
-    parser.add_argument('--mode', required=True, choices=['upgrade', 'install', 'online', 'enrollment'])
-    rehearsal = Rehearsal(parser.parse_args())
+    parser.add_argument('--mode', required=True, choices=MODES)
+    parser.add_argument('--scenario', choices=SCENARIOS, help='Run one independently initialized host scenario')
+    args = parser.parse_args()
+    args.scenario = args.scenario or args.mode
+    if args.scenario != args.mode and not (args.mode == 'upgrade' and args.scenario.startswith('crash-')):
+        parser.error('scenario does not belong to the selected mode')
+    rehearsal = Rehearsal(args)
     success = False
     try:
         rehearsal.setup()

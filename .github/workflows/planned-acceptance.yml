@@ -1,4 +1,4 @@
-name: Accept planned candidate application and ingress contracts
+name: Accept planned candidate on native Linux hosts
 
 on:
   workflow_dispatch:
@@ -90,7 +90,11 @@ jobs:
           archive="rehearsal/candidate/dist/geoflow-updater_${updater_version}_linux_${ARCHIVE_ARCH}.tar.gz"
           expected_sha="$(jq -er --arg platform "$PLATFORM" '.updater.archives[$platform]' rehearsal/candidate/candidate.json)"
           test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$expected_sha"
-          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
+            --source-digest "$candidate_sha"
+      - name: Install recovery verification dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y php-cli php-sqlite3 redis-server
       - name: Exercise the candidate app and real ingress
         env:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
@@ -101,11 +105,13 @@ jobs:
           install -d -m 0700 "$GITHUB_WORKSPACE/rehearsal/evidence/$PLATFORM"
           docker pull nginx:1.31.1-alpine
           docker pull python:3.12-alpine
+          docker pull php:8.4-cli
           go test -race ./...
           GEOFLOW_DOCKER_TEST=1 go test ./internal/deployment -run 'TestDockerIngress|TestDockerLegacyScheduler' -v > "rehearsal/evidence/$PLATFORM/ingress.txt"
           bash scripts/planned-candidate-acceptance.sh rehearsal/candidate "rehearsal/evidence/$PLATFORM"
           jq -n --arg platform "$PLATFORM" --arg kernel_arch "$KERNEL_ARCH" --arg candidate_run_id "$CANDIDATE_RUN_ID" \
-            '{schema_version:1,platform:$platform,kernel_arch:$kernel_arch,candidate_run_id:$candidate_run_id,result:"pass",verification_scope:"planned-container-contract-and-ingress",checks:["signed-image-identity","fresh-migrations","first-install","backfills","cache-compilation","standalone-readiness","install-idempotency","real-ingress-switch-and-stream"]}' \
+            --arg harness_commit "$GITHUB_SHA" \
+            '{schema_version:1,platform:$platform,kernel_arch:$kernel_arch,candidate_run_id:$candidate_run_id,harness_commit:$harness_commit,result:"pass",verification_scope:"planned-container-contract-and-ingress",checks:["signed-image-identity","fresh-migrations","first-install","backfills","cache-compilation","standalone-readiness","install-idempotency","real-ingress-switch-and-stream"]}' \
             > "rehearsal/evidence/$PLATFORM/result.json"
       - name: Upload architecture evidence
         if: ${{ always() }}
@@ -117,36 +123,33 @@ jobs:
           retention-days: 30
 
   host:
-    name: ${{ matrix.platform }} installed host ${{ matrix.mode }}
+    name: ${{ matrix.platform }} installed host ${{ matrix.scenario }}
     needs: rehearse
     strategy:
       fail-fast: false
       matrix:
+        platform: [linux-amd64, linux-arm64]
+        scenario:
+          - upgrade
+          - install
+          - online
+          - enrollment
+          - crash-retain-assets
+          - crash-quiesce
+          - crash-scheduler-freeze
+          - crash-backup
+          - crash-upgrade
+          - crash-layout
+          - crash-candidate
+          - crash-switch
+          - crash-workers
+          - crash-observe
+          - crash-recovery-backoff
         include:
           - platform: linux-amd64
             runner: ubuntu-24.04
-            mode: upgrade
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
-            mode: upgrade
-          - platform: linux-amd64
-            runner: ubuntu-24.04
-            mode: install
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            mode: install
-          - platform: linux-amd64
-            runner: ubuntu-24.04
-            mode: online
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            mode: online
-          - platform: linux-amd64
-            runner: ubuntu-24.04
-            mode: enrollment
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            mode: enrollment
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:
@@ -171,20 +174,21 @@ jobs:
         env:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           PLATFORM: ${{ matrix.platform }}
-          MODE: ${{ matrix.mode }}
+          MODE: ${{ startsWith(matrix.scenario, 'crash-') && 'upgrade' || matrix.scenario }}
+          SCENARIO: ${{ matrix.scenario }}
         run: |
           install -d -m 0700 "$GITHUB_WORKSPACE/rehearsal/host-evidence"
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_REPOSITORY,GITHUB_SHA,CANDIDATE_RUN_ID \
             /usr/bin/python3 scripts/planned-host-rehearsal.py \
             --candidate "$GITHUB_WORKSPACE/rehearsal/candidate" \
-            --evidence "$GITHUB_WORKSPACE/rehearsal/host-evidence/$PLATFORM-$MODE" \
-            --platform "$PLATFORM" --mode "$MODE"
+            --evidence "$GITHUB_WORKSPACE/rehearsal/host-evidence/$PLATFORM-$SCENARIO" \
+            --platform "$PLATFORM" --mode "$MODE" --scenario "$SCENARIO"
       - name: Upload installed-host evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: planned-host-${{ matrix.platform }}-${{ matrix.mode }}
-          path: rehearsal/host-evidence/${{ matrix.platform }}-${{ matrix.mode }}
+          name: planned-host-${{ matrix.platform }}-${{ matrix.scenario }}
+          path: rehearsal/host-evidence/${{ matrix.platform }}-${{ matrix.scenario }}
           if-no-files-found: error
           retention-days: 30
 
@@ -229,6 +233,7 @@ jobs:
           test "$HOST_JOB_RESULT" = success
           test "$REHEARSAL_JOB_RESULT" = success
           python3 scripts/planned-evidence.py assemble --root evidence --run-url "$run_url" \
+            --harness-commit "$GITHUB_SHA" \
             --output evidence/publication/evidence-template.json
           jq . evidence/publication/evidence-template.json
       - name: Upload the publication evidence template

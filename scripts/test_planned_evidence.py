@@ -1,4 +1,5 @@
 """Reject incomplete or mixed-candidate publication evidence."""
+import base64
 import copy
 import importlib.util
 import json
@@ -15,26 +16,36 @@ spec.loader.exec_module(gate)
 
 def complete():
     candidate = {'candidate_run_id': '123', 'updater': {'commit': 'a' * 40}}
-    evidence = {'schema_version': 1, 'candidate': candidate,
+    evidence = {'schema_version': 2, 'candidate': candidate, 'harness_commit': candidate['updater']['commit'],
                 'verification_scope': 'planned-container-contract-and-ingress',
                 'installed_host_scope': gate.SCOPE, 'architectures': {},
                 'approvals': {role: {'name': role, 'decision': 'approved'} for role in
                               ['release_operator', 'security_reviewer', 'product_owner']}}
     for platform, kernel in gate.PLATFORMS.items():
         common = {'schema_version': 1, 'candidate_run_id': '123', 'platform': platform,
-                  'kernel_arch': kernel, 'result': 'pass'}
+                  'kernel_arch': kernel, 'result': 'pass', 'harness_commit': evidence['harness_commit']}
         evidence['architectures'][platform] = {
             'result': 'pass', 'evidence_link': 'https://github.com/yaojingang/geoflow-updater/actions/runs/456',
-            'container': {**common, 'checks': sorted(gate.CONTAINER_CHECKS)},
-            'hosts': {mode: {**common, 'mode': mode,
-                            'checks': [{'id': name, 'status': 'pass'} for name in sorted(required)]}
-                      for mode, required in gate.HOST_CHECKS.items()}}
+            'container': {**common, 'verification_scope': gate.CONTAINER_SCOPE, 'checks': sorted(gate.CONTAINER_CHECKS)},
+            'hosts': {scenario: {**common, 'mode': 'upgrade' if scenario.startswith('crash-') else scenario,
+                                'scenario': scenario, 'checks': [{'id': name, 'status': 'pass'} for name in sorted(required)]}
+                      for scenario, required in gate.HOST_CHECKS.items()}}
     return evidence, copy.deepcopy(candidate)
 
 
 class EvidenceTests(unittest.TestCase):
     def test_complete_same_candidate(self):
         gate.validate(*complete(), approved=True)
+
+    def test_harness_only_rerun_can_report_but_cannot_authorize_publication(self):
+        evidence, candidate = complete()
+        evidence['harness_commit'] = 'b' * 40
+        for architecture in evidence['architectures'].values():
+            for result in [architecture['container'], *architecture['hosts'].values()]:
+                result['harness_commit'] = evidence['harness_commit']
+        gate.validate(evidence, candidate)
+        with self.assertRaisesRegex(ValueError, 'exact candidate harness commit'):
+            gate.validate(evidence, candidate, approved=True)
 
     def test_same_version_enrollment_cannot_be_omitted(self):
         for platform in ['linux-amd64', 'linux-arm64']:
@@ -47,7 +58,8 @@ class EvidenceTests(unittest.TestCase):
     def test_enrollment_requires_the_complete_restored_identity_lifecycle(self):
         required = ['native-candidate-install', 'unmanaged-candidate-site', 'legacy-enrollment', 'session-login',
                     'same-sequence-enrollment', 'same-sequence-layout-conversion', 'restored-enrollment-legacy',
-                    'same-sequence-enrollment-retry', 'session-after-enrollment-retry', 'enrollment-repeat-rejected']
+                    'same-sequence-enrollment-retry-blocked', 'enrollment-repeat-rejected',
+                    'protocol-5-credentials-invalidated', 'protocol-5-read-only', 'protocol-5-hold-after-restart']
         for platform in ['linux-amd64', 'linux-arm64']:
             for missing in required:
                 with self.subTest(platform=platform, missing=missing):
@@ -91,6 +103,13 @@ class EvidenceTests(unittest.TestCase):
             'emulated architecture': lambda e: e['architectures']['linux-arm64']['hosts']['install'].update(kernel_arch='x86_64'),
             'failed case': lambda e: e['architectures']['linux-amd64']['hosts']['upgrade']['checks'][0].update(status='fail'),
             'swapped mode': lambda e: e['architectures']['linux-amd64']['hosts']['install'].update(mode='upgrade'),
+            'omitted isolated crash scenario': lambda e: e['architectures']['linux-arm64']['hosts'].pop('crash-layout'),
+            'wrong crash scenario': lambda e: e['architectures']['linux-arm64']['hosts']['crash-layout'].update(scenario='crash-upgrade'),
+            'mixed harness': lambda e: e['architectures']['linux-arm64']['hosts']['crash-upgrade'].update(harness_commit='c' * 40),
+            'missing hold evidence': lambda e: e['architectures']['linux-amd64']['hosts']['crash-observe'].update(
+                checks=[{'id': key, 'status': 'pass'} for key in sorted(gate.HOST_CHECKS['crash-observe'] - gate.HELD_CHECKS)]),
+            'contradictory hold evidence': lambda e: e['architectures']['linux-amd64']['hosts']['crash-workers']['checks'].append(
+                {'id': 'pre-checkpoint-resumed', 'status': 'pass'}),
             'different source': lambda e: e['candidate']['updater'].update(commit='b' * 40),
             'pending approval': lambda e: e['approvals']['product_owner'].update(decision='pending'),
             'blank reviewer': lambda e: e['approvals']['security_reviewer'].update(name='  '),
@@ -101,6 +120,32 @@ class EvidenceTests(unittest.TestCase):
                 mutate(evidence)
                 with self.assertRaises((ValueError, KeyError)):
                     gate.validate(evidence, candidate, approved=True)
+
+    def test_assembly_uses_all_native_reports_and_keeps_private_diagnostics_out_of_approval(self):
+        evidence, candidate = complete()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def write(path, value):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(value))
+
+            write(root / 'candidate/candidate.json', candidate)
+            for platform, architecture in evidence['architectures'].items():
+                write(root / f'architectures/planned-acceptance-{platform}/result.json', architecture['container'])
+                for scenario, result in architecture['hosts'].items():
+                    for check in result['checks']:
+                        check['evidence'] = 'private diagnostics stay in the native artifact'
+                    write(root / f'hosts/planned-host-{platform}-{scenario}/result.json', result)
+            assembled = gate.assemble(root, 'https://github.com/yaojingang/geoflow-updater/actions/runs/456',
+                                      evidence['harness_commit'])
+            self.assertNotIn('private diagnostics', json.dumps(assembled))
+            self.assertEqual(sum(len(architecture['hosts']) for architecture in assembled['architectures'].values()), 30)
+            for approval in assembled['approvals'].values():
+                approval.update(name='Named release reviewer', decision='approved')
+            gate.validate(assembled, candidate, approved=True)
+            encoded = base64.b64encode((json.dumps(assembled, separators=(',', ':')) + '\n').encode())
+            self.assertLess(len(encoded), gate.GITHUB_SECRET_LIMIT)
 
 
 if __name__ == '__main__':
