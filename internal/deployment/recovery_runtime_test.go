@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yaojingang/geoflow-updater/internal/instance"
 	"github.com/yaojingang/geoflow-updater/internal/recovery"
 	"github.com/yaojingang/geoflow-updater/internal/recoverycontrol"
 	"gopkg.in/yaml.v3"
@@ -79,6 +80,67 @@ func TestMaintenanceRecoveryInspectsBeforeRemovingDatabaseNetwork(t *testing.T) 
 	err := service.restoreBeforeTraffic(context.Background(), &tx)
 	if !restored {
 		t.Fatalf("restore did not inspect administrators while the database was reachable: %v", err)
+	}
+}
+
+type observedRestoreStore struct {
+	topologyRecoveryStore
+	request *recovery.RestoreRequest
+}
+
+func (s *observedRestoreStore) Restore(_ context.Context, _ instance.Config, request recovery.RestoreRequest, _ recovery.Database) error {
+	s.request = &request
+	return nil
+}
+
+func TestExplicitRetryUsesOnlyTheUnopenedSamePointAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		different    bool
+		dataRestored bool
+	}{
+		{name: "same point while restoring"},
+		{name: "different point", different: true},
+		{name: "restored data requires fresh inspection", dataRestored: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, legacy, _, tx := recoveryTopologyFixture(t)
+			const previous = "failed-explicit-restore"
+			digest := strings.Repeat("c", 64)
+			control := service.recoveryControl()
+			if _, err := control.Begin(legacy.ID, tx.RecoveryPointID, previous, digest); err != nil {
+				t.Fatal(err)
+			}
+			if tc.dataRestored {
+				if _, err := control.Restored(legacy.ID, previous); err != nil {
+					t.Fatal(err)
+				}
+			}
+			point := tx.RecoveryPointID
+			if tc.different {
+				point = "20260908T010000Z-5678abcd"
+			}
+			store := &observedRestoreStore{topologyRecoveryStore: topologyRecoveryStore{
+				point: recovery.Point{ID: point, Deployment: &legacy},
+			}}
+			service.Recoveries = store
+			inspectErr := errors.New("previous topology has no reachable administrator database")
+			service.Runner = recoveryFixtureRunner(func(_ context.Context, _ io.Reader, _ io.Writer, _ string, args ...string) error {
+				if isRecoveryInspect(args) {
+					return inspectErr
+				}
+				return nil
+			})
+			const next = "new-explicit-restore"
+			err := service.Rollback(context.Background(), legacy.ID, recovery.RestoreRequest{PointID: point, TransactionID: next})
+			if tc.different || tc.dataRestored {
+				if !errors.Is(err, inspectErr) || store.request != nil {
+					t.Fatalf("unverified recovery reached restoration: %v", err)
+				}
+			} else if err != nil || store.request == nil || store.request.AdminDigest != digest || store.request.TransactionID != next || store.request.PointID != point {
+				t.Fatalf("same point did not retain the verified administrator identity under a new authorization: request=%+v error=%v", store.request, err)
+			}
+		})
 	}
 }
 

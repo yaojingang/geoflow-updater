@@ -31,6 +31,8 @@ INSTANCE = STATE / 'instances/primary'
 FAULT = STATE / 'planned-rehearsal-fault.json'
 MARKER = STATE / 'planned-rehearsal-hit.json'
 RESTORE_FAULT = STATE / 'planned-rehearsal-block-restore'
+RESTORE_ATTEMPTS = STATE / 'planned-rehearsal-restore-attempts.jsonl'
+BACKUPS = Path('/var/backups/geoflow-updater/primary')
 SOCKET = '/run/geoflow-updater/geoflow-updater.sock'
 REPO = Path(__file__).resolve().parent.parent
 CONTROL = STATE / 'recovery-control/primary'
@@ -565,7 +567,7 @@ class Rehearsal:
         self.restored('enrollment-legacy')
         require(not self.config().get('layout') and self.config().get('enrolled_release_sha256') == proof,
                 'Full restoration did not restore the legacy enrollment identity')
-        self.verify_after_restart(expect_held=True)
+        self.verify_after_restart()
         rejection = self.api('GET', 'plan', expected=503)
         require(rejection.get('error') == 'plan_failed', 'A held restore allowed another conversion')
         self.record('same-sequence-enrollment-retry-blocked',
@@ -605,8 +607,17 @@ class Rehearsal:
                 stream.write('\nGEOFLOW_REHEARSAL_AFTER_BACKUP=changed\n')
             with (INSTANCE / 'release.env').open('a') as stream:
                 stream.write('\n# rehearsal-after-backup\n')
+        self.assert_fixture_values('changed')
         self.record('changed-' + label, 'Verified non-baseline database, Redis and storage markers before restoration')
-        require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Corruption fixture did not write')
+
+    def assert_fixture_values(self, value, *, check_redis=True):
+        require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == value,
+                'Unexpected database marker, expected ' + value)
+        if check_redis:
+            require(self.redis('GET', 'geoflow:planned-rehearsal:marker') == value,
+                    'Unexpected Redis marker, expected ' + value)
+        require((ROOT / 'storage/app/rehearsal.txt').read_text() == value,
+                'Unexpected storage marker, expected ' + value)
 
     def recovery_state(self):
         return read_json(CONTROL / 'public/state.json')
@@ -662,30 +673,25 @@ class Rehearsal:
         self.record('protocol-5-read-only', 'Fresh administrator and API login read the restored site; a business write was rejected without modifying data')
         self.save('recovery-state-' + label + '.json', state)
 
-    def verify_after_restart(self, *, expect_held):
+    def verify_after_restart(self):
         state = self.recovery_state()
-        current_hash = sha(INSTANCE / 'operations/current.json')
+        current = self.api('GET', 'operations/current')
+        attempts = self.restore_attempts()
+        require(current.get('status') == 'succeeded', 'Expected a completed restore before the restart')
         self.run('systemctl', 'restart', 'geoflow-updater')
         self.wait_for_agent()
-        require(sha(INSTANCE / 'operations/current.json') == current_hash and self.recovery_state() == state,
+        require(self.api('GET', 'operations/current') == current and self.recovery_state() == state and
+                self.restore_attempts() == attempts,
                 'Completed recovery repeated or changed generation after restart')
-        if expect_held:
-            self.assert_background_held(state)
-            self.record('protocol-5-hold-after-restart', 'Restart preserved the recovery generation, operation result and background hold')
+        self.assert_background_held(state)
+        self.record('protocol-5-hold-after-restart', 'Restart preserved the recovery generation, operation result and background hold')
 
-    def restored(self, label, *, expect_held=True):
-        require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'baseline', 'Database marker not restored')
-        require(self.redis('GET', 'geoflow:planned-rehearsal:marker') == 'baseline', 'Redis marker not restored')
-        require((ROOT / 'storage/app/rehearsal.txt').read_text() == 'baseline', 'Storage marker not restored')
+    def restored(self, label):
+        self.assert_fixture_values('baseline')
         for path, digest in self.baseline_hashes.items():
             require(sha(path) == digest, 'Restored file differs: ' + path)
         require(self.query('SELECT migration || \':\' || batch FROM migrations ORDER BY migration;') == self.migrations, 'Migration history not restored')
-        if expect_held:
-            self.verify_recovery_hold(label)
-        else:
-            require(self.recovery_state() == self.source_recovery_state, 'A pre-checkpoint failure changed recovery authority')
-            self.healthy(label)
-            self.record('pre-checkpoint-resumed', 'Original deployment resumed normally without a data restore or recovery epoch change')
+        self.verify_recovery_hold(label)
         self.record('restored-' + label, 'Data markers, full configuration hashes and migration history match the baseline')
 
     def preview(self):
@@ -702,10 +708,115 @@ class Rehearsal:
                 'The 3.1.0 upgrade plan did not bind the signed target and exact pending migration set')
         return {'allow_maintenance': True, 'expected_plan_sha256': plan['plan_sha256']}
 
+    def verify_legacy_point(self, point, reason):
+        require(re.fullmatch(r'[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}', point or ''), 'Invalid recovery point identity')
+        backup = BACKUPS / point
+        manifest_path = backup / 'manifest.json'
+        manifest = read_json(manifest_path)
+        require(manifest['schema_version'] == 1 and manifest['id'] == point and manifest['instance_id'] == 'primary' and
+                manifest['root'] == str(ROOT) and manifest['reason'] == reason and
+                manifest['release_sequence'] == LEGACY_BASELINE['release_sequence'] and
+                manifest['version'] == LEGACY_BASELINE['version'] and not manifest['deployment'].get('layout'),
+                'Recovery point did not capture the expected legacy deployment')
+        config_files = {'site.env': ROOT / '.env.prod', 'version.json': ROOT / 'version.json',
+                        'managed/instance.yml': INSTANCE / 'instance.yml', 'managed/release.env': INSTANCE / 'release.env',
+                        'managed/docker-compose.yml': INSTANCE / 'docker-compose.managed.yml'}
+        require(set(manifest['files']) == set(config_files) | {'database.dump', 'redis.tar.gz', 'storage.tar.gz'},
+                'Recovery point manifest did not cover every backup component')
+        for name, entry in manifest['files'].items():
+            path = backup / name
+            digest = sha(path)
+            require(path.stat().st_size == entry['size'] > 0 and digest == entry['sha256'],
+                    'Recovery point component checksum or length differs: ' + name)
+            if name in config_files:
+                require(digest == self.baseline_hashes[str(config_files[name])], 'Backup configuration differs: ' + name)
+        self.save('verified-recovery-point.json', {'id': point, 'reason': reason, 'manifest_sha256': sha(manifest_path),
+                                                  'components': sorted(manifest['files'])})
+
+    def restore_attempts(self):
+        if not RESTORE_ATTEMPTS.exists():
+            return []
+        return [json.loads(line) for line in RESTORE_ATTEMPTS.read_text().splitlines()]
+
+    def require_recovery_pending(self, operation, identity, point, kind):
+        require(operation['id'] == identity and operation['kind'] == kind and
+                operation['status'] == 'recovery_required' and operation.get('completed_at') and
+                operation.get('recovery_point_id') == point,
+                'Interrupted operation lost its recovery hold or point identity: ' + json.dumps(operation))
+
+    def assert_mutations_blocked(self, payload):
+        rejected_backup = self.api('POST', 'backups', scope='backup', expected=409)
+        rejected_update = self.api('POST', 'updates', payload, 'update', expected=409)
+        require(rejected_backup.get('error') == rejected_update.get('error') == 'operation_active',
+                'Recovery hold did not reject unrelated mutations')
+
+    def explicit_rollback(self, point, label, *, manual):
+        if manual:
+            # The web API is restricted to the latest update checkpoint.
+            result = json.loads(self.run('geoflow-updater', 'rollback', '--instance', 'primary',
+                                         '--recovery-point', point, '--json'))
+            self.save('operation-' + label + '.json', result)
+            return result
+        return self.mutate('rollbacks', 'rollback', {'recovery_point_id': point}, label)
+
+    def exercise_restore_backoff(self, point, update_id, payload):
+        RESTORE_FAULT.touch(mode=0o600)
+        try:
+            started = self.api('POST', 'rollbacks', {'recovery_point_id': point}, 'rollback', expected=202)
+            require(started['id'] != update_id, 'Rollback reused the interrupted update identity')
+            failed = self.operation(started['id'], ['recovery_required'], 'failed-explicit-rollback')
+            self.require_recovery_pending(failed, started['id'], point, 'rollback')
+            state = self.recovery_state()
+            attempts = self.restore_attempts()
+            require(state['phase'] == 'restoring' and state['transaction_id'] == failed['id'] and
+                    state['epoch'] != self.source_recovery_state['epoch'] and attempts ==
+                    [{'transaction_id': failed['id'], 'epoch': state['epoch'], 'point_id': point, 'blocked': True}],
+                    'The injected fault did not block the authorized PostgreSQL restore')
+
+            def backoff(after_attempt):
+                current = self.api('GET', 'operations/current')
+                self.require_recovery_pending(current, failed['id'], point, 'rollback')
+                if current.get('reconcile_attempts', 0) > after_attempt and current.get('next_reconcile_at'):
+                    return current
+                return None
+
+            before_restart = self.wait(lambda: backoff(0), 'rollback recovery backoff', timeout=45)
+            self.assert_mutations_blocked(payload)
+        finally:
+            RESTORE_FAULT.unlink(missing_ok=True)
+        self.run('systemctl', 'restart', 'geoflow-updater')
+        self.wait_for_agent()
+        restarted = self.api('GET', 'operations/current')
+        self.require_recovery_pending(restarted, failed['id'], point, 'rollback')
+        require(restarted.get('reconcile_attempts', 0) >= before_restart['reconcile_attempts'] and
+                restarted.get('next_reconcile_at', '') >= before_restart['next_reconcile_at'],
+                'Rollback backoff did not survive the updater restart')
+        after_restart = self.wait(lambda: backoff(restarted['reconcile_attempts']),
+                                  'rollback reconciliation after restart', timeout=180)
+        require(after_restart['next_reconcile_at'] > restarted['next_reconcile_at'] and
+                self.recovery_state() == state and self.restore_attempts() == attempts,
+                'Reconciliation changed the recovery generation or attempted PostgreSQL restoration')
+        self.save('rollback-backoff.json', {'before_restart': before_restart, 'restarted': restarted,
+                                          'after_restart': after_restart,
+                                          'attempts': attempts})
+        self.record('rollback-backoff-held', 'A failed explicit PostgreSQL restore retained its identity and backoff across restart without replay')
+        return failed
+
     def crash(self, stage, block_restore=False):
         label = 'recovery-backoff' if block_restore else stage
         self.current = 'crash-' + label
         self.fixture(recoverable=True)
+        source_authority = read_json(CONTROL / 'authority.json')
+        require(source_authority['state'] == self.source_recovery_state, 'Source recovery authority differed from its published state')
+        expect_checkpoint = CRASH_STAGES[label]
+        manual_point = None
+        if not expect_checkpoint:
+            backup = self.mutate('backups', 'backup', label='pre-interruption-backup')
+            manual_point = backup.get('recovery_point_id')
+            require(backup['kind'] == 'backup', 'Fallback point was not made by a manual backup')
+            self.verify_legacy_point(manual_point, 'manual-backup')
+            self.record('manual-recovery-point', 'Verified a complete independent legacy backup before interrupting the upgrade')
+            self.corrupt(label)
         payload = self.preview()
         MARKER.unlink(missing_ok=True)
         FAULT.write_text(json.dumps({'stage': stage, 'after': stage in ['upgrade', 'scheduler-freeze']}))
@@ -722,44 +833,56 @@ class Rehearsal:
         transaction = read_json(INSTANCE / 'release-transaction.json')
         expected_stage = 'quiesce' if stage == 'scheduler-freeze' else stage
         require(transaction['stage'] == expected_stage and transaction['operation_id'] == operation['id'], 'Fault hit a different transaction')
-        expect_held = CRASH_STAGES[label]
-        require(bool(transaction.get('recovery_point_id')) == expect_held, 'Fault reached the wrong side of the backup checkpoint')
-        scheduler = None
+        checkpoint = transaction.get('recovery_point_id')
+        require(bool(checkpoint) == expect_checkpoint, 'Fault reached the wrong side of the backup checkpoint')
         if stage == 'scheduler-freeze':
             scheduler = self.container('scheduler')
             parent = self.run('/usr/bin/docker', 'inspect', '--format', '{{.State.Pid}}', scheduler)
             processes = self.run('/usr/bin/docker', 'top', scheduler, '-eo', 'pid,stat')
             require(any(parts[0] == parent and parts[1].startswith('T') for line in processes.splitlines()[1:] if len(parts := line.split()) == 2), 'Scheduler spawner was not frozen at interruption')
+            self.record('scheduler-frozen-at-interruption', 'The original scheduler PID was stopped when the updater was killed')
         self.save('interrupted-' + label + '.json', {'stage': stage, 'operation_id': operation['id'],
-                  'traffic_opened': transaction['traffic_opened'], 'recovery_point_id': transaction.get('recovery_point_id')})
-        if transaction.get('recovery_point_id'):
+                  'traffic_opened': transaction['traffic_opened'], 'recovery_point_id': checkpoint,
+                  'manual_recovery_point_id': manual_point})
+        if checkpoint:
+            self.verify_legacy_point(checkpoint, 'update-to-' + self.manifest['version'])
+            self.record('update-recovery-point', 'Verified the exact complete update checkpoint recorded before the interruption')
             self.corrupt(label)
-        if block_restore:
-            RESTORE_FAULT.touch(mode=0o600)
         self.run('systemctl', 'kill', '--signal=SIGKILL', '--kill-whom=all', 'geoflow-updater')
         FAULT.unlink()
         self.run('systemctl', 'restart', 'geoflow-updater')
-        expected = 'recovery_required' if transaction['traffic_opened'] or block_restore else ('rolled_back' if transaction.get('recovery_point_id') else 'failed')
-        result = self.operation(operation['id'], [expected], label)
-        if block_restore:
-            require(result['reconcile_attempts'] >= 1 and result.get('next_reconcile_at'), 'Recovery backoff was not persisted')
-            require('restore' in result.get('error', '').lower(), 'Recovery did not reach injected restore failure')
-            self.api('POST', 'backups', scope='backup', expected=409)
-            require(self.api('GET', 'operations/current')['id'] == operation['id'], 'Blocked write replaced interrupted operation')
-            self.run('systemctl', 'restart', 'geoflow-updater')
-            time.sleep(2)
-            current = self.api('GET', 'operations/current')
-            require(current['status'] == 'recovery_required' and current['recovery_point_id'] == result['recovery_point_id'], 'Recovery state lost after restart')
-            RESTORE_FAULT.unlink()
-        if expected == 'recovery_required':
-            if transaction['traffic_opened']:
-                require(self.query('SELECT value FROM geoflow_rehearsal_markers WHERE id=1;') == 'changed', 'Post-traffic data was rewound automatically')
-            self.mutate('rollbacks', 'rollback', {'recovery_point_id': result['recovery_point_id']}, 'recover-' + label)
-        self.restored(label, expect_held=expect_held)
-        if scheduler:
-            processes = self.run('/usr/bin/docker', 'top', scheduler, '-eo', 'pid,stat')
-            require(any(parts[0] == parent and not parts[1].startswith('T') for line in processes.splitlines()[1:] if len(parts := line.split()) == 2), 'Scheduler remained frozen after startup reconciliation')
-        self.verify_after_restart(expect_held=expect_held)
+        result = self.operation(operation['id'], ['recovery_required'], label)
+        self.require_recovery_pending(result, operation['id'], checkpoint, 'update')
+        self.assert_mutations_blocked(payload)
+        self.require_recovery_pending(self.api('GET', 'operations/current'), operation['id'], checkpoint, 'update')
+        journal = read_json(INSTANCE / 'release-transaction.json')
+        require(journal['status'] == 'recovery_required' and all(journal.get(key) == transaction.get(key) for key in
+                ['operation_id', 'stage', 'traffic_opened', 'recovery_point_id']), 'Updater changed the interrupted release boundary')
+        require(self.recovery_state() == self.source_recovery_state and
+                read_json(CONTROL / 'authority.json') == source_authority and not self.restore_attempts(),
+                'The interrupted upgrade triggered automatic data restoration')
+        # The backup-stage interruption leaves Redis stopped after its graceful drain.
+        self.assert_fixture_values('changed', check_redis=stage != 'backup')
+        self.record('maintenance-interruption-held', 'Restart preserved the update identity and changed data without a restore attempt or epoch rotation and blocked new mutations')
+        point = checkpoint or manual_point
+        failed = self.exercise_restore_backoff(point, operation['id'], payload) if block_restore else None
+        attempts_before_restore = self.restore_attempts()
+        restored = self.explicit_rollback(point, 'recover-' + label, manual=not checkpoint)
+        authority = read_json(CONTROL / 'authority.json')
+        state = self.recovery_state()
+        require(restored['status'] == 'succeeded' and restored['kind'] == 'rollback' and restored.get('recovery_point_id') == point and
+                restored['id'] != operation['id'] and (failed is None or restored['id'] != failed['id']) and
+                state['transaction_id'] == restored['id'] and authority.get('point_id') == point,
+                'Restoration did not complete under the explicitly authorized identity')
+        attempts = self.restore_attempts()
+        require(attempts == attempts_before_restore + [
+                {'transaction_id': restored['id'], 'epoch': state['epoch'], 'point_id': point, 'blocked': False}],
+                'Authorized restoration did not produce exactly one PostgreSQL restore attempt')
+        self.record('explicit-data-restore', 'A new authorized operation restored the selected point under its own recovery generation')
+        self.restored(label)
+        self.verify_after_restart()
+        require(self.restore_attempts() == attempts, 'Completed restoration was replayed after restart')
+        self.save('restore-attempts-' + label + '.json', attempts)
         self.record('crash-' + label, 'SIGKILL at the recorded durable stage; correct recovery policy and restart stability')
 
     def upgrade(self):
@@ -793,7 +916,7 @@ class Rehearsal:
         self.corrupt('manual-rollback', config=True)
         self.mutate('rollbacks', 'rollback', {'recovery_point_id': checkpoint}, 'manual-rollback')
         self.restored('manual-rollback')
-        self.verify_after_restart(expect_held=True)
+        self.verify_after_restart()
         self.record('complete-backup-restore', 'A later manual backup retained the update checkpoint; explicit restore recovered all tested surfaces')
 
     def install(self):

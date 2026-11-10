@@ -38,6 +38,24 @@ type recoveryReport struct {
 	QuarantineSHA256       string `json:"quarantine_sha256,omitempty"`
 }
 
+func (service *Service) prepareExplicitRestore(ctx context.Context, config instance.Config, request recovery.RestoreRequest) (recovery.RestoreRequest, error) {
+	if !safeOperationID(request.TransactionID) {
+		return request, errors.New("recovery requires a stable operation identity")
+	}
+	state, err := service.recoveryControl().Read(config.ID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return request, err
+	}
+	if err == nil && state.State.Phase == "restoring" && !state.DataRestored && !state.HTTPOpened &&
+		state.PointID == request.PointID && state.State.TransactionID != nil && *state.State.TransactionID != request.TransactionID {
+		// A failed restore can remove the inspection network. The verified point
+		// and administrator identity remain bound while its HTTP is still closed.
+		request.AdminDigest = state.AdminDigest
+		return request, nil
+	}
+	return service.prepareRestore(ctx, config, request)
+}
+
 func (service *Service) prepareRestore(ctx context.Context, config instance.Config, request recovery.RestoreRequest) (recovery.RestoreRequest, error) {
 	if !safeOperationID(request.TransactionID) {
 		return request, errors.New("recovery requires a stable operation identity")

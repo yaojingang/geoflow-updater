@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 
 PLATFORMS = {'linux-amd64': 'x86_64', 'linux-arm64': 'aarch64'}
-SCOPE = 'protocol-5-maintenance-upgrade-held-restore-isolated-crashes-install-enrollment-and-online-fixture'
+SCOPE = 'protocol-5-maintenance-upgrade-explicit-held-restore-isolated-crashes-install-enrollment-and-online-fixture'
 CONTAINER_SCOPE = 'planned-container-contract-and-ingress'
 GITHUB_SECRET_LIMIT = 48_000
 CONTAINER_CHECKS = {'signed-image-identity', 'fresh-migrations', 'first-install', 'backfills',
@@ -18,6 +18,7 @@ HELD_CHECKS = {'protocol-5-redis-quarantined', 'protocol-5-background-held',
 LEGACY_CHECKS = {'native-candidate-install', 'legacy-enrollment', 'official-310-baseline', 'session-login'}
 PRE_CHECKPOINT = {'retain-assets', 'quiesce', 'scheduler-freeze', 'backup'}
 POST_CHECKPOINT = {'upgrade', 'layout', 'candidate', 'switch', 'workers', 'observe', 'recovery-backoff'}
+CRASH_CHECKS = LEGACY_CHECKS | HELD_CHECKS | {'maintenance-interruption-held', 'explicit-data-restore'}
 HOST_CHECKS = {
     'enrollment': {'native-candidate-install', 'unmanaged-candidate-site', 'legacy-enrollment', 'session-login',
                    'same-sequence-enrollment', 'same-sequence-layout-conversion', 'restored-enrollment-legacy',
@@ -28,11 +29,13 @@ HOST_CHECKS = {
     'install': {'native-candidate-install', 'session-login', 'fresh-install-retry'},
     'upgrade': LEGACY_CHECKS | HELD_CHECKS | {'session-after-upgrade', 'signed-upgrade', 'complete-backup-restore',
                                             'restored-manual-rollback'},
-    **{'crash-' + stage: LEGACY_CHECKS | {'crash-' + stage, 'restored-' + stage, 'pre-checkpoint-resumed'}
+    **{'crash-' + stage: CRASH_CHECKS | {'crash-' + stage, 'restored-' + stage, 'manual-recovery-point'}
        for stage in sorted(PRE_CHECKPOINT)},
-    **{'crash-' + stage: LEGACY_CHECKS | {'crash-' + stage, 'restored-' + stage} | HELD_CHECKS
+    **{'crash-' + stage: CRASH_CHECKS | {'crash-' + stage, 'restored-' + stage, 'update-recovery-point'}
        for stage in sorted(POST_CHECKPOINT)},
 }
+HOST_CHECKS['crash-scheduler-freeze'].add('scheduler-frozen-at-interruption')
+HOST_CHECKS['crash-recovery-backoff'].add('rollback-backoff-held')
 
 
 def require(condition, message):
@@ -77,7 +80,8 @@ def validate(evidence, candidate, approved=False):
             ids = {check['id'] for check in checks}
             require(len(ids) == len(checks), 'A host check was reported more than once')
             require(required <= ids, 'Required host checks missing')
-            require(not (HELD_CHECKS & ids and 'pre-checkpoint-resumed' in ids), 'Recovery results contradict each other')
+            require('pre-checkpoint-resumed' not in ids and not {'manual-recovery-point', 'update-recovery-point'} <= ids,
+                    'Recovery results contradict each other')
     if approved:
         for role in ['release_operator', 'security_reviewer', 'product_owner']:
             approval = evidence['approvals'][role]

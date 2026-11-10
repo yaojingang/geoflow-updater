@@ -405,7 +405,7 @@ func (service *Service) Rollback(ctx context.Context, instanceID string, request
 	if tx, readErr := service.readTransaction(instanceID); readErr == nil && tx.LayoutStarted && (tx.Status == "running" || tx.Status == "recovery_required") {
 		inspector = tx.Candidate
 	}
-	request, err = service.prepareRestore(ctx, inspector, request)
+	request, err = service.prepareExplicitRestore(ctx, inspector, request)
 	if err != nil {
 		return err
 	}
